@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { ruleIntent, directImageIntent, routeIntent } = require('./intent.cjs');
-const { textMessage } = require('./feedback.cjs');
+const { textMessage } = require('../lib/feedback.cjs');
 class NaturalRouter {
   // `classifier` is injected because classification runs on the ChatGPT web page,
   // not in this process; `directImage` sends image requests straight to ChatGPT.

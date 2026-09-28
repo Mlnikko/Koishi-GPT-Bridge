@@ -3,8 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { ruleIntent, directImageIntent, routeIntent } = require('../intent.cjs');
-const { NaturalRouter } = require('../natural.cjs');
+const { ruleIntent, directImageIntent, routeIntent } = require('../../src/core/intent.cjs');
+const { NaturalRouter } = require('../../src/core/natural.cjs');
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'intent-test-'));
 const context = { current: 'a1234567', hasImage: true, sessions: [{ id: 'a1234567', name: '橘猫' }], latestJob: 'abcdef123456', jobs: [{ id: 'abcdef123456', status: 'running' }] };
 const intent = (action, text = '', target = '') => ({ action, text, target, confidence: 1 });
@@ -69,13 +69,5 @@ test('busy classifier does not block a rule cancellation; shutdown aborts recogn
   await pending; assert.equal(dispatched,1);
   const other=r.handle(session('m4')); r.close(); await other; assert.equal(dispatched,1);
 });
-test('the classifier is injected, so nothing here spawns a local process', () => {
-  // Classification runs on the signed-in ChatGPT web page via the local bridge;
-  // intent.cjs must stay a pure vocabulary/validation module.
-  const source = fs.readFileSync(path.join(__dirname, '../intent.cjs'), 'utf8');
-  for (const forbidden of ['child_process', 'spawn', 'execFile', 'codexPath', 'CODEX_HOME']) {
-    assert.ok(!source.includes(forbidden), `intent.cjs 不应再出现 ${forbidden}`);
-  }
-  const naturalSource = fs.readFileSync(path.join(__dirname, '../natural.cjs'), 'utf8');
-  assert.ok(!naturalSource.includes('codexPath'), 'natural.cjs 不应再依赖 codexPath');
-});
+// 「intent.cjs 不得引入子进程」这类源码级约束已统一收敛到
+// test/architecture.test.cjs，在那里对全部运行时模块一起扫描，避免多处重复维护。

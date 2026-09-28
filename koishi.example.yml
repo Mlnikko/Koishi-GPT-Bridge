@@ -1,0 +1,30 @@
+# 本插件在 koishi.yml 中的配置示例。
+# 可直接把下面 plugins 段合并进 Koishi 实例的 koishi.yml，
+# 键名也可写成带实例后缀的形式，例如 codex-image-local:xw6vpk。
+#
+# 完整说明见 README.md 的「安装与配置」。
+
+plugins:
+  codex-image-local:
+    # 必需。允许调用本插件的 QQ openid 列表。
+    # ["*"] 表示允许所有 QQ 私聊用户；群聊始终不会触发本插件。
+    allowedUsers:
+      - '*'
+
+    # 以下均为可选，不写即使用默认值。
+
+    # 本机桥接端口，需与 browser-extension/config.js 中的地址保持一致。
+    # 默认 5141。改动后需重跑：node scripts/setup-web-bridge.cjs <端口>
+    # webBridgePort: 5141
+
+    # 设为 false 关闭自然语言入口，只保留明确命令。默认开启。
+    # naturalLanguage: true
+
+    # 单张参考图体积上限（字节）。默认 10 MB。
+    # maxInputBytes: 10485760
+
+    # 任务保留天数。不写＝永久保留。
+    # 设为大于 0 时，已结束（完成/失败/取消/中断）的任务超过该天数会在启动时
+    # 及之后每 6 小时整体删除，回收参考图与结果图占用；排队中和运行中的永不删除，
+    # 被删除的任务不再能「取图」。每个图片任务约占 5–12 MB。
+    # retentionDays: 30

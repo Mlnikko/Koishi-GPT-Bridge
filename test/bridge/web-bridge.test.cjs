@@ -1,7 +1,7 @@
 const { test }=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
-const {WebBridge,webFailure,saveImage}=require('../web-bridge.cjs');
+const {WebBridge,webFailure,saveImage}=require('../../src/bridge/web-bridge.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
 function png(width=8,height=8,size=256){const bytes=Buffer.alloc(size);Buffer.from('89504e470d0a1a0a','hex').copy(bytes,0);bytes.writeUInt32BE(13,8);Buffer.from('IHDR','latin1').copy(bytes,12);bytes.writeUInt32BE(width,16);bytes.writeUInt32BE(height,20);return bytes;}

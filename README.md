@@ -39,20 +39,20 @@
 - 下载文件以 0600 写入临时目录，入队时移入任务目录并记录为 `input-<序号>.<扩展名>`，随任务一并持久化。
 - 图片字节只在本机 5141 端口按任务令牌提供，不写入扩展的持久存储，也不出现在 QQ 消息里。
 
-## 文件与运行
-
-`conversations.cjs` 管理用户会话，`data/conversations.json` 持久化会话名称、所属用户、选中状态及 ChatGPT 会话编号（`webThreadId`）。
-`plugin.cjs` 为 Koishi 插件，`queue.cjs` 为持久化任务队列，`image.cjs` 负责参考图片的安全下载与校验，`intent.cjs` 只负责语义词汇、提示词与结果校验。
-`web-bridge.cjs` 是本机桥接服务，`browser-extension/` 是 Chrome 扩展，`setup-web-bridge.cjs` 生成扩展的本地配置。
-`data/jobs/<id>/job.json` 保存任务状态；`result.png` 保存完成的图片；`input-<序号>.<扩展名>` 保存该任务下载的参考图片。
-任务文件含提示词和 QQ openid，权限 0600，目录权限 0700。
-
-取消只是请求网页停止生成，是否真正停下取决于浏览器状态，也不保证远端计算立即停止或返还额度。
-服务重启后进行中的任务标记 interrupted，不自动重复生成；当前没有执行中任务恢复，也没有自动重试生成，避免重复消耗。
-
 ## 安装与配置
 
-将此目录链接到 Koishi 实例的 `node_modules/koishi-plugin-codex-image-local`，在 `koishi.yml` 增加 `codex-image-local`。
+只需三步：
+
+1. 把本目录链接到 Koishi 实例的 `node_modules/koishi-plugin-codex-image-local`。
+2. 生成扩展配置（写入 `browser-extension/config.js` 与 `data/web-bridge-token`）：
+
+   ```bash
+   node scripts/setup-web-bridge.cjs        # 端口需与 webBridgePort 一致，默认 5141
+   ```
+
+3. 在实例 `koishi.yml` 增加 `codex-image-local` 配置（可参考仓库根目录的 `koishi.example.yml`），**重启实例**；
+   再在 Chrome 扩展管理页开启开发者模式，加载 `browser-extension` 目录。
+
 插件名与包名沿用 `codex-image-local`（历史命名），与后端无关，重命名需要同步改 `koishi.yml` 的键。
 
 必需配置只有一项：
@@ -68,112 +68,57 @@
 
 停用插件后其正在执行的任务会被取消。
 
-## 验证
+部署细节、重启方式与排障见 [docs/operations.md](docs/operations.md)。
 
-`node --test test/*.test.cjs` 验证去重、串行取消、重启、参考图下载边界、桥接取图与扩展提交顺序。
-独立生图与真实 QQ 收发需要分别验证，单元测试不替代端到端验收。
-`npm test` 等价，Node 22 自行展开 `test/*.test.cjs`，Windows 下无需 shell 展开。
+## 项目结构
 
-## 维护位置
-
-Koishi 实例通过 node_modules 中的 `koishi-plugin-codex-image-local` 符号链接加载本目录。
-**修改脚本后必须重启 Koishi 实例**，插件没有热重载；重启前请确认没有正在生成的任务。
-QQ 适配器密钥仍保留在 Koishi 实例的 `.env`，不存放在开发项目内。
-
-### 当前部署（Windows）
-
-- 项目位于 `D:\Projects\Koishi\koishi-codex-image-bridge`。
-- Koishi Desktop 主程序 `C:\Program Files\Koishi\Desktop\bin\koishi.exe`；实例目录 `%APPDATA%\Koishi\Desktop\data\instances\default`，配置在其 `koishi.yml`。
-- **Windows 上没有 `koi` 命令**，重启需在 Koishi Desktop 界面操作实例；macOS 上的 `/Applications/Koishi.app/Contents/MacOS/koi restart default` 不适用。
-- 插件目录以符号链接方式加载，重启实例即生效，不需要重新链接。
-- 桥接令牌固定保存在 `data/web-bridge-token`，重启会复用同一个值，因此不必重跑 `setup-web-bridge.cjs`。
-
-### 判断运行中的实例是否加载了新代码
-
-用正确令牌请求 `GET http://127.0.0.1:5141/input?id=probe&i=0`：
-返回 `409 {"error":"job is no longer active"}` 表示已加载含 `/input` 的新代码；返回 `404 {"error":"not found"}` 表示仍是旧代码，需重启。
-注意：带正确令牌的请求会刷新在线时间戳，使桥接在 90 秒内认为扩展在线。
-
-更直接的办法是看日志，每次加载都会留一行：
-
-```bash
-grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\logs\"*.log
+```
+koishi-codex-image-bridge/
+├── src/                        插件运行时，Koishi 从这里加载
+│   ├── index.cjs               Koishi 入口：导出 name / apply，注册命令与中间件
+│   ├── lib/                    通用工具层，不依赖项目内其他模块
+│   │   ├── image.cjs           参考图安全下载、格式嗅探、PNG 尺寸解析
+│   │   └── feedback.cjs        用户可见文案、失败分类、本机路径脱敏
+│   ├── core/                   领域层，可用 lib
+│   │   ├── conversations.cjs   画图会话持久化
+│   │   ├── queue.cjs           任务队列持久化与串行执行
+│   │   ├── intent.cjs          语义词表、分类提示词与结果校验
+│   │   └── natural.cjs         自然语言路由
+│   └── bridge/                 传输层，可用 core 与 lib
+│       └── web-bridge.cjs      与 Chrome 扩展的本机 HTTP 桥接（127.0.0.1:5141）
+├── browser-extension/          Chrome MV3 扩展：驱动 ChatGPT 页面
+├── scripts/
+│   └── setup-web-bridge.cjs    生成扩展的本地配置与桥接令牌
+├── test/                       镜像 src/ 的分层
+│   ├── lib/ core/ bridge/      各模块单元测试
+│   ├── index.test.cjs          装配层：假 Koishi 上下文驱动整个插件
+│   ├── architecture.test.cjs   分层与依赖规则的守卫
+│   ├── pipeline.test.cjs       端到端：QQ 元素 → 安全下载 → 落盘 → 桥接 → 回传 PNG
+│   └── browser-worker.test.cjs 扩展后台脚本
+├── docs/                       架构、运维与历史记录
+├── koishi.example.yml          配置示例
+├── data/                       运行时状态（任务、会话、令牌），已 gitignore
+└── package.json
 ```
 
-日志文件名按启动日期命名，可能不是当天，**取 mtime 最大的那个**再判断，不要按日期猜。
-实测改 `koishi.yml` 不会新增该行——Koishi 不热重载本插件的配置，改配置和改代码一样都要重启实例。
+分层规则是强制约束：`lib` 不得依赖 `core`/`bridge`，`core` 不得依赖 `bridge`，反向依赖与孤立模块都会被
+`test/architecture.test.cjs` 拦下。新增目录时需要同步更新该测试里的分层表。详见 [docs/architecture.md](docs/architecture.md)。
 
-### 实现注意
+## 验证
 
-- 结果图与参考图校验使用纯 JavaScript 解析 PNG 文件头，不依赖 macOS 的 `sips`。
-- 插件不 spawn 任何子进程，因此不存在子进程环境泄漏或跨平台进程终止问题；后续如需引入外部命令，必须重新处理「不继承 Koishi 密钥」与「Windows 无进程组信号」这两件事。
-- 本仓库不含 `probe/` 目录（`.gitignore` 已忽略），文档中提到的探针脚本只存在于原 macOS 机器上，需另行重建。
+```bash
+npm test          # 等价于 node --test "test/**/*.test.cjs"
+```
 
-## 失败反馈
+覆盖去重、串行取消、重启、参考图下载边界、桥接取图、扩展提交顺序，以及分层与依赖规则的守卫。
+Node 22 自行展开 glob，Windows 下无需 shell 展开。
 
-保存并返回网页最后一条回复，区分明确拒绝、工具不可用、认证失败、额度限制、网络失败与无明确原因的缺图。缺图本身不等于审查。异常写入任务目录 `failure.json`；任务状态与取图指令都可查询原因。模型文本作为纯文本转义，隐藏常见凭据、服务 URL 与本机路径（含 Windows 盘符与 UNC 路径）。不会为拒绝或错误自动重试生成。
+独立生图与真实 QQ 收发需要分别验证，单元测试不替代端到端验收；已完成的验收记录见 [docs/history.md](docs/history.md)。
 
-## 多会话行为
+## 文档
 
-会话按 QQ 用户与私聊隔离，最多 20 个打开会话。会话编号为 8 位，任务编号为 12 位；命令分别使用对应编号。每个会话同一时间仅允许一个待完成任务，不同会话共用全局串行队列。切换会话不会改变已排队任务的归属。关闭会话前须等待或取消任务；关闭不会删除历史任务和图片。重启后保留会话选择，但不会自动重试中断任务。
-
-续画通过服务器保存的确切 ChatGPT 会话编号进入同一网页会话，不接受用户提交任意会话编号。续画只接收本轮新回复中的图片；未产生新图片时保留真实错误，不回传旧图。当前会话之外的历史任务仍可用明确任务编号查询或取图。
-
-## 自然语言识别
-
-默认启用，仅处理允许用户的 QQ 私聊纯文本；原有明确命令优先。
-
-- 简单的肯定绘图请求、查询、取消、取图由本地规则处理，不联网。
-- 绘图与改图请求（`directImage`）直接交给 ChatGPT，由它自己理解语义并生图，不额外分类。
-- 其余消息（会话管理、有歧义的表达）由**同一个已登录的 ChatGPT 网页**分类：桥接打开一个专用标签页，用结构化输出返回意图 JSON，再由程序调用已有命令处理函数。绝不执行模型生成的命令字符串。
-
-示例：
-- `我想画一个芙兰朵露。` → 直接绘图，不分类。
-- `让刚才那张图里的背景变成夜晚，其他都保留` → 当前会话续画；需已选中会话且已有图片。
-- `刚才那张画好了吗？` → 查询任务。
-- `不用画了` → 取消当前会话最近任务。
-- `另开一段绘图对话，名字就叫月夜` → 新建并切换。
-- `我不想画芙兰朵露了，停止当前任务` → 取消，不会误当绘图。
-
-非命令文本的分类请求附带的上下文只含该用户当前私聊的会话名称、任务编号与状态；不提供其他用户记录或 QQ 凭据。分类超时 60 秒，且与绘图任务共用同一个桥接槽位——绘图进行中时分类会返回“网页正在处理其他任务”，此时仍可使用明确命令。新命令会使旧识别结果失效，避免识别完成后误操作已切换的会话。歧义或多项操作要求用户重新明确表达；普通聊天不触发生图，也不作为通用聊天机器人回复。
-
-消息去重收据保存在 `data/intent-receipts.json`（最近 24 小时、最多 1000 条）；未完成的识别在重启后不会自动重放。识别失败保留明确命令入口，可重新发送消息重试。
-
-## ChatGPT 网页生图连接器
-
-`web-bridge.cjs` 为本机网页任务服务，`browser-extension/` 为 Chrome 扩展。它操作已登录的 `https://chatgpt.com/` 普通 Chat 页面，通过页面输入框提交请求，从本轮生成图片读取像素并保存为 PNG，不调用未公开聊天接口，也不复制登录 Cookie。
-
-安装：运行 `node setup-web-bridge.cjs`，在 Chrome 扩展管理页开启开发者模式，加载 `browser-extension` 文件夹。扩展只申请 ChatGPT 页面、本机 5141 端口、脚本注入、扩展存储和定时任务权限。`browser-extension/config.js` 与 `data/web-bridge-token` 保存随机本机连接令牌，均需私密保存；不含 QQ 或 ChatGPT 登录凭据。
-
-网页无法连接时明确失败，不会回退到其他方式生图。重启电脑后启动 Chrome（扩展须保持启用并保留 ChatGPT 登录）和 Koishi 即可。扩展更新后在 Chrome 扩展管理页点击刷新。
-
-扩展为绘图任务打开专用标签页。绘图期间不要编辑、刷新或关闭该页。任务与网页会话编号绑定；续画仅进入该用户保存的网页会话，并只接收本轮新回复中的图片。无法确认提交时不会自动再次点击，避免重复生图。页面验证需用户手动完成，连接器不会处理验证挑战。关闭 Chrome、登录失效、网页变化或额度不足均可能导致失败，可查看具体反馈。
-
-带参考图片的任务多一个“上传”阶段：`/state` 只返回图片元数据，扩展在后台服务工作线程按任务令牌从 `GET /input` 取回字节（页面 CSP 不允许页面脚本直连本机），转成 `File` 注入 ChatGPT 输入框的文件选择器并派发 `input`/`change`。确认输入框内已出现附件后才填写文字并提交；45 秒内无法确认附件则明确失败，绝不退化成纯文字请求，避免生成与参考图无关的图片。上传只尝试一次，不会重复附加。
-
-如果上次浏览器或 Koishi 在提交前退出，输入框可能留下带有 `QQ绘图任务 <任务编号>` 的连接器草稿。扩展只会自动清理这种带有本连接器标记的旧草稿；检测到其他文本时会停止并提示用户手动处理，避免覆盖用户自己的输入。
-
-`node --test test/*.test.cjs` 验证认证、错误分类、会话匹配、取消、自动提交防重、连接器旧草稿清理，以及参考图片的下载边界、落盘持久化、`/input` 取图与“先附加后提交”的顺序。
-
-## 验证记录
-
-### 参考图片链路（2026-09-29）
-
-**真实 QQ 端到端已验收通过**：任务 `8e6eb22e5257` 私聊发送一张 2.9 MB 参考图 + 文字要求，52 秒后 `status: ready`、`delivery: sent`，回传 2.47 MB `result.png`。参考图落盘为 `input-0.png`，ChatGPT 会话编号与结果图均正常绑定。附件缩略图选择器在真实页面上有效。
-
-`test/pipeline.test.cjs` 用真实模块串起整条链路：QQ 元素 → 安全下载 → 任务持久化 → 本机桥接取图 → 回传 PNG，覆盖纯图片、图片+文字与下载失败三种情形。
-
-### 网页接入（2026-09-27）
-
-真实网页在同一会话先生成蓝色圆形、再改成橙色，均自动保存为 1254×1254 PNG。
-
-### 变更记录（2026-09-29）
-
-- 移除 Codex CLI 后端：删除 `runner.cjs`（`runCodex`/`collectImage`）与 `intent.cjs` 中的 `classify()`，`conversations.cjs` 的 `bind()`，以及 `feedback.cjs` 中只服务于该路径的 `Outcome`。配置项 `codexPath`、`imageBackend`、`intentBackend`、`intentModel` 不再使用，可以从 `koishi.yml` 删除（留着也无害）。
-- 语义分类统一走 ChatGPT 网页；`directImage` 固定开启，绘图请求不再经过分类。
-- `safeReason()` 补全 Windows 盘符、正斜杠盘符与 UNC 路径的脱敏。
-- 新增可选 `retentionDays` 清理（默认关闭，行为不变）。
-- 新增 `test/plugin.test.cjs`：用假 Koishi 上下文直接覆盖 `plugin.cjs` 的装配层，验证图片中间件优先级、纯图片受理、下载失败不入队、文字命令入队、未授权隔离、浏览器离线时的失败原因，以及缺 `allowedUsers` 时拒绝加载。该文件里的假上下文刻意复刻了 Koishi 的 `next(fallback)` 语义（先跑完后续中间件，只有都没产出时才执行 fallback），否则延迟生效的自然语言路由会吞掉所有命令。
-- 测试从 55 项收敛到 49 项（删掉只测 Codex 路径的用例），随后随 `plugin.test.cjs` 增至 56 项；跳过项从 3 项归零。
-
-尚未完成：真实页面上多图参考与失败重试场景的验收。
+| 文档 | 内容 |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | 分层与依赖规则、各模块职责、数据流、多会话与自然语言识别、失败反馈、连接器工作原理 |
+| [docs/operations.md](docs/operations.md) | Windows 部署位置、重启方式、判断运行中实例是否加载了新代码、实现注意与排障 |
+| [docs/history.md](docs/history.md) | 端到端验收记录与变更记录 |

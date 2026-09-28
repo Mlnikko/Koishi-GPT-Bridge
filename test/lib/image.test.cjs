@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { downloadImage, sniffImage, pngSize, isPrivateAddress, decodeDataUrl, messageImages, messageText } = require('../image.cjs');
+const { downloadImage, sniffImage, pngSize, isPrivateAddress, decodeDataUrl, messageImages, messageText } = require('../../src/lib/image.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'qq-image-test-'));
 // A minimal but structurally valid PNG: signature + IHDR + padding to a size the

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { Conversations } = require('../conversations.cjs');
+const { Conversations } = require('../../src/core/conversations.cjs');
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'drawing-conversations-'));
 test('conversation selection persists; foreign users/chats cannot select, rename or close', () => {
   const file = path.join(temp(), 'sessions.json'), c = new Conversations(file);

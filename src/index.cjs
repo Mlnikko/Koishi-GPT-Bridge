@@ -2,18 +2,19 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { WebBridge } = require('./web-bridge.cjs');
-const { NaturalRouter } = require('./natural.cjs');
-const { Conversations } = require('./conversations.cjs');
-const { JobQueue } = require('./queue.cjs');
-const { textMessage } = require('./feedback.cjs');
-const { downloadImage, messageImages, messageText, MAX_INPUT_IMAGES } = require('./image.cjs');
+const { WebBridge } = require('./bridge/web-bridge.cjs');
+const { NaturalRouter } = require('./core/natural.cjs');
+const { Conversations } = require('./core/conversations.cjs');
+const { JobQueue } = require('./core/queue.cjs');
+const { textMessage } = require('./lib/feedback.cjs');
+const { downloadImage, messageImages, messageText, MAX_INPUT_IMAGES } = require('./lib/image.cjs');
 exports.name = 'codex-image-local';
 exports.apply = (ctx, config) => {
   if (!config?.allowedUsers?.length) throw new Error('必须配置 allowedUsers');
   // `dataDir` only exists so tests and relocated installs can point the state
-  // somewhere else; production uses the project's own data directory.
-  const root = config.dataDir || path.join(__dirname, 'data');
+  // somewhere else; production uses the project's own data directory. `src/` is
+  // one level down from the project root, hence the `..`.
+  const root = config.dataDir || path.join(__dirname, '..', 'data');
   // There is exactly one backend: the already-signed-in ChatGPT web page driven
   // by the local extension. Nothing here spawns an external CLI or needs API keys.
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141 });

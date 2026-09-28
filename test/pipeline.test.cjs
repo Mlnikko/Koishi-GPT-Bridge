@@ -3,9 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { WebBridge } = require('../web-bridge.cjs');
-const { JobQueue } = require('../queue.cjs');
-const { downloadImage, messageImages, messageText, pngSize } = require('../image.cjs');
+const { WebBridge } = require('../src/bridge/web-bridge.cjs');
+const { JobQueue } = require('../src/core/queue.cjs');
+const { downloadImage, messageImages, messageText, pngSize } = require('../src/lib/image.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-test-'));
 const thread = '11111111-2222-3333-4444-555555555555';

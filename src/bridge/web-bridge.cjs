@@ -3,10 +3,10 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { classificationPrompt, validateIntent, schema } = require('./intent.cjs');
+const { classificationPrompt, validateIntent, schema } = require('../core/intent.cjs');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
-const { failureInfo, safeReason } = require('./feedback.cjs');
-const { pngSize } = require('./image.cjs');
+const { failureInfo, safeReason } = require('../lib/feedback.cjs');
+const { pngSize } = require('../lib/image.cjs');
 const validThread = id => /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id || '');
 function error(code, message) { return Object.assign(new Error(message), { code }); }
 function webFailure(reply) {

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const plugin = require('../plugin.cjs');
+const plugin = require('../src/index.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-test-'));
 const wait = () => new Promise(resolve => setImmediate(resolve));

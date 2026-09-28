@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { failureInfo, safeReason, textMessage } = require('../feedback.cjs');
+const { failureInfo, safeReason, textMessage } = require('../../src/lib/feedback.cjs');
 
 test('explicit refusal, unavailable tool and ambiguous missing image stay distinct', () => {
   assert.equal(failureInfo({ noImage: true, reply: '抱歉，我不能生成这类图片。可以改为经典服装。' }).code, 'refused');

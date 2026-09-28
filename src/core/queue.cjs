@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { MAX_INPUT_IMAGES } = require('./image.cjs');
+const { MAX_INPUT_IMAGES } = require('../lib/image.cjs');
 
 // The download staging directory and the job directory normally share a volume,
 // but a configured temp path may not; fall back to copy + unlink in that case.

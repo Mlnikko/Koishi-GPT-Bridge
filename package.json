@@ -2,7 +2,14 @@
   "name": "koishi-plugin-codex-image-local",
   "version": "0.1.0",
   "private": true,
-  "main": "plugin.cjs",
-  "scripts": { "test": "node --test test/*.test.cjs" },
-  "engines": { "node": ">=20" }
+  "description": "通过本机 Chrome 扩展驱动已登录的 ChatGPT 网页生图，供 Koishi / QQ 私聊调用；不依赖 API Key，也不调用任何本地 CLI。",
+  "main": "src/index.cjs",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.cjs\"",
+    "setup:bridge": "node scripts/setup-web-bridge.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "UNLICENSED"
 }

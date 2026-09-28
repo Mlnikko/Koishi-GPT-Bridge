@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { JobQueue } = require('../queue.cjs');
+const { JobQueue } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'image-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, prompt: 'a cat' });
 test('duplicate incoming message does not enqueue another generation; owner and chat are isolated', () => {
