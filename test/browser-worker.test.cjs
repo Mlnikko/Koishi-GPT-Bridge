@@ -1,0 +1,120 @@
+const {test}=require('node:test');const assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+test('browser worker fills and sends in separate ticks, persists sending before click, and never resends an uncertain submission',async()=>{
+ const storage={},operations=[];const task={id:'abcdef123456',prompt:'a circle',threadId:'',cancelled:false};
+ const sandbox={console,AbortSignal,Error,JSON,Date,setInterval:()=>{},importScripts:()=>{},BRIDGE:{url:'http://local',token:'test'},
+  fetch:async()=>({ok:true,json:async()=>({job:task})}),
+  chrome:{alarms:{create:()=>{},onAlarm:{addListener:()=>{}}},runtime:{onStartup:{addListener:()=>{}},onInstalled:{addListener:()=>{}},onMessage:{addListener:()=>{}}},
+   storage:{local:{get:async key=>({[key]:storage[key]}),set:async values=>Object.assign(storage,structuredClone(values))}},
+   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/'})},
+   scripting:{executeScript:async({args:[op]})=>{
+    operations.push(op);
+    if(op==='inspect')return[{result:{editor:true,assistants:0,threadId:'',matching:false}}];
+    if(op==='submit')return[{result:{filled:true}}];
+    if(op==='send'){assert.equal(storage.current.phase,'sending');return[{result:{clicked:true}}];}
+    throw Error('unexpected operation');
+   }}},};
+ vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8'),sandbox);
+ await new Promise(setImmediate); // automatic first tick opens tab
+ await vm.runInContext('tick()',sandbox);
+ assert.deepEqual(operations,['inspect','submit']);assert.equal(storage.current.phase,'filled');
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='send').length,1);
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='send').length,1);
+ storage.current.phase='sending';await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='send').length,1);
+});
+test('web page reads user bubbles separately from assistant role headings',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const user={parentElement:{innerText:'QQ绘图任务 abcdef123456\na circle'}};
+ const assistant={parentElement:{innerText:'ChatGPT 说：编辑',querySelectorAll:()=>[{complete:true,naturalWidth:1254}]}};
+ const sandbox={location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
+  document:{body:{innerText:''},querySelector:selector=>selector.includes('textbox')?{}:null,querySelectorAll:selector=>selector==='[data-user-message-bubble]'?[user]:selector==='[data-conversation-role="assistant"]'?[assistant]:[]}};
+ vm.createContext(sandbox);vm.runInContext(code,sandbox);
+ const info=await vm.runInContext("pageStep('inspect',{id:'abcdef123456'})",sandbox);
+ assert.equal(info.matching,true);assert.equal(info.users,1);assert.equal(info.assistants,1);assert.equal(info.imageReady,true);
+});
+test('web page clears only a stale connector draft before filling a new task',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const commands=[];
+ const editor={innerText:'QQ绘图任务 abcdef123456\nold request',focus(){},dispatchEvent(){}};
+ const sandbox={InputEvent:class{},location:{href:'https://chatgpt.com/',pathname:'/'},
+  document:{body:{innerText:''},querySelector:selector=>selector.includes('textbox')?editor:null,
+   querySelectorAll:selector=>selector==='button'?[]:[],execCommand:(command,_ui,value)=>{
+    commands.push(command);if(command==='delete')editor.innerText='';
+    if(command==='insertText')editor.innerText=value;return true;
+   }}};
+ vm.createContext(sandbox);vm.runInContext(code,sandbox);
+ const result=await vm.runInContext("pageStep('submit',{id:'111111111111',message:'new request\\nQQ绘图任务 111111111111',threadId:''})",sandbox);
+ assert.equal(result.filled,true);assert.deepEqual(commands,['selectAll','delete','selectAll','insertText']);
+ assert.equal(editor.innerText,'new request\nQQ绘图任务 111111111111');
+});
+test('web page attaches a reference image to the composer file input before any submit',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const events=[],input={files:null,dispatchEvent:event=>events.push(event.type)};
+ const editor={focus(){}};
+ const sandbox={InputEvent:class{},File:class{constructor(parts,name,options){this.parts=parts;this.name=name;this.type=options.type;}},
+  DataTransfer:class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}},
+  Event:class{constructor(type){this.type=type;}},
+  ClipboardEvent:class{},location:{href:'https://chatgpt.com/',pathname:'/'},
+  atob:value=>Buffer.from(value,'base64').toString('binary'),
+  document:{body:{innerText:''},querySelector:selector=>selector==='input[type="file"]'?input:(selector.includes('textbox')?editor:null),
+   querySelectorAll:()=>[]}};
+ vm.createContext(sandbox);vm.runInContext(code,sandbox);
+ const result=await vm.runInContext("pageStep('attach',{id:'abcdef123456',images:[{name:'input-0.png',mime:'image/png',base64:'AQIDBA=='}]})",sandbox);
+ assert.equal(result.attached,1);assert.deepEqual(events,['input','change']);
+ assert.equal(input.files[0].type,'image/png');assert.equal(input.files[0].name,'input-0.png');
+ assert.deepEqual(Array.from(input.files[0].parts[0]),[1,2,3,4]);
+ const none=await vm.runInContext("pageStep('attach',{id:'abcdef123456',images:[]})",sandbox);
+ assert.equal(none.attached,0);
+});
+test('browser worker uploads the reference image once, then fills and sends',async()=>{
+ const storage={},operations=[];let attachments=0;
+ const task={id:'abcdef123456',prompt:'把背景改成夜晚',kind:'image',images:[{index:0,mime:'image/png',name:'input-0.png',size:4}],threadId:'',cancelled:false};
+ const sandbox={console,AbortSignal,Error,JSON,Date,setInterval:()=>{},importScripts:()=>{},BRIDGE:{url:'http://local',token:'test'},
+  btoa:value=>Buffer.from(value,'binary').toString('base64'),
+  fetch:async url=>String(url).includes('/input')
+   ?{ok:true,arrayBuffer:async()=>new Uint8Array([1,2,3,4]).buffer}
+   :{ok:true,json:async()=>({job:task})},
+  chrome:{alarms:{create:()=>{},onAlarm:{addListener:()=>{}}},runtime:{onStartup:{addListener:()=>{}},onInstalled:{addListener:()=>{}},onMessage:{addListener:()=>{}}},
+   storage:{local:{get:async key=>({[key]:storage[key]}),set:async values=>Object.assign(storage,structuredClone(values))}},
+   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/'})},
+   scripting:{executeScript:async({args:[op,payload]})=>{
+    operations.push(op);
+    if(op==='inspect')return[{result:{editor:true,assistants:0,threadId:'',matching:false,attachments}}];
+    if(op==='attach'){assert.equal(payload.images[0].mime,'image/png');assert.equal(payload.images[0].base64,'AQIDBA==');attachments=1;return[{result:{attached:1}}];}
+    if(op==='submit')return[{result:{filled:true}}];
+    if(op==='send')return[{result:{clicked:true}}];
+    throw Error('unexpected operation '+op);
+   }}},};
+ vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8'),sandbox);
+ await new Promise(setImmediate); // automatic first tick opens the tab
+ assert.match(storage.current.message,/附加 1 张参考图片/);assert.equal(storage.current.hasImages,true);
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(storage.current.phase,'attaching');
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='attach').length,1);assert.equal(storage.current.phase,'attaching');
+ await vm.runInContext('tick()',sandbox); // attachment confirmed -> fill and submit
+ assert.equal(storage.current.phase,'filled');assert.equal(operations.filter(x=>x==='submit').length,1);
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='send').length,1);
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(operations.filter(x=>x==='attach').length,1);
+});
+test('a pure image message still carries an instruction marker so the send button unlocks',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('function buildMessage('),full.indexOf('async function api('));
+ const sandbox={};vm.createContext(sandbox);vm.runInContext(code,sandbox);
+ const text=vm.runInContext("buildMessage({id:'abcdef123456',prompt:'',kind:'image',images:[{index:0}]})",sandbox);
+ assert.match(text,/QQ绘图任务 abcdef123456/);
+ assert.match(text,/请参考我上传的图片生成一张新的图片/);
+ const withText=vm.runInContext("buildMessage({id:'abcdef123456',prompt:'改成夜晚',kind:'image',images:[{index:0}]})",sandbox);
+ assert.match(withText,/用户的要求：改成夜晚/);
+ const plain=vm.runInContext("buildMessage({id:'abcdef123456',prompt:'一只猫',kind:'text'})",sandbox);
+ assert.match(plain,/用户的图片请求：一只猫/);
+ assert.doesNotMatch(plain,/参考图片/);
+});

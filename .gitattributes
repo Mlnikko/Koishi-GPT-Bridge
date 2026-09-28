@@ -1,0 +1,11 @@
+# 统一换行符：Windows 上默认的 autocrlf 会让 LF 与 CRLF 反复产生无意义 diff，
+# 这里显式固定为 LF，保证任何机器上 checkout 出来都一致。
+* text=auto eol=lf
+
+# 二进制资源不做换行符转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary

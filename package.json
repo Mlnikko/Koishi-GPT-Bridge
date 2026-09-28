@@ -1,0 +1,8 @@
+{
+  "name": "koishi-plugin-codex-image-local",
+  "version": "0.1.0",
+  "private": true,
+  "main": "plugin.cjs",
+  "scripts": { "test": "node --test test/*.test.cjs" },
+  "engines": { "node": ">=20" }
+}
