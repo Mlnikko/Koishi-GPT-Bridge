@@ -58,6 +58,43 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
 若把 `webBridgePort` 改成非 5141，需要重跑并带上端口：
 `node scripts/setup-web-bridge.cjs <端口>`。
 
+## QQ 适配器版本要求（图片消息不能带空行）
+
+图片发到 QQ 后多出一行空行，根因不在本项目，而在 `@satorijs/adapter-qq`：**4.12.0 及更早版本**
+在发送纯媒体消息（`msg_type=7`）时，若文本内容为空会强行填一个空格：
+
+```js
+if (this.attachedFile) {
+  if (!data.content.length) data.content = " ";   // 4.13.0 起已删除
+  data.media = this.attachedFile;
+  data.msg_type = Message.Type.MEDIA;
+}
+```
+
+QQ 会把这个空格渲染成一行空行。**4.13.0 起上游删掉了这一行**，所以要求
+`@satorijs/adapter-qq >= 4.13.0`（当前实例为 4.14.0）。
+
+- QQ 官方文档的 `msg_type=7` 示例请求体**根本不含 `content` 字段**，空格只是旧版的防御性补丁。
+- 本项目侧无需任何改动：`deliver()` 只发一条 `<img/>`，成功时不返回额外文本，也不会二次发送。
+- 编码器对 `img` 是「先 flush 再设 attachedFile、之后不再 flush」，所以纯图片消息只产生一条出站消息。
+
+## 实例依赖由 market 插件自动升级（重要）
+
+实例启用了 `market` 插件，它**在每次实例启动时用 yarn 升级一批依赖**；而每次升级都会让
+Koishi Desktop 重启实例，于是形成「升级 → 重启 → 再升级」的级联，直到所有包都到最新为止。
+实测一次重启后连续升级了 `@koishijs/plugin-market`、`koishi-plugin-adapter-onebot`、
+`@koishijs/plugin-adapter-qq` 等，约 70 秒后自行稳定。
+
+由此得到的规矩：
+
+- **不要手动对实例跑 `yarn up` / `yarn up -R`**。它会改动 `node_modules`，触发 Desktop 重启，
+  再触发 market 的升级级联。需要升级某个传递依赖时，等实例自己重启即可。
+- 实例 `package.json` 的版本号由 market 维护，**手工写入的 `resolutions` 会被它删掉**。
+- 升级期间实例会反复重启、QQ 连接短暂中断，属预期现象。判断是否稳定的办法是看
+  `<data>/logs/*.log` 的 mtime 是否停止增长——静默 25 秒以上即可认为稳定。
+- 升级某个包但不想动整个依赖树时，`yarn up` 只认直接依赖，`-R` 会连带升级依赖它的包
+  （例如升级 `@satorijs/adapter-qq` 会顺带把 `@koishijs/plugin-adapter-qq` 和 `koishi` 一起抬上去）。
+
 ## 实现注意
 
 - 结果图与参考图校验使用纯 JavaScript 解析 PNG 文件头，不依赖 macOS 的 `sips`。
@@ -79,6 +116,8 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
 | 参考图任务失败且提到附件 | 页面上的文件选择器或附件缩略图选择器可能已变化。连接器会明确失败，不会退化成纯文字请求。 |
 | 改了代码但行为没变 | 实例未重启。用上面的 `/input` 探针或日志确认。 |
 | 端口被占用 | 5141 已被其他进程监听，改 `webBridgePort` 并重跑 `scripts/setup-web-bridge.cjs`。 |
+| 图片消息多出一行空行 | `@satorijs/adapter-qq` < 4.13.0 会给纯媒体消息填 `content: " "`。重启实例让 market 把它升到 4.13+ 即可，本项目无需改动。 |
+| 实例反复重启 | `market` 插件在逐个升级依赖，每次升级都会重启实例。等日志静默即可，不要在此期间手动改 `node_modules`。 |
 | 想回收磁盘 | 每个图片任务约占 5–12 MB。设置 `retentionDays` 后重启，终态任务会在启动时与每 6 小时被清理。 |
 
 ## 验证命令
