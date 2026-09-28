@@ -35,7 +35,23 @@ test('web errors report authentication and quota separately',()=>{
  assert.equal(webFailure('请登录 ChatGPT').code,'authentication');
  assert.equal(webFailure('已达到图片生成上限').code,'rate_limit');
  assert.equal(webFailure('图片已生成').code,'no_image');
+ assert.equal(webFailure('等待网页出图超时，未检测到本轮图片').code,'no_image');
  assert.equal(webFailure('参考图片上传超时，未提交请求').code,'browser_interaction');
+});
+test('a page-structure probe from the extension is kept beside the job, never breaking the report',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const probe={turns:3,roleNodes:['div@assistant'],images:[{src:'blob:',alt:'生成图片',w:1024,h:1024,complete:true,inUser:false}],assistantHtml:'<article></article>'};
+ assert.equal((await call('/failure',{id:job.id,message:'等待网页出图超时，未检测到本轮图片',probe})).status,200);
+ assert.equal((await p).code,'no_image');
+ const file=path.join(job.dir,'dom-probe.json');
+ const saved=JSON.parse(fs.readFileSync(file,'utf8'));
+ assert.equal(saved.turns,3);assert.equal(saved.images[0].w,1024);assert.ok(saved.at>0);
+ // An oversized probe is dropped, and the failure is still reported normally.
+ await call('/state');const q=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ await call('/failure',{id:job.id,message:'等待网页出图超时，未检测到本轮图片',probe:{blob:'x'.repeat(40000)}});
+ assert.equal((await q).code,'no_image');
+ assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).turns,3);
 });
 test('web result images are validated from their PNG header without external tools',()=>{
  const dir=temp(),destination=path.join(dir,'result.png');

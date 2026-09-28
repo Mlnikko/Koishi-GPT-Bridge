@@ -81,7 +81,17 @@ class WebBridge {
         if(phase)p.onProgress(phase);
         return send(200,{ok:true,cancelled:!!p.cancelled});
       }
-      if(req.url==='/failure') {p.finish(p.cancelled || webFailure(String(body.message||'网页未返回明确原因')));return send(200,{ok:true});}
+      if(req.url==='/failure') {
+        // The extension attaches a page-structure snapshot when it could not find
+        // the generated image. Keep it beside the job so the selectors can be
+        // corrected from real markup instead of guesswork; never let it break the
+        // failure report itself.
+        try {
+          const probe=body.probe && JSON.stringify(body.probe).length<20000 ? body.probe : null;
+          if(probe)fs.writeFileSync(path.join(p.job.dir,'dom-probe.json'),JSON.stringify({at:Date.now(),...probe}),{mode:0o600});
+        } catch {}
+        p.finish(p.cancelled || webFailure(String(body.message||'网页未返回明确原因')));return send(200,{ok:true});
+      }
       if(req.url==='/result') {
         if(p.cancelled){p.finish(p.cancelled);return send(409,{error:'cancelled'});}
         if(!validThread(body.threadId) || (p.threadId && body.threadId!==p.threadId)) throw error('thread_mismatch','ChatGPT 返回的会话与任务不一致');

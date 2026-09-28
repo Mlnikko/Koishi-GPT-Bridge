@@ -29,7 +29,8 @@ test('web page reads user bubbles separately from assistant role headings',async
  const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
  const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
  const user={parentElement:{innerText:'QQ绘图任务 abcdef123456\na circle'}};
- const assistant={parentElement:{innerText:'ChatGPT 说：编辑',querySelectorAll:()=>[{complete:true,naturalWidth:1254}]}};
+ const generated={complete:true,naturalWidth:1254,naturalHeight:1254,currentSrc:'blob:https://chatgpt.com/2f3c',getAttribute:name=>({alt:'Generated image','data-testid':'generated-image-preview'}[name]??null)};
+ const assistant={parentElement:{innerText:'ChatGPT 说：编辑',querySelectorAll:()=>[generated]}};
  const sandbox={location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
   document:{body:{innerText:''},querySelector:selector=>selector.includes('textbox')?{}:null,querySelectorAll:selector=>selector==='[data-user-message-bubble]'?[user]:selector==='[data-conversation-role="assistant"]'?[assistant]:[]}};
  vm.createContext(sandbox);vm.runInContext(code,sandbox);
@@ -104,6 +105,90 @@ test('browser worker uploads the reference image once, then fills and sends',asy
  assert.equal(operations.filter(x=>x==='send').length,1);
  await vm.runInContext('tick()',sandbox);
  assert.equal(operations.filter(x=>x==='attach').length,1);
+});
+test('a generated image is found by its shape, not by a single data-testid',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const bitmap=overrides=>Object.assign({complete:true,naturalWidth:1024,naturalHeight:1024,currentSrc:'blob:https://chatgpt.com/2f3c',
+  getAttribute:name=>({alt:'生成图片','data-testid':null}[name]??null)},overrides);
+ const run=async(sandbox,job)=>{vm.createContext(sandbox);vm.runInContext(code,sandbox);
+  return vm.runInContext("pageStep('inspect',"+JSON.stringify(job)+")",sandbox);};
+ // The wrapper no longer carries the legacy testid; the bitmap itself is enough.
+ const generated=bitmap();
+ const assistantTurn={innerText:'ChatGPT 说：编辑',textContent:'ChatGPT 说：编辑',querySelectorAll:sel=>sel==='img'?[generated]:[]};
+ const userTurn={innerText:'QQ绘图任务 abcdef123456\n一只猫',contains:()=>false};
+ const documentFor=imgs=>({body:{innerText:''},querySelector:()=>null,
+  querySelectorAll:sel=>sel==='[data-user-message-bubble]'?[{closest:()=>userTurn}]
+   :sel==='[data-conversation-role="assistant"]'?[{closest:()=>assistantTurn}]
+   :sel==='img'?imgs:[]});
+ const scoped=await run({location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
+  document:documentFor([])},{id:'abcdef123456',baseline:0});
+ assert.equal(scoped.images,1);assert.equal(scoped.imageReady,true);assert.equal(scoped.generating,false);
+ // A preview rendered outside the turn is still picked up, while the reference
+ // image the user attached stays excluded.
+ const reference=bitmap({currentSrc:'blob:https://chatgpt.com/ref'});
+ const outside=bitmap({naturalWidth:1536,naturalHeight:1536});
+ const userEl={closest:()=>Object.assign(userTurn,{contains:img=>img===reference})};
+ const fallback=await run({location:{href:'https://chatgpt.com/',pathname:'/'},
+  document:{body:{innerText:''},querySelector:()=>null,
+   querySelectorAll:sel=>sel==='[data-user-message-bubble]'?[userEl]
+    :sel==='[data-conversation-role="assistant"]'?[{closest:()=>Object.assign(assistantTurn,{querySelectorAll:()=>[]})}]
+    :sel==='img'?[reference,outside]:[]}},{id:'abcdef123456',baseline:0});
+ assert.equal(fallback.images,1);assert.equal(fallback.imageReady,true);
+});
+test('ui chrome is never reported as a model reply',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('function modelReply('),full.indexOf('async function pageStep('));
+ const sandbox={};vm.createContext(sandbox);vm.runInContext(code,sandbox);
+ const reply=text=>vm.runInContext('modelReply('+JSON.stringify({assistantText:text})+')',sandbox);
+ assert.equal(reply('ChatGPT 说：\n编辑'),'');
+ assert.equal(reply('ChatGPT said:\nCopy\nRegenerate'),'');
+ assert.equal(reply('抱歉，我不能生成这张图片。'),'抱歉，我不能生成这张图片。');
+});
+test('an image-only turn that is still rendering is waited out, not failed',async()=>{
+ const storage={},calls=[];
+ const task={id:'abcdef123456',prompt:'一只猫',kind:'image',threadId:'',cancelled:false};
+ const inspect={editor:true,assistants:1,matching:true,threadId:'',imageReady:false,imageLoading:false,generating:true,assistantText:'ChatGPT 说：编辑'};
+ const sandbox={console,AbortSignal,Error,JSON,Date,setInterval:()=>{},importScripts:()=>{},BRIDGE:{url:'http://local',token:'test'},
+  fetch:async(url,options)=>{calls.push((options?.method||'GET')+' '+String(url).replace('http://local',''));
+   return String(url).endsWith('/state')?{ok:true,json:async()=>({job:task})}:{ok:true,json:async()=>({})};},
+  chrome:{alarms:{create:()=>{},onAlarm:{addListener:()=>{}}},runtime:{onStartup:{addListener:()=>{}},onInstalled:{addListener:()=>{}},onMessage:{addListener:()=>{}}},
+   storage:{local:{get:async key=>({[key]:storage[key]}),set:async values=>Object.assign(storage,structuredClone(values))}},
+   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555'})},
+   scripting:{executeScript:async()=>[{result:inspect}]}},};
+ vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8'),sandbox);
+ await new Promise(setImmediate); // the automatic first tick must finish before we seed state
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-60000,baseline:0,kind:'image',threadId:'',message:'x'};
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(calls.some(call=>call.includes('/failure')),false);
+ assert.equal(storage.status,'ChatGPT 正在生成图片');
+ // A page that never stops looking busy must still give up at the hard cap
+ // instead of waiting out the bridge timeout.
+ storage.current.sentAt=Date.now()-250000;
+ await vm.runInContext('tick()',sandbox);
+ assert.equal(calls.filter(call=>call.includes('/failure')).length,1);
+ assert.match(storage.status,/任务失败/);
+});
+test('a real refusal is reported straight away with the model wording',async()=>{
+ const storage={},calls=[];
+ const task={id:'abcdef123456',prompt:'一只猫',kind:'image',threadId:'',cancelled:false};
+ const inspect={editor:true,assistants:1,matching:true,threadId:'',imageReady:false,imageLoading:false,generating:false,assistantText:'抱歉，我不能生成这张图片。'};
+ const sandbox={console,AbortSignal,Error,JSON,Date,setInterval:()=>{},importScripts:()=>{},BRIDGE:{url:'http://local',token:'test'},
+  fetch:async(url,options)=>{calls.push({route:String(url).replace('http://local',''),body:options?.body?JSON.parse(options.body):null});
+   return String(url).endsWith('/state')?{ok:true,json:async()=>({job:task})}:{ok:true,json:async()=>({})};},
+  chrome:{alarms:{create:()=>{},onAlarm:{addListener:()=>{}}},runtime:{onStartup:{addListener:()=>{}},onInstalled:{addListener:()=>{}},onMessage:{addListener:()=>{}}},
+   storage:{local:{get:async key=>({[key]:storage[key]}),set:async values=>Object.assign(storage,structuredClone(values))}},
+   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555'})},
+   scripting:{executeScript:async()=>[{result:inspect}]}},};
+ vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8'),sandbox);
+ await new Promise(setImmediate); // the automatic first tick must finish before we seed state
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-60000,stableAt:Date.now()-30000,
+  lastText:'抱歉，我不能生成这张图片。',baseline:0,kind:'image',threadId:'',message:'x'};
+ await vm.runInContext('tick()',sandbox);
+ const failure=calls.find(call=>call.route==='/failure');
+ assert.ok(failure,'expected the worker to report a failure');
+ assert.match(failure.body.message,/抱歉，我不能生成这张图片。/);
+ assert.match(storage.status,/任务失败/);
 });
 test('a pure image message still carries an instruction marker so the send button unlocks',async()=>{
  const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');

@@ -32,20 +32,77 @@ async function api(route,body){
  if(!response.ok)throw new Error('本机连接器返回 '+response.status);
  return response.json();
 }
+// The assistant turn of an image-only answer contains no model text, only the
+// screen-reader heading and the action buttons. Reporting that chrome as a model
+// reply is how "ChatGPT 说：编辑" ended up in a failure message, so anything that
+// is left after removing the chrome and is still tiny counts as no reply at all.
+function modelReply(info){
+ const text=String(info?.assistantText||'')
+  .replace(/^ChatGPT\s*(?:说|said)\s*[:：]?\s*/i,'')
+  .replace(/编辑|复制|重新生成|分享|朗读|点赞|点踩|Edit|Copy|Regenerate|Share|Read aloud/g,'')
+  .replace(/\s+/g,' ').trim();
+ return text.length>=6?text.slice(0,700):'';
+}
 async function pageStep(operation,job){
  try {
  const buttons=()=>Array.from(document.querySelectorAll('button'));
  const byLabel=labels=>buttons().find(b=>labels.includes(b.getAttribute('aria-label')||'') || labels.includes(b.innerText.trim()));
  const roles=role=>Array.from(document.querySelectorAll(role==='user'?'[data-user-message-bubble]':`[data-conversation-role="${role}"]`));
- const root=node=>node?.parentElement;
- const user=roles('user'),assistant=roles('assistant'),lastUser=root(user.at(-1)),lastAssistant=root(assistant.at(-1));
+ const turn=node=>{
+  if(!node)return null;
+  if(typeof node.closest==='function'){const found=node.closest('[data-testid^="conversation-turn"]');if(found)return found;}
+  return node.parentElement||node;
+ };
+ const user=roles('user'),assistant=roles('assistant'),lastUser=turn(user.at(-1)),lastAssistant=turn(assistant.at(-1));
  const editor=document.querySelector('[role="textbox"][contenteditable="true"]');
  const stop=byLabel(['停止','Stop','停止生成','Stop generating']);
  const marker='QQ绘图任务 '+job.id;
  const matching=lastUser?.innerText.includes(marker);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
- const images=lastAssistant?Array.from(lastAssistant.querySelectorAll('[data-testid="generated-image-preview"] img')):[];
+ // ChatGPT has shipped several wrappers for a generated image, so identify one by
+ // what it is — a large bitmap — instead of a single data-testid that can be
+ // renamed without notice. Avatars, icons and emoji are small and are skipped.
+ const source=img=>String(img?.currentSrc||img?.src||img?.getAttribute?.('src')||'');
+ const area=img=>(Number(img.naturalWidth)||0)*(Number(img.naturalHeight)||0);
+ const looksGenerated=img=>{
+  if(!img || typeof img.getAttribute!=='function')return false;
+  if(!/^(?:blob:|data:image\/|https?:\/\/)/i.test(source(img)))return false;
+  if(/avatar|profile|icon|emoji|头像/i.test(String(img.getAttribute('alt')||'')+String(img.getAttribute('data-testid')||'')))return false;
+  const width=Number(img.naturalWidth)||0,height=Number(img.naturalHeight)||0;
+  return width>=200 && height>=200;
+ };
+ const insideUser=img=>user.some(node=>{const scope=turn(node);return scope && typeof scope.contains==='function' && scope.contains(img);});
+ // The newest assistant turn is the only place a fresh generation can appear.
+ // Scanning the page is a fallback for DOM variants that move the preview out of
+ // the turn; it is restricted to images outside the user bubble (the reference
+ // image) and outside every older turn, so an earlier picture in the same thread
+ // can never be handed back as the result of the current request.
+ const turnNodes=Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+ const newestTurn=turnNodes[turnNodes.length-1]||lastAssistant;
+ const stale=img=>insideUser(img)||turnNodes.some(node=>node!==newestTurn && typeof node.contains==='function' && node.contains(img));
+ const scoped=lastAssistant?Array.from(lastAssistant.querySelectorAll('img')).filter(looksGenerated):[];
+ const images=(scoped.length?scoped
+  :assistant.length>(job.baseline||0)?Array.from(document.querySelectorAll('img')).filter(img=>looksGenerated(img)&&!stale(img)):[]
+ ).sort((a,b)=>area(b)-area(a));
+ const best=images[0]||null;
+ const imageReady=!!best && best.complete!==false && Number(best.naturalWidth)>0 && Number(best.naturalHeight)>0;
+ const imageLoading=!imageReady && images.some(img=>img.complete===false || !(Number(img.naturalWidth)>0));
+ // An image-only answer carries no model text at all, so an empty turn is not a
+ // finished answer. Any progress wording is read from this turn only: the user's
+ // own prompt often contains the word "生成" and must never look like activity.
+ const turnText=String(lastAssistant?.innerText||'')+'\n'+String(lastAssistant?.textContent||'').slice(0,1500);
+ const generating=!!stop || /正在生成|生成中|正在创建|正在绘制|Generating|Creating image/i.test(turnText);
+ const probeDom=()=>({
+  turns:document.querySelectorAll('[data-testid^="conversation-turn"]').length,
+  roleNodes:Array.from(document.querySelectorAll('[data-message-author-role],[data-conversation-role]')).slice(0,20)
+   .map(el=>el.tagName.toLowerCase()+'@'+(el.getAttribute('data-message-author-role')||el.getAttribute('data-conversation-role')||'')),
+  images:Array.from(document.querySelectorAll('img')).slice(0,20).map(img=>({
+   src:source(img).replace(/^([a-z]+:)[\s\S]*/i,'$1').slice(0,12),
+   alt:String(img.getAttribute?.('alt')||'').slice(0,40),
+   testid:String(img.getAttribute?.('data-testid')||'').slice(0,40),
+   w:Number(img.naturalWidth)||0,h:Number(img.naturalHeight)||0,complete:img.complete!==false,inUser:insideUser(img)})),
+  assistantHtml:String(lastAssistant?.outerHTML||'').slice(0,2500)});
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.
  const composer=editor && typeof editor.closest==='function'
@@ -55,12 +112,17 @@ async function pageStep(operation,job){
  const chatGroup=document.querySelector('[aria-label="撰写器模式"], [aria-label="Composer mode"]');
  const chatButton=chatGroup && Array.from(chatGroup.querySelectorAll('button')).find(b=>['聊天','Chat'].includes(b.innerText.trim()));
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,matching:!!matching,editor:!!editor,
-  stopping:!!stop,images:images.length,imageReady:images.length===1 && images[0].complete && images[0].naturalWidth>0,
+  stopping:!!stop,generating,images:images.length,imageReady,imageLoading,
   attachments:new Set(attachmentNodes).size,
   assistantText:lastAssistant?.innerText.slice(0,1800)||'',needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
- if(operation==='inspect')return snapshot;
+ if(operation==='inspect'){
+  // Ground truth for the next failure: when no image ever shows up, keep the
+  // page's structure so the selectors can be corrected without guessing.
+  if(!images.length && job.sentAt && Date.now()-job.sentAt>90000)snapshot.probe=probeDom();
+  return snapshot;
+ }
  if(operation==='chat'){if(chatButton)chatButton.click();return snapshot;}
  if(operation==='stop'){if(stop)stop.click();return {stopped:!!stop};}
  if(operation==='attach'){
@@ -227,13 +289,25 @@ async function tick(){
    const image=await page(current.tabId,'image',current);
    await api('/result',{id:task.id,...image});await store(null,'图片已交给 Koishi 回传 QQ');return;
   }
-  if(Date.now()-current.sentAt<15000)return;
+  // ChatGPT renders the empty assistant turn long before the picture exists, and
+  // generation regularly needs a minute or more. Keep waiting while the page
+  // still looks busy instead of treating a text-less turn as a finished answer.
+  const fail=message=>{const error=Error(message);error.probe=info.probe;return error;};
+  const waited=Date.now()-current.sentAt;
+  if(waited<20000)return;
+  // Checked before the busy branch below, otherwise a page that never stops
+  // looking busy would wait out the bridge timeout instead of failing clearly.
+  if(waited>240000)throw fail('等待网页出图超时，未检测到本轮图片');
+  if(info.generating||info.imageLoading||info.stopping){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成图片');return;}
   if(current.lastText!==info.assistantText){current.lastText=info.assistantText;current.stableAt=Date.now();await store(current,'正在等待网页返回图片');return;}
-  if(Date.now()-current.stableAt>10000 && info.assistantText)throw Error(info.assistantText);
+  // Only a real model reply is reported immediately (a refusal or a text answer).
+  // Silence is not an answer, so it is given a much longer budget.
+  const reply=modelReply(info);
+  if(reply && waited>45000 && Date.now()-current.stableAt>20000)throw fail(reply);
  }catch(err){
   const message=String(err.message||err).slice(0,1800);
   if(current?.id){
-   try{await api('/failure',{id:current.id,message});await store(null,'任务失败：'+message);}catch{await chrome.storage.local.set({status:'本机连接中断，未重发网页请求'});}
+   try{await api('/failure',{id:current.id,message,probe:err.probe});await store(null,'任务失败：'+message);}catch{await chrome.storage.local.set({status:'本机连接中断，未重发网页请求'});}
   }else await chrome.storage.local.set({status:'等待本机 Koishi 连接：'+message});
  }finally{ticking=false;}
 }
