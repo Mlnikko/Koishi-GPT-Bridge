@@ -3,6 +3,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { MAX_INPUT_IMAGES } = require('../lib/image.cjs');
+const { submissionText, imagesOf, isEmpty } = require('./message.cjs');
+
+// 任务负载的版本号。生图时代的任务没有这个字段，语义也已不适用，
+// 载入时直接跳过（不删除），把目录留给用户自己处理。
+const JOB_VERSION = 2;
+const MAX_INPUT_CHARS = 1500;
+const MAX_QUEUED = 5;
 
 // The download staging directory and the job directory normally share a volume,
 // but a configured temp path may not; fall back to copy + unlink in that case.
@@ -16,13 +23,16 @@ function moveFile(source, destination) {
 }
 
 class JobQueue {
-  constructor(root, runner, onChange = async () => {}) {
-    this.root = root; this.runner = runner; this.onChange = onChange; this.jobs = []; this.active = null; this.closed = false;
+  constructor(root, runner, onChange = async () => {}, { maxImages = MAX_INPUT_IMAGES, maxChars = MAX_INPUT_CHARS } = {}) {
+    this.root = root; this.runner = runner; this.onChange = onChange;
+    this.maxImages = maxImages; this.maxChars = maxChars;
+    this.jobs = []; this.active = null; this.closed = false;
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     for (const name of fs.readdirSync(root)) {
       if (!/^[a-f0-9]{12}$/.test(name)) continue;
       try {
         const j = JSON.parse(fs.readFileSync(path.join(root, name, 'job.json'), 'utf8'));
+        if (j.version !== JOB_VERSION) continue;
         j.dir = path.join(root, name);
         if (['queued', 'running'].includes(j.status)) { j.status = 'interrupted'; j.error = '服务重启，原任务状态待确认；未自动重试'; }
         this.jobs.push(j); this.save(j);
@@ -34,31 +44,33 @@ class JobQueue {
     const p = path.join(j.dir, 'job.json');
     fs.writeFileSync(p + '.tmp', JSON.stringify(j, null, 2), { mode: 0o600 }); fs.renameSync(p + '.tmp', p);
   }
-  enqueue({ owner, conversation, messageId, prompt, sessionId, inputImages = [] }) {
+  // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
+  // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
+  enqueue({ owner, conversation, messageId, sessionId, segments = [] }) {
     const duplicate = this.jobs.find(j => j.owner === owner && j.conversation === conversation && j.messageId === messageId);
     if (duplicate) return { job: duplicate, duplicate: true };
-    if (this.closed) throw new Error('生图服务正在关闭');
-    const text = String(prompt || '').trim();
-    if (text.length > 1500) throw new Error('图片描述最多 1500 字');
-    // A pure-image message carries no text; a reference image is the request.
-    if (!text && !inputImages.length) throw new Error('请输入 1–1500 字的图片描述，或直接发送一张图片');
-    if (inputImages.length > MAX_INPUT_IMAGES) throw new Error(`一次最多参考 ${MAX_INPUT_IMAGES} 张图片`);
-    if (this.jobs.filter(j => ['queued', 'running'].includes(j.status)).length >= 5) throw new Error('队列已满，请稍后再试');
+    if (this.closed) throw new Error('桥接服务正在关闭');
+    const list = Array.isArray(segments) ? segments : [];
+    const text = submissionText(list);
+    if (text.length > this.maxChars) throw new Error(`文字最多 ${this.maxChars} 字，请缩短后重新发送`);
+    if (isEmpty(list)) throw new Error('消息里既没有文字也没有图片');
+    if (imagesOf(list).length > this.maxImages) throw new Error(`一次最多发送 ${this.maxImages} 张图片`);
+    if (this.jobs.filter(j => ['queued', 'running'].includes(j.status)).length >= MAX_QUEUED) throw new Error('队列已满，请稍后再试');
     const id = randomUUID().replaceAll('-', '').slice(0, 12);
     const dir = path.join(this.root, id);
-    const files = [];
+    const input = [];
     try {
       fs.mkdirSync(dir, { mode: 0o700 });
-      // Staged downloads move into the job directory before the job is saved, so
-      // a restart can always resolve every recorded reference image.
-      inputImages.forEach((image, index) => {
-        const name = `input-${index}.${image.ext}`;
-        moveFile(image.file, path.join(dir, name));
-        files.push({ file: name, mime: image.mime, size: image.size });
-      });
+      let index = 0;
+      for (const segment of list) {
+        if (segment.type !== 'image') { input.push({ type: 'text', text: segment.text }); continue; }
+        const name = `input-${index}.${segment.ext}`;
+        moveFile(segment.file, path.join(dir, name));
+        input.push({ type: 'image', file: name, mime: segment.mime, size: segment.size });
+        index++;
+      }
     } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
-    const j = { id, owner, conversation, messageId, prompt: text, sessionId,
-      kind: files.length ? 'image' : 'text', inputImages: files,
+    const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input,
       status: 'queued', delivery: 'pending', createdAt: Date.now(), dir };
     this.jobs.push(j); this.save(j);
     return { job: j, duplicate: false };
@@ -73,9 +85,9 @@ class JobQueue {
     job.status = 'running'; job.startedAt = Date.now(); this.save(job);
     try {
       await this.onChange(job);
-      const image = await this.runner(job, controller.signal, threadId => { job.threadId = threadId; this.save(job); });
+      const output = await this.runner(job, controller.signal, threadId => { job.threadId = threadId; this.save(job); });
       if (controller.signal.aborted) { job.status = 'cancelled'; }
-      else { job.image = image; job.status = 'ready'; job.finishedAt = Date.now(); }
+      else { job.output = output; job.status = 'ready'; job.finishedAt = Date.now(); }
     } catch (err) { job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = String(err.message).slice(0,1000); job.errorCode = err.code || 'unknown'; }
     this.save(job);
     try { await this.onChange(job); } catch {}
@@ -84,10 +96,10 @@ class JobQueue {
   }
   cancel(j) {
     if (j.status === 'queued') { j.status = 'cancelled'; this.save(j); return '已取消排队任务'; }
-    if (this.active?.job.id === j.id) { this.active.controller.abort(); return '已请求停止任务，等待本机进程退出'; }
+    if (this.active?.job.id === j.id) { this.active.controller.abort(); return '已请求停止生成，等待网页确认'; }
     return '任务已结束，无需取消';
   }
-  // Reference images and results are kept forever by default, because the
+  // Reference images and replies are kept forever by default, because the
   // retention window is a policy decision rather than a technical one. Setting
   // retentionDays opts in: terminal jobs older than the window are removed whole.
   prune(retentionDays) {
@@ -107,4 +119,4 @@ class JobQueue {
   }
   close() { this.closed = true; this.active?.controller.abort(); }
 }
-module.exports = { JobQueue };
+module.exports = { JobQueue, JOB_VERSION, MAX_INPUT_CHARS, MAX_QUEUED };

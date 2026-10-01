@@ -2,12 +2,18 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { failureInfo, safeReason, textMessage } = require('../../src/lib/feedback.cjs');
 
-test('explicit refusal, unavailable tool and ambiguous missing image stay distinct', () => {
-  assert.equal(failureInfo({ noImage: true, reply: '抱歉，我不能生成这类图片。可以改为经典服装。' }).code, 'refused');
-  assert.equal(failureInfo({ noImage: true, reply: '图像生成工具不可用。' }).code, 'tool_unavailable');
-  assert.equal(failureInfo({ noImage: true, reply: '图片已生成。' }).code, 'no_image');
+test('a model refusal is never classified as a failure', () => {
+  // 「抱歉，我不能…」在通用桥接里就是它该给的回复，会被原样回传给用户。
+  // 归类成 refused / tool_unavailable 就等于把用户真正想看的内容丢掉。
+  for (const reply of ['抱歉，我不能生成这类图片。', '图像生成工具不可用。', '我不能帮你做这个。'])
+    assert.equal(failureInfo({ technical: reply }).code, 'execution_failed', reply);
+  assert.equal(failureInfo({ reply: '抱歉，我不能生成这类图片。' }).code, 'execution_failed');
+});
+test('technical problems keep distinct codes', () => {
   assert.equal(failureInfo({ technical: 'network connection reset' }).code, 'network');
-  assert.equal(failureInfo({ technical: 'content_policy_violation' }).code, 'content_rejected');
+  assert.equal(failureInfo({ technical: '读取不到回复内容' }).code, 'reply_unreadable');
+  assert.equal(failureInfo({ technical: '页面加载超时' }).code, 'browser_interaction');
+  assert.equal(failureInfo({ technical: 'boom' }).code, 'execution_failed');
 });
 test('authentication errors are distinguished from rate limits', () => {
   assert.equal(failureInfo({ technical: 'unexpected status 401 Unauthorized: Missing bearer' }).code, 'authentication');
@@ -19,9 +25,9 @@ test('diagnostics are backend neutral and never claim a local CLI', () => {
   // The only backend is the ChatGPT web page, so user-facing text must not
   // mention Codex or any other local executable.
   for (const info of [
-    failureInfo({ noImage: true, reply: '抱歉，我不能生成这类图片。' }),
-    failureInfo({ noImage: true, reply: '图像生成工具不可用。' }),
-    failureInfo({ noImage: true, reply: '图片已生成。' }),
+    failureInfo({ technical: '抱歉，我不能生成这类图片。' }),
+    failureInfo({ technical: '图像生成工具不可用。' }),
+    failureInfo({ technical: '读取不到回复内容' }),
     failureInfo({ technical: 'network connection reset' }),
     failureInfo({ technical: 'unexpected status 401 Unauthorized' }),
     failureInfo({ technical: 'boom' }),

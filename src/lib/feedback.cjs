@@ -14,28 +14,28 @@ function safeReason(value) {
     .replace(/[\u0000-\u0008\u000b-\u001f]/g, '').trim().slice(0, 700);
 }
 
-function failureInfo({ technical = '', reply = '', noImage = false }) {
-  // Technical errors and model replies have different meanings; do not infer quota
-  // or policy from the absence of a file alone.
+// 只归类技术失败。
+//
+// 模型的内容拒绝**不是**失败：在通用桥接里「抱歉，我不能帮你做这个」就是它该给的回复，
+// 会原样回传给用户。把拒绝判成失败会把用户真正想看的内容丢掉，所以这里没有
+// refused / tool_unavailable / content_rejected 这类判定，也没有「没有图片」这种推断。
+function failureInfo({ technical = '' } = {}) {
   let code, title;
   if (/401|unauthorized|authentication|not logged in/i.test(technical)) {
-    code = 'authentication'; title = '生成服务登录认证失败，请检查登录状态';
+    code = 'authentication'; title = 'ChatGPT 网页登录认证失败，请检查登录状态';
   } else if (/rate.limit|quota|usage.limit|429/i.test(technical)) {
-    code = 'rate_limit'; title = '生成服务额度或速率受限，请稍后重试';
-  } else if (/content_policy|safety.*(?:reject|block)|moderation.*(?:reject|block)/i.test(technical)) {
-    code = 'content_rejected'; title = '生成服务拒绝了本次内容';
+    code = 'rate_limit'; title = 'ChatGPT 网页额度或速率受限，请稍后重试';
   } else if (/ECONN|ENOTFOUND|ETIMEDOUT|fetch failed|network|connection.*(?:closed|reset)|stream disconnected/i.test(technical)) {
-    code = 'network'; title = '生成服务网络连接失败，未自动重新生成';
-  } else if (noImage && /(?:工具|tool).{0,50}(?:不可用|未提供|unavailable|not available)|(?:没有|无法使用).{0,30}(?:生图|图像生成)工具/is.test(reply)) {
-    code = 'tool_unavailable'; title = '生成服务的生图工具不可用';
-  } else if (noImage && /(?:不能|无法|不允许|不支持).{0,70}(?:生成|绘制)|(?:cannot|can't|unable to).{0,50}(?:generate|create)|(?:抱歉|sorry).{0,60}(?:拒绝|不能|无法)/is.test(reply)) {
-    code = 'refused'; title = '生成服务拒绝生成本次图片';
+    code = 'network'; title = '网络连接失败，未自动重试';
+  } else if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加/.test(technical)) {
+    code = 'browser_interaction'; title = 'ChatGPT 网页操作未完成';
+  } else if (/没有返回|内容为空|读取不到|无法读取回复|回复结构/.test(technical)) {
+    code = 'reply_unreadable'; title = '网页已结束回答，但没有读到可回传的内容';
   } else {
-    code = noImage ? 'no_image' : 'execution_failed';
-    title = noImage ? '生成已结束，但没有可用图片；尚不能确定是内容限制' : '生成失败';
+    code = 'execution_failed'; title = '任务失败';
   }
-  const reason = safeReason(reply || technical);
-  return { code, message: title + (reason ? `\n${reply ? '模型回复' : '错误详情'}：${reason}` : '\n未返回明确原因，请检查本机任务记录。') };
+  const reason = safeReason(technical);
+  return { code, message: title + (reason ? `\n详情：${reason}` : '\n未返回明确原因，请检查本机任务记录。') };
 }
 
 function textMessage(value) {

@@ -1,98 +1,173 @@
 const { test }=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
-const {WebBridge,webFailure,saveImage}=require('../../src/bridge/web-bridge.cjs');
+const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
 function png(width=8,height=8,size=256){const bytes=Buffer.alloc(size);Buffer.from('89504e470d0a1a0a','hex').copy(bytes,0);bytes.writeUInt32BE(13,8);Buffer.from('IHDR','latin1').copy(bytes,12);bytes.writeUInt32BE(width,16);bytes.writeUInt32BE(height,20);return bytes;}
-async function setup(t){const root=temp(),b=new WebBridge({root,port:0});await b.ready;t.after(()=>b.close());return {b,job:{id:'abcdef123456',prompt:'a blue circle',dir:root},call:async(route,body,token=b.token)=>fetch(`http://127.0.0.1:${b.port}${route}`,{method:body?'POST':'GET',headers:{'x-bridge-token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined})};}
+async function setup(t){
+ const root=temp(),b=new WebBridge({root,port:0});await b.ready;t.after(()=>b.close());
+ const call=async(route,body,token=b.token)=>fetch(`http://127.0.0.1:${b.port}${route}`,{method:body?'POST':'GET',headers:{'x-bridge-token':token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+ const asset=(route,bytes,token=b.token)=>fetch(`http://127.0.0.1:${b.port}${route}`,{method:'POST',headers:{'x-bridge-token':token,'Content-Type':'image/png'},body:bytes});
+ return {b,root,call,asset,job:{id:'abcdef123456',input:[{type:'text',text:'a blue circle'}],dir:root}};
+}
 test('web bridge requires local token and online extension before accepting a task',async t=>{
  const {b,job,call}=await setup(t);
  assert.equal((await call('/state',undefined,'wrong')).status,401);
  await assert.rejects(b.run(job),err=>err.code==='browser_offline');
  await call('/state');const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
  assert.equal((await call('/state')).status,200);
- const state=await(await call('/state')).json();assert.equal(state.job.id,job.id);
+ const state=await(await call('/state')).json();
+ assert.equal(state.version,PROTOCOL_VERSION);
+ assert.equal(state.job.id,job.id);
+ assert.equal(state.job.text,'a blue circle');
  assert.equal((await call('/progress',{id:'foreign',phase:'submitted'})).status,409);
- await call('/failure',{id:job.id,message:'抱歉，我不能生成该图片。'});
- assert.equal((await p).code,'refused');
+ await call('/failure',{id:job.id,message:'ChatGPT 页面加载超时'});
+ assert.equal((await p).code,'browser_interaction');
 });
-test('web result thread must match saved conversation; a mismatch cannot return an image',async t=>{
+test('web result thread must match saved conversation; a mismatch cannot return a reply',async t=>{
  const {b,job,call}=await setup(t);await call('/state');
  const p=b.run(job,{threadId:id}).catch(e=>e);await new Promise(setImmediate);
- const response=await call('/result',{id:job.id,threadId:'99999999-2222-3333-4444-555555555555',base64:'AAAA'});
+ const response=await call('/result',{id:job.id,threadId:'99999999-2222-3333-4444-555555555555',segments:[{type:'text',text:'hi'}]});
  assert.equal(response.status,400);assert.equal((await p).code,'thread_mismatch');
- assert.equal(fs.existsSync(path.join(job.dir,'result.png')),false);
+ assert.equal(fs.existsSync(path.join(job.dir,'reply.md')),false);
 });
-test('browser cancellation waits for acknowledgement and never accepts late image',async t=>{
+test('browser cancellation waits for acknowledgement and never accepts a late reply',async t=>{
  const {b,job,call}=await setup(t);await call('/state');const controller=new AbortController();
  const p=b.run(job,{signal:controller.signal}).catch(e=>e);await new Promise(setImmediate);controller.abort();
  assert.equal((await(await call('/state')).json()).job.cancelled,true);
- await call('/result',{id:job.id,threadId:id,base64:'AAAA'});
- assert.equal((await p).code,'cancelled');assert.equal(fs.existsSync(path.join(job.dir,'result.png')),false);
+ await call('/result',{id:job.id,threadId:id,segments:[{type:'text',text:'late'}]});
+ assert.equal((await p).code,'cancelled');assert.equal(fs.existsSync(path.join(job.dir,'reply.md')),false);
 });
-test('web errors report authentication and quota separately',()=>{
+test('a text reply is stored whole and keeps its code fences on disk',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const segments=[{type:'text',text:'两种写法：'},{type:'code',language:'js',text:'const a = 1;'},{type:'text',text:'第二种同理。'}];
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments})).status,200);
+ assert.deepEqual(await p,[
+  {type:'text',text:'两种写法：'},
+  {type:'code',language:'js',text:'const a = 1;'},
+  {type:'text',text:'第二种同理。'},
+ ]);
+ assert.equal(fs.readFileSync(path.join(job.dir,'reply.md'),'utf8'),'两种写法：\n\n```js\nconst a = 1;\n```\n\n第二种同理。');
+});
+test('a model refusal is an ordinary reply, not a failure',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[{type:'text',text:'抱歉，我不能帮你做这个。'}]})).status,200);
+ // 关键：拒绝必须原样回传，而不是被归成某个失败码丢掉。
+ assert.deepEqual(await p,[{type:'text',text:'抱歉，我不能帮你做这个。'}]);
+});
+test('only technical problems are classified as failures',()=>{
  assert.equal(webFailure('请登录 ChatGPT').code,'authentication');
- assert.equal(webFailure('已达到图片生成上限').code,'rate_limit');
- assert.equal(webFailure('图片已生成').code,'no_image');
- assert.equal(webFailure('等待网页出图超时，未检测到本轮图片').code,'no_image');
+ assert.equal(webFailure('429 rate_limit_exceeded').code,'rate_limit');
  assert.equal(webFailure('参考图片上传超时，未提交请求').code,'browser_interaction');
+ assert.equal(webFailure('读取不到回复内容').code,'reply_unreadable');
+ assert.equal(webFailure('ECONNRESET').code,'network');
+ // 拒绝文案不再被当成失败分类。
+ assert.equal(webFailure('抱歉，我不能生成该图片。').code,'execution_failed');
 });
 test('a page-structure probe from the extension is kept beside the job, never breaking the report',async t=>{
  const {b,job,call}=await setup(t);await call('/state');
  const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
- const probe={turns:3,roleNodes:['div@assistant'],images:[{src:'blob:',alt:'生成图片',w:1024,h:1024,complete:true,inUser:false}],assistantHtml:'<article></article>'};
- assert.equal((await call('/failure',{id:job.id,message:'等待网页出图超时，未检测到本轮图片',probe})).status,200);
- assert.equal((await p).code,'no_image');
+ const probe={turns:3,roleNodes:['h4@assistant'],images:[{src:'blob:',alt:'',w:1024,h:1024,complete:true,inUser:false}],assistantHtml:'<article></article>'};
+ assert.equal((await call('/failure',{id:job.id,message:'读取不到回复内容',probe})).status,200);
+ assert.equal((await p).code,'reply_unreadable');
  const file=path.join(job.dir,'dom-probe.json');
  const saved=JSON.parse(fs.readFileSync(file,'utf8'));
  assert.equal(saved.turns,3);assert.equal(saved.images[0].w,1024);assert.ok(saved.at>0);
  // An oversized probe is dropped, and the failure is still reported normally.
  await call('/state');const q=b.run(job).catch(e=>e);await new Promise(setImmediate);
- await call('/failure',{id:job.id,message:'等待网页出图超时，未检测到本轮图片',probe:{blob:'x'.repeat(40000)}});
- assert.equal((await q).code,'no_image');
+ await call('/failure',{id:job.id,message:'读取不到回复内容',probe:{blob:'x'.repeat(40000)}});
+ assert.equal((await q).code,'reply_unreadable');
  assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).turns,3);
 });
-test('a fallback-scan probe rides along with a result so a wrong picture stays auditable',async t=>{
+test('a probe rides along with a result so a suspicious reply stays auditable',async t=>{
  const {b,job,call}=await setup(t);await call('/state');
  const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
  const probe={turns:2,images:[{src:'https:',alt:'',testid:'profile-button',w:512,h:512,complete:true,chrome:true,picked:true}],assistantHtml:'<article></article>'};
- assert.equal((await call('/result',{id:job.id,threadId:id,base64:png(512,512).toString('base64'),probe})).status,200);
- assert.equal(await p,path.join(job.dir,'result.png'));
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[{type:'text',text:'hi'}],probe})).status,200);
+ assert.deepEqual(await p,[{type:'text',text:'hi'}]);
  const saved=JSON.parse(fs.readFileSync(path.join(job.dir,'result-probe.json'),'utf8'));
  assert.equal(saved.images[0].chrome,true);assert.equal(saved.images[0].w,512);assert.ok(saved.at>0);
  // A result without a probe writes nothing extra and still lands normally.
  const second=await setup(t);await second.call('/state');
  const q=second.b.run(second.job).catch(e=>e);await new Promise(setImmediate);
- await second.call('/result',{id:second.job.id,threadId:id,base64:png(1024,1024).toString('base64')});
- assert.equal(await q,path.join(second.job.dir,'result.png'));
+ await second.call('/result',{id:second.job.id,threadId:id,segments:[{type:'text',text:'ok'}]});
+ assert.deepEqual(await q,[{type:'text',text:'ok'}]);
  assert.equal(fs.existsSync(path.join(second.job.dir,'result-probe.json')),false);
 });
-test('web result images are validated from their PNG header without external tools',()=>{
- const dir=temp(),destination=path.join(dir,'result.png');
- assert.throws(()=>saveImage(Buffer.from('not an image at all').toString('base64'),destination),err=>err.code==='image_invalid');
- assert.throws(()=>saveImage(png(8,8,64).toString('base64'),destination),err=>err.code==='image_invalid');
- assert.equal(saveImage(png(1254,1254).toString('base64'),destination),destination);
+test('reply images are uploaded as raw bytes and referenced by index',async t=>{
+ const {b,job,call,asset}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=0`,png(1024,768))).status,200);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=1`,png(512,512))).status,200);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[
+   {type:'text',text:'两个版本：'},
+   {type:'image',asset:0,mime:'image/png'},
+   {type:'text',text:'或者：'},
+   {type:'image',asset:1,mime:'image/png'},
+ ]})).status,200);
+ assert.deepEqual(await p,[
+  {type:'text',text:'两个版本：'},
+  {type:'image',asset:0,mime:'image/png'},
+  {type:'text',text:'或者：'},
+  {type:'image',asset:1,mime:'image/png'},
+ ]);
+ assert.equal(fs.existsSync(path.join(job.dir,'result-0.png')),true);
+ assert.equal(fs.existsSync(path.join(job.dir,'result-1.png')),true);
+});
+test('a reply that references an image the page never uploaded is refused whole',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[{type:'image',asset:0}]})).status,400);
+ assert.equal((await p).code,'reply_invalid');
+ assert.equal(fs.existsSync(path.join(job.dir,'reply.md')),false);
+});
+test('an out-of-order asset upload is refused, so indices cannot be faked',async t=>{
+ const {b,job,call,asset}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=1`,png(64,64))).status,400);
+ assert.equal((await asset(`/result-asset?id=foreign&i=0`,png(64,64))).status,409);
+ assert.equal(fs.existsSync(path.join(job.dir,'result-1.png')),false);
+ await call('/failure',{id:job.id,message:'页面加载超时'});
+ await p;
+});
+test('unknown or empty reply segments are refused',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[{type:'script',text:'evil'}]})).status,400);
+ assert.equal((await p).code,'reply_invalid');
+ const second=await setup(t);await second.call('/state');
+ const q=second.b.run(second.job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await second.call('/result',{id:second.job.id,threadId:id,segments:[]})).status,400);
+ assert.equal((await q).code,'empty_reply');
+});
+test('reply images are validated from their PNG header without external tools',()=>{
+ const dir=temp(),destination=path.join(dir,'result-0.png');
+ assert.throws(()=>saveAsset(Buffer.from('not an image at all, definitely not a png'),destination),err=>err.code==='image_invalid');
+ assert.throws(()=>saveAsset(png(8,8,64),destination),err=>err.code==='image_invalid');
+ assert.equal(saveAsset(png(1254,1254),destination),destination);
  assert.equal(fs.existsSync(destination),true);
  if(process.platform!=='win32')assert.equal(fs.statSync(destination).mode & 0o777,0o600);
 });
 test('reference images are advertised on /state and streamed from /input behind the token',async t=>{
  const {b,job,call}=await setup(t);
  fs.writeFileSync(path.join(job.dir,'input-0.png'),png(4,4));
- const task={...job,kind:'image',inputImages:[{file:'input-0.png',mime:'image/png',size:256}]};
+ const task={...job,input:[{type:'text',text:'看看这个'},{type:'image',file:'input-0.png',mime:'image/png',size:256}]};
  await call('/state');
  const p=b.run(task).catch(e=>e);await new Promise(setImmediate);
  const state=await(await call('/state')).json();
  assert.deepEqual(state.job.images,[{index:0,mime:'image/png',name:'input-0.png',size:256}]);
- assert.equal(state.job.kind,'image');
+ assert.equal(state.job.text,'看看这个');
  const image=await call('/input?id='+job.id+'&i=0');
  assert.equal(image.status,200);assert.equal(image.headers.get('content-type'),'image/png');
  assert.equal((await image.arrayBuffer()).byteLength,256);
  assert.equal((await call('/input?id=foreign&i=0')).status,409);
  assert.equal((await call('/input?id='+job.id+'&i=9')).status,404);
  assert.equal((await call('/input?id='+job.id+'&i=0',undefined,'wrong-token')).status,401);
- await call('/failure',{id:job.id,message:'抱歉，我不能生成该图片。'});
- assert.equal((await p).code,'refused');
+ await call('/failure',{id:job.id,message:'页面加载超时'});
+ await p;
 });
 test('a task without reference images advertises an empty list',async t=>{
  const {b,job,call}=await setup(t);await call('/state');
@@ -100,6 +175,6 @@ test('a task without reference images advertises an empty list',async t=>{
  const state=await(await call('/state')).json();
  assert.deepEqual(state.job.images,[]);
  assert.equal((await call('/input?id='+job.id+'&i=0')).status,404);
- await call('/failure',{id:job.id,message:'图片已生成'});
- assert.equal((await p).code,'no_image');
+ await call('/failure',{id:job.id,message:'页面加载超时'});
+ await p;
 });
