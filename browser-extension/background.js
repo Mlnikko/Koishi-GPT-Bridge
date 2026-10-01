@@ -55,14 +55,22 @@ async function pageStep(operation,job){
 const source=img=>String(img?.currentSrc||img?.src||img?.getAttribute?.('src')||'');
 // Size alone does not separate a generated picture from the signed-in account's
 // avatar: that avatar is a 512×512 bitmap in the page chrome, it lives outside
-// every conversation turn, and it is already loaded. Anything in the header or
-// sidebar, or outside the conversation area, is chrome.
+// every conversation turn, and it is already loaded.
 const conversationArea=document.querySelector('main');
-const isChrome=img=>{
- if(typeof img.closest!=='function')return false;
- if(img.closest('header, nav, aside, [data-testid*="profile" i], [data-testid*="sidebar" i]'))return true;
- return !!conversationArea && typeof conversationArea.contains==='function' && !conversationArea.contains(img);
+// 已经在最新回复轮次内部的图片直接放行：位置本身就是最强的证据。
+// 「不在 <main> 内」是一条依赖页面结构的假设，ChatGPT 一旦把会话渲染到 <main> 之外，
+// 它就会把真正的生成图整批判成页面框架 —— 任务 e1d8e9675311 就是这样等满 240 秒后
+// 报「未检测到本轮图片」，而页面上那张 1367×1150 的图一直都在。
+const inReplyTurn=img=>!!lastAssistant && typeof lastAssistant.contains==='function' && lastAssistant.contains(img);
+const chromeReason=img=>{
+ if(typeof img.closest!=='function')return '';
+ const ancestor=img.closest('header, nav, aside, [data-testid*="profile" i], [data-testid*="sidebar" i]');
+ if(ancestor)return 'ancestor:'+String(ancestor.tagName).toLowerCase();
+ if(inReplyTurn(img))return '';
+ if(conversationArea && typeof conversationArea.contains==='function' && !conversationArea.contains(img))return 'outside-main';
+ return '';
 };
+const isChrome=img=>!!chromeReason(img);
 const looksGenerated=img=>{
  if(!img || typeof img.getAttribute!=='function')return false;
  if(!/^(?:blob:|data:image\/|https?:\/\/)/i.test(source(img)))return false;
@@ -198,7 +206,7 @@ const userText=String(lastUser?.innerText||'');
 const submitted=user.length>(job.userBaseline||0);
 const probeDom=()=>({
  turns:document.querySelectorAll('[data-testid^="conversation-turn"]').length,
- userNodes:user.length,assistantAnchor:!!lastAssistant,
+ userNodes:user.length,assistantAnchor:!!lastAssistant,main:!!conversationArea,
  roleNodes:Array.from(document.querySelectorAll('[data-message-author-role],[data-conversation-role]')).slice(0,20)
   .map(el=>el.tagName.toLowerCase()+'@'+(el.getAttribute('data-message-author-role')||el.getAttribute('data-conversation-role')||'')),
  images:Array.from(document.querySelectorAll('img')).slice(0,20).map(img=>({
@@ -206,7 +214,9 @@ const probeDom=()=>({
   alt:String(img.getAttribute?.('alt')||'').slice(0,40),
   testid:String(img.getAttribute?.('data-testid')||'').slice(0,40),
   w:Number(img.naturalWidth)||0,h:Number(img.naturalHeight)||0,complete:img.complete!==false,
-  inUser:insideUser(img),inUserTurn:inUserTurn(img),chrome:isChrome(img),picked:replyImages().includes(img)})),
+  inUser:insideUser(img),inUserTurn:inUserTurn(img),inReplyTurn:inReplyTurn(img),
+  chrome:isChrome(img),chromeReason:chromeReason(img),gallery:!!img.closest?.('[data-testid*="generated-image" i]'),
+  picked:replyImages().includes(img)})),
  assistantHtml:String(lastAssistant?.outerHTML||'').slice(0,2500)});
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.

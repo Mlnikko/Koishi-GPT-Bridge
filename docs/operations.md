@@ -130,7 +130,8 @@ Koishi Desktop 重启实例，于是形成「升级 → 重启 → 再升级」�
 | 端口被占用 | 5141 已被其他进程监听，改 `webBridgePort` 并重跑 `scripts/setup-web-bridge.cjs`。 |
 | 图片消息多出一行空行 | `@satorijs/adapter-qq` < 4.13.0 会给纯媒体消息填 `content: " "`。重启实例让 market 把它升到 4.13+ 即可，本项目无需改动。 |
 | 网页已经结束回答，任务却报「没有读取到可回传的内容」 | 先看 `data/jobs/<id>/dom-probe.json`（扩展在失败时附带的页面结构快照：轮次数、角色节点、每张图的来源/尺寸/是否在用户气泡内/是否属于页面框架/是否被选中、最新轮次截断 HTML）。据此判断是回复还没渲染完、Markdown 容器选择器失配，还是 `h4[data-conversation-role="assistant"]` 已经改名。 |
-| 回复里少了图片，或者图片不对 | 只在最新 assistant 轮次内找图，所以先确认图确实渲染在该轮次里。任务目录的 `result-probe.json` 记录了每张图的 `picked`/`chrome`/`inUserTurn`/`alt`：`alt` 含 `用户附件` 说明是**你自己发出去的参考图**，`chrome:true` 说明是页面框架图片。`turns` 为 `0` 说明 `[data-testid^="conversation-turn"]` 已失效，`assistantAnchor`、`userNodes` 能进一步说明轮次与用户气泡选择器是否还认得出来。改完扩展必须在 `chrome://extensions` 手动重载。 |
+| 回复里少了图片，或者图片不对 | 只在最新 assistant 轮次内找图，所以先确认图确实渲染在该轮次里。任务目录的 `result-probe.json` 记录了每张图的 `picked`/`chrome`/`chromeReason`/`inReplyTurn`/`alt`：`chromeReason` 直接说明是**哪条规则**把哪张图判掉的（`ancestor:header` 是页面框架，`outside-main` 是会话不在 `<main>` 内），`alt` 含 `用户附件` 说明是**你自己发出去的参考图**。`turns` 为 `0` 说明 `[data-testid^="conversation-turn"]` 已失效，`assistantAnchor`、`userNodes`、`main` 能进一步说明选择器是否还认得出来。改完扩展必须在 `chrome://extensions` 手动重载。 |
+| 任务卡在「ChatGPT 已接收，正在生成回复」，最后报「未检测到本轮图片」 | 图片识别没找到图，扩展会一直等到 240 秒硬上限（这是刻意的：宁可等也不返回错图）。看 `dom-probe.json` 的 `images`：如果里面有一张尺寸正常的 `blob:` 图但 `picked:false`，问题在筛选规则，看同一行的 `chromeReason` 即可定位。 |
 | 纯图片消息发不出去 | 空正文提交后如果发送按钮一直不解锁，扩展会在 5 秒后补**一个空格**再试一次。仍失败说明页面结构变了。 |
 | 输入框里留着上一次的草稿 | 只有与扩展自己记录的 `draft` 完全一致的草稿才会被自动清掉，其余内容一律不动并提示你手动清空。 |
 | 实例反复重启 | `market` 插件在逐个升级依赖，每次升级都会重启实例。等日志静默即可，不要在此期间手动改 `node_modules`。 |

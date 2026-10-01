@@ -215,10 +215,16 @@ scope.middleware((session, next) => next(() => forward(session)));
 
 只在最新 assistant 轮次内查找，且必须通过两道闸门（改这段代码时不要拆掉）：
 
-- `isChrome(img)`：在 `header`/`nav`/`aside`/`[data-testid*=profile|sidebar]` 内，或存在 `main`
-  却不在 `main` 内 → 属于页面框架，不是回复内容。账号头像走这条。
+- `chromeReason(img)`：**先看它是不是在最新回复轮次内部 —— 在就直接放行**。
+  位置本身就是最强的证据。只有不在轮次内的图片才继续判断：
+  命中 `header`/`nav`/`aside`/`[data-testid*=profile|sidebar]` 祖先，或存在 `main` 却不在 `main` 内
+  → 属于页面框架，不是回复内容。账号头像走这条。
 - `inUserTurn(img)` / `insideUser(img)`：用户自己那一轮里的图永不作为回复内容。
   用户发出去的参考图走这条（其 `alt` 就是 `用户附件`，`looksGenerated` 也据此拒绝）。
+
+> `outside-main` 这条判断依赖页面结构假设。ChatGPT 一旦把会话渲染到 `<main>` 之外，
+> 它会把真正的生成图整批判掉（任务 `e1d8e9675311` 就是这样等满 240 秒的）。
+> 所以「在回复轮次内部」必须优先于它 —— 排查时看 `result-probe.json` 的 `chromeReason`。
 
 **全页兜底扫描已删除**。它是「返回账号头像」（任务 `f948b24235f4`）与「返回用户参考图」
 （任务 `02c2fa8e036a`）两次事故的根源：ChatGPT 会先渲染空的 assistant 轮次，图片几十秒后才出现，

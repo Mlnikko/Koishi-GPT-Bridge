@@ -30,6 +30,38 @@ ChatGPT 会话编号与结果图均正常绑定。附件缩略图选择器在真
 
 ## 变更记录
 
+### 2026-10-01 · 修掉「图片明明在页面上却报未检测到本轮图片」
+
+现象：发图请求后一直收不到回复，任务等满 240 秒后失败：
+`等待网页出图超时，未检测到本轮图片`。任务 `e1d8e9675311` 的 `dom-probe.json` 直接给出了现场：
+
+```
+images:
+  {"alt":"",            chrome:true, complete:true, w:512,  h:512,  picked:false, src:"data:"}   ← 账号头像
+  {"alt":"已生成图像 1","chrome:true", complete:true, w:1367, h:1150, picked:false, src:"blob:"} ← 生成结果
+```
+
+第二张就是生成结果，尺寸、加载状态、`generated-image-gallery` 位置全部正确 —— 但它被
+`isChrome()` 判成了「页面框架图片」，于是 `replyImages()` 永远是空的。
+上一轮刚加的 `gallery && !images → 继续等` 判定因此一直成立，直到硬上限。
+
+定位：`isChrome()` 的第二条判断是「存在 `main` 但图片不在 `main` 内 → 判为页面框架」。
+这是一条**对页面结构的假设**，而当前 ChatGPT 把会话渲染在 `<main>` 之外（页面上另有 `main`），
+于是真正的生成图被整批判掉。
+
+改动（`browser-extension/background.js`）：
+
+- 抽出 `chromeReason()`，并把「已在最新回复轮次内部」放在 `outside-main` 之前直接放行 ——
+  位置本身就是最强的证据。`header`/`nav`/`aside`/`profile`/`sidebar` 祖先判断保留在最前，
+  账号头像仍然被排除。
+- `probeDom()` 增加 `main`、每张图的 `inReplyTurn`、`chromeReason`、`gallery`，
+  下次能直接看出是**哪条规则**把哪张图判掉的，不用再靠猜。
+
+测试：新增「会话不在 `<main>` 内时仍能找到生成图」与「会话不在 `<main>` 内时头像仍被排除」，
+并把 `inReplyTurn` 那道放行关掉做过反向验证（两项都失败），确认不是空转。全套 **110 项通过**。
+
+未验证：真实页面上图片渲染完成后的正向路径（本次只验证了识别逻辑）。
+
 ### 2026-10-01 · 修掉「空回复：只回传了 `#### ChatGPT 说:`」
 
 现象：群里发「参考图 + 画图」，QQ 收到一条内容为 `#### ChatGPT 说:` 的消息，

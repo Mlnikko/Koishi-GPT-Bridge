@@ -196,6 +196,55 @@ test('the assistant role heading is never part of the reply', async()=>{
  assert.equal(info.images,0);
 });
 
+test('a generated picture is still found when the conversation is not inside <main>', async()=>{
+ // 任务 e1d8e9675311 的现场：图片确实存在（1367×1150、已加载、就在
+ // generated-image-gallery 里），但会话不在 <main> 内，于是被「不在 main 内」
+ // 这条判断整批判成页面框架，等满 240 秒后报「未检测到本轮图片」。
+ const document=createDocument();
+ const unrelatedMain=el('main');            // 页面上确实有 <main>，但与会话无关
+ document.body.appendChild(unrelatedMain);
+ const page=el('div',{class:'page'});
+ document.body.appendChild(page);
+ const turn=el('div',{'data-testid':'conversation-turn-7'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']));
+ const gallery=el('div',{'data-testid':'generated-image-gallery'});
+ const button=el('button',{'data-testid':'generated-image-preview','aria-label':'已生成图像 1'});
+ button.appendChild(img('blob:https://chatgpt.com/12f867b7',{width:1367,height:1150,alt:'已生成图像 1'}));
+ gallery.appendChild(button);
+ turn.appendChild(gallery);
+ page.appendChild(turn);
+ const sandbox=sandboxOf({document});
+ const read=await sandbox.pageStep('read',{});
+ assert.equal(read.imageCount,1);
+ assert.deepEqual(plain(read.segments),[{type:'image',asset:0,mime:'image/png'}]);
+ const info=await sandbox.pageStep('inspect',{id:'abcdef123456'});
+ assert.equal(info.images,1);
+ assert.equal(info.gallery,true);
+});
+
+test('the account avatar is still excluded when the conversation sits outside <main>', async()=>{
+ const document=createDocument();
+ document.body.appendChild(el('main'));
+ const page=el('div',{class:'page'});
+ document.body.appendChild(page);
+ const header=el('header');
+ header.appendChild(img('https://chatgpt.com/avatar/me',{width:512,height:512}));
+ page.appendChild(header);
+ const turn=el('div',{'data-testid':'conversation-turn-8'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']));
+ const gallery=el('div',{'data-testid':'generated-image-gallery'});
+ gallery.appendChild(img('blob:https://chatgpt.com/real',{width:1024,height:1024,alt:'已生成图像 1'}));
+ turn.appendChild(gallery);
+ page.appendChild(turn);
+ const sandbox=sandboxOf({document});
+ const read=await sandbox.pageStep('read',{});
+ // 头像在 header 里，仍然被排除；只有回复里那张图被选中。
+ assert.equal(read.imageCount,1);
+ const probe=await sandbox.pageStep('inspect',{id:'abcdef123456'});
+ assert.equal(probe.images,1);
+ assert.equal(probe.gallery,true);
+});
+
 // ---------------------------------------------------------------- 完成判定
 
 test('a reply whose picture is still rendering is waited out, and the tab stays open', async()=>{
