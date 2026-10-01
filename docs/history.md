@@ -30,6 +30,41 @@ ChatGPT 会话编号与结果图均正常绑定。附件缩略图选择器在真
 
 ## 变更记录
 
+### 2026-10-01 · 修掉「空回复：只回传了 `#### ChatGPT 说:`」
+
+现象：群里发「参考图 + 画图」，QQ 收到一条内容为 `#### ChatGPT 说:` 的消息，
+网页上的图片**还没渲染出来就被关掉了**。
+
+定位（两处缺陷叠加）：
+
+1. **角色标题被当成了正文。** 页面当时没有暴露 markdown 容器，`replyRoot()` 退到整个轮次容器，
+   而 `<h4 data-conversation-role="assistant">` 里的「ChatGPT 说：」就在这个容器里，
+   被 `walk()` 序列化成了一条 `#### ChatGPT 说：` 的标题段。
+2. **完成判定用了「轮次里有字」这个错误的信号。** `replyStable` 取自 `lastAssistant.innerText`，
+   而空轮次本来就有无障碍标题，长度不为 0 —— 于是这个「还没出图的空轮次」被判成已完成回复。
+   扩展读完就 `chrome.tabs.remove()` 关掉专用标签页，**把还在生成的图片一起关掉了**。
+
+改动（`browser-extension/background.js`）：
+
+- `walk()` 跳过带 `data-conversation-role` / `data-message-author-role` 的元素，
+  角色标题与操作按钮不再进入回复；`replyRoot()` 增加 `[data-message-author-role="assistant"]` 候选。
+- 完成判定改为看**读出来的内容**：新增 `replyLength`（序列化后的正文长度）、`images`、
+  `imageLoading`、`gallery`，替换掉 `replyStable`/`replyText`。以下任一成立就继续等：
+  没有任何可读内容、画廊已出现但还没有可用图片、图片未加载完、页面还在忙。
+  稳定信号也从整段 `innerText` 换成序列化结果的校验和。
+- 硬上限超时会区分「一直在准备图片但没有产出」与「什么都没读到」。
+
+顺带修掉一个**测试基础设施的 bug**：`test/helpers/dom.cjs` 的选择器解析按空白切分后代组合子，
+把 `[data-testid*="generated-image" i]` 里的空格也切开了，导致带 `i` 标志的选择器永远匹配不上
+（`isChrome` 就用了 `[data-testid*="profile" i]`）。这类选择器的断言此前全部是空转。
+现在按引号与方括号深度切分，并新增 `test/helpers/dom.test.cjs` 把 DOM 桩本身也纳入测试 ——
+地基失配时测试还是绿的，但什么都没验证。
+
+测试：新增 5 项（角色标题不属于回复、空轮次不是完成、图还在画就继续等且**不关标签页**、
+图片未加载完继续等、空轮次到硬上限才失败），并把 DOM 桩的 4 项自测加入。全套 **108 项通过**。
+
+未验证：真实网页上图片渲染完成后的正向路径。
+
 ### 2026-10-01 · 从生图插件改造为通用 QQ ↔ ChatGPT 网页桥接器
 
 方向变更，设计见 `docs/design-v1.md`。目标从「QQ 发提示词、取回生成的图片」变成

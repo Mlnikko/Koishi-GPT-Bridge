@@ -44,8 +44,30 @@ function matchesChain(node, chain) {
   return true;
 }
 
+// 按空白切分后代组合子时**必须跳过引号与方括号内部**：
+// `[data-testid*="generated-image" i]` 里有一个空格，朴素 split(/\s+/) 会把它切成
+// 两段，于是这类选择器永远匹配不上，用到它的断言全部静默失效。
+function splitChain(selector, separator) {
+  const parts = [];
+  let current = '', depth = 0, quote = null;
+  for (const char of String(selector)) {
+    if (quote) { current += char; if (char === quote) quote = null; continue; }
+    if (char === '"' || char === "'") { quote = char; current += char; continue; }
+    if (char === '[') depth++;
+    else if (char === ']') depth--;
+    if (depth === 0 && (separator === ' ' ? /\s/.test(char) : char === separator)) {
+      if (current.trim()) parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
 const matches = (node, selector) =>
-  String(selector).split(',').some(group => matchesChain(node, group.trim().split(/\s+/)));
+  splitChain(selector, ',').some(group => matchesChain(node, splitChain(group, ' ')));
 
 function walk(node, visit) {
   for (const child of node.childNodes) {

@@ -95,8 +95,10 @@ const replyImages=()=>{
 // page still exposes one.
 const replyRoot=()=>{
  if(!lastAssistant)return null;
- const markdown=typeof lastAssistant.querySelector==='function'?lastAssistant.querySelector('[class*="markdown"]'):null;
- return markdown||lastAssistant;
+ const find=selector=>typeof lastAssistant.querySelector==='function'?lastAssistant.querySelector(selector):null;
+ // 找不到 markdown 容器时会退到整个轮次容器，而那里还带着「ChatGPT 说：」这类
+ // 无障碍标题，所以 walk() 里另外要按角色属性把它过滤掉。
+ return find('[class*="markdown"]')||find('[data-message-author-role="assistant"]')||lastAssistant;
 };
 const BLOCKS=new Set(['P','DIV','SECTION','ARTICLE','FIGURE','UL','OL','LI','BLOCKQUOTE','PRE','TABLE','H1','H2','H3','H4','H5','H6','HR']);
 // Inline rendering keeps the structure a reader would see: links carry their
@@ -133,6 +135,9 @@ const serializeReply=()=>{
   for(const child of node.children||[]){
    const tag=child.tagName;
    if(tag==='BUTTON'||tag==='SVG'||tag==='STYLE'||tag==='SCRIPT')continue;
+   // 「ChatGPT 说：」这类无障碍标题是页面框架，不是回复内容。轮次容器把标题和
+   // 正文放在一起，少了这道过滤，一个还没出图的空轮次也会被读成一条回复。
+   if(child.getAttribute?.('data-conversation-role')||child.getAttribute?.('data-message-author-role'))continue;
    if(tag==='IMG'){pushImage(child);continue;}
    if(tag==='PRE'){
     const code=(typeof child.querySelector==='function'&&child.querySelector('code'))||child;
@@ -211,18 +216,28 @@ const probeDom=()=>({
   ?Array.from(composer.querySelectorAll('img[src^="blob:"], [data-testid*="attachment" i], [data-testid*="composer-file" i]')):[];
  const chatGroup=document.querySelector('[aria-label="撰写器模式"], [aria-label="Composer mode"]');
  const chatButton=chatGroup && Array.from(chatGroup.querySelectorAll('button')).find(b=>['聊天','Chat'].includes(b.innerText.trim()));
- const replyText=String(lastAssistant?.innerText||'');
+ // 完成判定必须看**读出来的内容**，而不是整个轮次的文本：空轮次里也有
+ // 「ChatGPT 说：」这类无障碍标题，把它当成回复就会在图片还没渲染出来时提前收工，
+ // 而收工之后扩展会关掉标签页 —— 等于把还在生成的图一起关掉。
+ const {segments,images}=serializeReply();
+ const answerText=segments.filter(segment=>segment.type!=='image').map(segment=>segment.text).join('\n');
+ const replyLength=answerText.replace(/\s+/g,'').length;
+ const imageLoading=images.some(image=>image.complete===false||!(Number(image.naturalWidth)>0));
+ // 画廊已经出现但还没有可用图片，说明图正在画。
+ const gallery=!!(typeof lastAssistant?.querySelector==='function'&&lastAssistant.querySelector('[data-testid*="generated-image" i]'));
+ const checksum=value=>{let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))|0;return hash;};
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,submitted,
   textMatched:sameText(job.sentText,userText),userText:userText.slice(0,120),
-  editor:!!editor,stopping:!!stop,images:replyImages().length,attachments:new Set(attachmentNodes).size,
-  replyText:replyText.slice(0,1800),replyStable:normalize(replyText).length,
+  editor:!!editor,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:new Set(attachmentNodes).size,
+  replyLength,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length,
+  busyText:String(lastAssistant?.innerText||'').slice(0,600),
   needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
  if(operation==='inspect'){
   // Ground truth for the next failure: when nothing readable shows up, keep the
   // page structure so the selectors can be corrected without guessing.
-  if(!replyText.trim() && job.sentAt && Date.now()-job.sentAt>90000)snapshot.probe=probeDom();
+  if(!replyLength && !images.length && job.sentAt && Date.now()-job.sentAt>90000)snapshot.probe=probeDom();
   return snapshot;
  }
  if(operation==='chat'){if(chatButton)chatButton.click();return snapshot;}
@@ -279,11 +294,9 @@ const probeDom=()=>({
   send.click();return {clicked:true};
  }
  if(operation==='read'){
-  const {segments,images}=serializeReply();
   return {threadId,segments,imageCount:images.length,probe:probeDom()};
  }
  if(operation==='image'){
-  const {images}=serializeReply();
   const img=images[Number(job.imageIndex)||0];
   if(!img)throw Error('回复中的图片不存在');
   if(img.naturalWidth*img.naturalHeight>32*1024*1024)throw Error('图片尺寸超过上限');
@@ -409,10 +422,17 @@ async function tick(){
   if(waited<1500)return;
   // Checked before the busy branch below, otherwise a page that never stops
   // looking busy would wait out the bridge timeout instead of failing clearly.
-  if(waited>240000)throw Object.assign(Error('等待网页回复超时，未读取到内容'),{probe:info.probe});
-  const busy=info.stopping||/正在生成|生成中|正在创建|正在思考|Generating|Thinking|Creating image/i.test(info.replyText);
-  if(busy||!info.replyStable){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成回复');return;}
-  if(current.lastText!==info.replyText){current.lastText=info.replyText;current.stableAt=Date.now();await store(current,'正在等待网页回复结束');return;}
+  if(waited>240000)throw Object.assign(
+   Error(info.gallery&&!info.images?'等待网页出图超时，未检测到本轮图片':'等待网页回复超时，未读取到内容'),
+   {probe:info.probe});
+  const busy=info.stopping||/正在生成|生成中|正在创建|正在思考|正在调用|Generating|Thinking|Creating image/i.test(info.busyText);
+  // 「没有任何可读内容」和「图还在画」都算没完成。ChatGPT 会先渲染一个空的
+  // assistant 轮次（只有无障碍标题），图片要几十秒后才出现；在这里提前收工，
+  // 后面的 chrome.tabs.remove 会把还在生成的图片一起关掉。
+  const empty=!info.replyLength && !info.images;
+  const pendingImage=info.imageLoading || (info.gallery && !info.images);
+  if(busy||empty||pendingImage){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成回复');return;}
+  if(current.lastSignature!==info.replySignature){current.lastSignature=info.replySignature;current.stableAt=Date.now();await store(current,'正在等待网页回复结束');return;}
   if(Date.now()-current.stableAt<3000)return;
   await api('/progress',{id:task.id,threadId:info.threadId,phase:'reading'});
   const reply=await page(current.tabId,'read',current);

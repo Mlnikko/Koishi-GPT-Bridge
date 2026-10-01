@@ -43,7 +43,7 @@ function worker({state=null,results={},storageSeed={}}={}){
     get:async key=>{const keys=Array.isArray(key)?key:[key];const out={};for(const k of keys)out[k]=storage[k];return out;},
     set:async values=>Object.assign(storage,plain(values)),
    }},
-   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/'+THREAD}),remove:async()=>{}},
+   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/'+THREAD}),remove:async()=>{calls.push({route:'tabs.remove'});}},
    scripting:{executeScript:async({args:[op,job]})=>{calls.push({op,job:plain(job)});return [{result:typeof results==='function'?results(op,job):results[op]}];}},
   },
   fetch:async(url,options)=>{
@@ -172,9 +172,76 @@ test('an empty assistant turn is not a finished reply', async()=>{
  turn.appendChild(el('div',{class:'markdown'}));
  document.body.appendChild(turn);
  const info=await sandboxOf({document}).pageStep('inspect',{id:'abcdef123456'});
- assert.equal(info.replyStable,0);
+ assert.equal(info.replyLength,0);
  assert.equal(info.images,0);
  assert.equal(info.stopping,false);
+});
+
+test('the assistant role heading is never part of the reply', async()=>{
+ // 线上真实形状：轮次容器里只有角色标题和还没出图的画廊，
+ // 没有 markdown 容器，所以 walk() 会退到整个轮次容器。
+ const document=createDocument();
+ const main=el('main');
+ document.body.appendChild(main);
+ const turn=el('div',{'data-testid':'conversation-turn-5'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']));
+ turn.appendChild(el('div',{'data-testid':'generated-image-gallery'},[el('div',{class:'placeholder'})]));
+ main.appendChild(turn);
+ const sandbox=sandboxOf({document});
+ const read=await sandbox.pageStep('read',{});
+ assert.deepEqual(plain(read.segments),[],'「ChatGPT 说：」不是回复内容');
+ const info=await sandbox.pageStep('inspect',{id:'abcdef123456'});
+ assert.equal(info.replyLength,0);
+ assert.equal(info.gallery,true,'画廊已出现说明图正在画');
+ assert.equal(info.images,0);
+});
+
+// ---------------------------------------------------------------- 完成判定
+
+test('a reply whose picture is still rendering is waited out, and the tab stays open', async()=>{
+ // 这是线上事故的形状：空的 assistant 轮次 + 已出现的画廊占位符。
+ // 提前收工会让后面的 chrome.tabs.remove 把还在生成的图片一起关掉。
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'画一只猫',threadId:'',cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+    replyLength:0,images:0,gallery:true,imageLoading:false,busyText:'ChatGPT 说：',replySignature:'0/0/0'}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-30000,stableAt:Date.now()-20000,
+  lastSignature:'0/0/0',baseline:0,userBaseline:1,sentText:'画一只猫',threadId:'',draft:null};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/result').length,0);
+ assert.equal(routeOf(calls,'/failure').length,0);
+ assert.equal(calls.filter(call=>call.route==='tabs.remove').length,0,'图还没出来就不能关标签页');
+ assert.match(storage.status,/正在生成/);
+});
+
+test('a picture that has not finished loading keeps the worker waiting', async()=>{
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'画一只猫',threadId:'',cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+    replyLength:0,images:1,gallery:true,imageLoading:true,busyText:'',replySignature:'0/0/1'}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-30000,stableAt:Date.now()-20000,
+  lastSignature:'0/0/1',baseline:0,userBaseline:1,sentText:'画一只猫',threadId:'',draft:null};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/result').length,0);
+ assert.equal(calls.filter(call=>call.route==='tabs.remove').length,0);
+});
+
+test('a turn that never produces anything fails at the hard cap instead of hanging', async()=>{
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'画一只猫',threadId:'',cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+    replyLength:0,images:0,gallery:false,imageLoading:false,busyText:'',replySignature:'0/0/0'}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-250000,stableAt:Date.now()-200000,
+  lastSignature:'0/0/0',baseline:0,userBaseline:1,sentText:'画一只猫',threadId:'',draft:null};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);
+ assert.match(storage.status,/任务失败/);
 });
 
 // ---------------------------------------------------------------- 回合识别
@@ -273,7 +340,7 @@ test('reference images are attached once, before any submit', async()=>{
 test('the worker fills and sends in separate ticks and never resends an uncertain submission', async()=>{
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'一只猫',threadId:'',cancelled:false,images:[]},
-  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyStable:0},
+  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'},
    submit:{filled:true},send:{clicked:true}},
  });
  await wait(); // 自动的第一次 tick 会开标签页
@@ -296,7 +363,7 @@ test('the worker fills and sends in separate ticks and never resends an uncertai
 test('a pure image message only gains a single space once the send button refuses', async()=>{
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'',threadId:'',cancelled:false,images:[{index:0,mime:'image/png',name:'input-0.png',size:4}]},
-  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyStable:0},
+  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'},
    submit:{filled:true},send:{ready:false}},
  });
  await wait();
@@ -314,12 +381,12 @@ test('a stable reply is read back and handed to the bridge', async()=>{
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'写个例子',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyText:'下面是示例：',replyStable:9},
+    replyLength:6,images:0,gallery:false,imageLoading:false,replySignature:'1/6/0'},
    read:{threadId:THREAD,segments,imageCount:0}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-20000,stableAt:Date.now()-10000,
-  lastText:'下面是示例：',baseline:0,userBaseline:1,sentText:'写个例子',threadId:'',draft:null};
+  lastSignature:'1/6/0',baseline:0,userBaseline:1,sentText:'写个例子',threadId:'',draft:null};
  await sandbox.tick();
  const result=routeOf(calls,'/result');
  assert.equal(result.length,1);
@@ -333,13 +400,13 @@ test('a reply that carries pictures uploads them as raw bytes before the result'
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'画个图',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyText:'做好了。',replyStable:4},
+    replyLength:4,images:1,gallery:true,imageLoading:false,replySignature:'2/4/1'},
    read:{threadId:THREAD,segments,imageCount:1},
    image:{base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-20000,stableAt:Date.now()-10000,
-  lastText:'做好了。',baseline:0,userBaseline:1,sentText:'画个图',threadId:'',draft:null};
+  lastSignature:'2/4/1',baseline:0,userBaseline:1,sentText:'画个图',threadId:'',draft:null};
  await sandbox.tick();
  const upload=routeOf(calls,'/result-asset');
  assert.equal(upload.length,1);
@@ -352,12 +419,12 @@ test('a refusal is delivered as an ordinary reply, never as a failure', async()=
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'帮我做点坏事',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyText:'抱歉，我不能帮你做这个。',replyStable:9},
+    replyLength:12,images:0,gallery:false,imageLoading:false,replySignature:'3/12/0'},
    read:{threadId:THREAD,segments,imageCount:0}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-20000,stableAt:Date.now()-10000,
-  lastText:'抱歉，我不能帮你做这个。',baseline:0,userBaseline:1,sentText:'帮我做点坏事',threadId:'',draft:null};
+  lastSignature:'3/12/0',baseline:0,userBaseline:1,sentText:'帮我做点坏事',threadId:'',draft:null};
  await sandbox.tick();
  assert.equal(routeOf(calls,'/failure').length,0);
  assert.deepEqual(routeOf(calls,'/result')[0].body.segments,segments);
@@ -367,7 +434,7 @@ test('a page that never stops looking busy is waited out, then fails at the hard
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'一只猫',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyText:'正在生成',replyStable:4}},
+    replyLength:4,images:0,gallery:false,imageLoading:false,busyText:'正在生成',replySignature:'4/4/0'}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-60000,stableAt:Date.now(),baseline:0,
@@ -385,12 +452,12 @@ test('a page with nothing readable fails once, with a page snapshot attached', a
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'一只猫',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyText:'随便说了点什么',replyStable:6},
+    replyLength:7,images:0,gallery:false,imageLoading:false,replySignature:'5/7/0'},
    read:{threadId:THREAD,segments:[],imageCount:0,probe:{turns:0,roleNodes:['h4@assistant']}}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-20000,stableAt:Date.now()-10000,
-  lastText:'随便说了点什么',baseline:0,userBaseline:1,sentText:'一只猫',threadId:'',draft:null};
+  lastSignature:'5/7/0',baseline:0,userBaseline:1,sentText:'一只猫',threadId:'',draft:null};
  await sandbox.tick();
  const failure=routeOf(calls,'/failure');
  assert.equal(failure.length,1);
@@ -401,7 +468,7 @@ test('a page with nothing readable fails once, with a page snapshot attached', a
 test('a task cancelled by the bridge is stopped and reported, never submitted', async()=>{
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'一只猫',threadId:'',cancelled:true,images:[]},
-  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyStable:0},stop:{stopped:true}},
+  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'},stop:{stopped:true}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now(),stableAt:Date.now(),baseline:0,
