@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "QQ ChatGPT 生图连接器",
-  "version": "0.1.0",
-  "description": "将本机 Koishi 绘图任务送到 ChatGPT 普通聊天网页，并取回本轮图片。",
+  "name": "QQ ChatGPT 网页桥接",
+  "version": "0.2.0",
+  "description": "把本机 Koishi 收到的 QQ 消息原样送进 ChatGPT 普通聊天网页，并把回复原样送回。",
   "permissions": ["alarms", "storage", "scripting"],
   "host_permissions": ["https://chatgpt.com/*", "http://127.0.0.1:5141/*"],
   "background": {"service_worker": "background.js"},

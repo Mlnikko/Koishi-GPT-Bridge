@@ -1,8 +1,8 @@
 {
   "name": "koishi-plugin-codex-image-local",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "通过本机 Chrome 扩展驱动已登录的 ChatGPT 网页生图，供 Koishi / QQ 私聊调用；不依赖 API Key，也不调用任何本地 CLI。",
+  "description": "把 QQ 消息原样送进已登录的 ChatGPT 网页会话，并把网页回复原样送回 QQ；不依赖 API Key，也不调用任何本地 CLI。",
   "main": "src/index.cjs",
   "scripts": {
     "test": "node --test \"test/**/*.test.cjs\"",
