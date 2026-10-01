@@ -60,31 +60,60 @@ async function pageStep(operation,job){
  const matching=lastUser?.innerText.includes(marker);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
- // ChatGPT has shipped several wrappers for a generated image, so identify one by
- // what it is — a large bitmap — instead of a single data-testid that can be
- // renamed without notice. Avatars, icons and emoji are small and are skipped.
- const source=img=>String(img?.currentSrc||img?.src||img?.getAttribute?.('src')||'');
- const area=img=>(Number(img.naturalWidth)||0)*(Number(img.naturalHeight)||0);
- const looksGenerated=img=>{
-  if(!img || typeof img.getAttribute!=='function')return false;
-  if(!/^(?:blob:|data:image\/|https?:\/\/)/i.test(source(img)))return false;
-  if(/avatar|profile|icon|emoji|头像/i.test(String(img.getAttribute('alt')||'')+String(img.getAttribute('data-testid')||'')))return false;
-  const width=Number(img.naturalWidth)||0,height=Number(img.naturalHeight)||0;
-  return width>=200 && height>=200;
- };
- const insideUser=img=>user.some(node=>{const scope=turn(node);return scope && typeof scope.contains==='function' && scope.contains(img);});
- // The newest assistant turn is the only place a fresh generation can appear.
- // Scanning the page is a fallback for DOM variants that move the preview out of
- // the turn; it is restricted to images outside the user bubble (the reference
- // image) and outside every older turn, so an earlier picture in the same thread
- // can never be handed back as the result of the current request.
- const turnNodes=Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
- const newestTurn=turnNodes[turnNodes.length-1]||lastAssistant;
- const stale=img=>insideUser(img)||turnNodes.some(node=>node!==newestTurn && typeof node.contains==='function' && node.contains(img));
- const scoped=lastAssistant?Array.from(lastAssistant.querySelectorAll('img')).filter(looksGenerated):[];
- const images=(scoped.length?scoped
-  :assistant.length>(job.baseline||0)?Array.from(document.querySelectorAll('img')).filter(img=>looksGenerated(img)&&!stale(img)):[]
- ).sort((a,b)=>area(b)-area(a));
+// ChatGPT has shipped several wrappers for a generated image, so identify one by
+// what it is — a large bitmap — instead of a single data-testid that can be
+// renamed without notice.
+const source=img=>String(img?.currentSrc||img?.src||img?.getAttribute?.('src')||'');
+const area=img=>(Number(img.naturalWidth)||0)*(Number(img.naturalHeight)||0);
+// Size alone does not separate a generated picture from the signed-in account's
+// avatar: that avatar is a 512×512 bitmap in the page chrome, it lives outside
+// every conversation turn, and it is already loaded — so the whole-page fallback
+// below could hand it back the moment the empty assistant turn appeared. Anything
+// in the header/sidebar, or outside the conversation area, is chrome.
+const conversationArea=document.querySelector('main');
+const isChrome=img=>{
+ if(typeof img.closest!=='function')return false;
+ if(img.closest('header, nav, aside, [data-testid*="profile" i], [data-testid*="sidebar" i]'))return true;
+ return !!conversationArea && typeof conversationArea.contains==='function' && !conversationArea.contains(img);
+};
+const looksGenerated=img=>{
+ if(!img || typeof img.getAttribute!=='function')return false;
+ if(!/^(?:blob:|data:image\/|https?:\/\/)/i.test(source(img)))return false;
+ const label=String(img.getAttribute('alt')||'')+String(img.getAttribute('data-testid')||'');
+ if(/avatar|profile|icon|emoji|头像/i.test(label))return false;
+ // The picture the user attached is rendered in the conversation as well, and
+ // its alt says so. Handing it back is the reference image coming out as the
+ // result (job 02c2fa8e036a), so it is never a candidate.
+ if(/附件|attachment/i.test(label))return false;
+ if(isChrome(img))return false;
+ const width=Number(img.naturalWidth)||0,height=Number(img.naturalHeight)||0;
+ return width>=200 && height>=200;
+};
+const insideUser=img=>user.some(node=>{const scope=turn(node);return scope && typeof scope.contains==='function' && scope.contains(img);});
+// The account avatar is also rendered inside the user's own turn. The newest
+// assistant turn can resolve to a wrapper that covers that turn as well, so an
+// image sitting in the user turn is never the result of the current request.
+const inUserTurn=img=>!!lastUser && typeof lastUser.contains==='function' && lastUser.contains(img);
+// A generated picture is the assistant's output, so it is looked for inside the
+// newest assistant turn first.
+const scoped=lastAssistant?Array.from(lastAssistant.querySelectorAll('img')).filter(img=>looksGenerated(img)&&!inUserTurn(img)):[];
+// `stale` keeps a picture from an older turn, or from the user's own bubble, out
+// of the page-wide fallback below.
+const turnNodes=Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+const newestTurn=turnNodes[turnNodes.length-1]||lastAssistant;
+const stale=img=>insideUser(img)||inUserTurn(img)||turnNodes.some(node=>node!==newestTurn && typeof node.contains==='function' && node.contains(img));
+// The page-wide scan is only a fallback for a preview that renders outside the
+// turn, so it accepts nothing but pictures the page itself files under a
+// generated-image gallery. It used to accept any large bitmap on the page, and
+// because the turn stays empty for tens of seconds while the user's own
+// attachment is already loaded, it handed that reference image back as the
+// result (job 02c2fa8e036a). If the marker ever disappears the scan finds
+// nothing and we keep waiting, which fails safe instead of returning a wrong
+// picture.
+const inGallery=img=>typeof img.closest==='function' && !!img.closest('[data-testid*="generated-image" i]');
+const images=(scoped.length?scoped
+ :assistant.length>(job.baseline||0)?Array.from(document.querySelectorAll('img')).filter(img=>looksGenerated(img)&&inGallery(img)&&!stale(img)):[]
+).sort((a,b)=>area(b)-area(a));
  const best=images[0]||null;
  const imageReady=!!best && best.complete!==false && Number(best.naturalWidth)>0 && Number(best.naturalHeight)>0;
  const imageLoading=!imageReady && images.some(img=>img.complete===false || !(Number(img.naturalWidth)>0));
@@ -95,13 +124,15 @@ async function pageStep(operation,job){
  const generating=!!stop || /正在生成|生成中|正在创建|正在绘制|Generating|Creating image/i.test(turnText);
  const probeDom=()=>({
   turns:document.querySelectorAll('[data-testid^="conversation-turn"]').length,
+  userNodes:user.length,assistantAnchor:!!lastAssistant,
   roleNodes:Array.from(document.querySelectorAll('[data-message-author-role],[data-conversation-role]')).slice(0,20)
    .map(el=>el.tagName.toLowerCase()+'@'+(el.getAttribute('data-message-author-role')||el.getAttribute('data-conversation-role')||'')),
   images:Array.from(document.querySelectorAll('img')).slice(0,20).map(img=>({
    src:source(img).replace(/^([a-z]+:)[\s\S]*/i,'$1').slice(0,12),
    alt:String(img.getAttribute?.('alt')||'').slice(0,40),
    testid:String(img.getAttribute?.('data-testid')||'').slice(0,40),
-   w:Number(img.naturalWidth)||0,h:Number(img.naturalHeight)||0,complete:img.complete!==false,inUser:insideUser(img)})),
+   w:Number(img.naturalWidth)||0,h:Number(img.naturalHeight)||0,complete:img.complete!==false,
+   inUser:insideUser(img),inUserTurn:inUserTurn(img),chrome:isChrome(img),gallery:inGallery(img),picked:images.includes(img)})),
   assistantHtml:String(lastAssistant?.outerHTML||'').slice(0,2500)});
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.
@@ -119,8 +150,11 @@ async function pageStep(operation,job){
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
  if(operation==='inspect'){
   // Ground truth for the next failure: when no image ever shows up, keep the
-  // page's structure so the selectors can be corrected without guessing.
-  if(!images.length && job.sentAt && Date.now()-job.sentAt>90000)snapshot.probe=probeDom();
+  // page's structure so the selectors can be corrected without guessing. The
+  // same snapshot is kept when the answer came from the whole-page fallback
+  // instead of the assistant turn — that is the path a page-chrome picture
+  // (the account avatar) can slip through, so a bad result stays auditable.
+  if((!images.length && job.sentAt && Date.now()-job.sentAt>90000) || (!scoped.length && images.length))snapshot.probe=probeDom();
   return snapshot;
  }
  if(operation==='chat'){if(chatButton)chatButton.click();return snapshot;}
@@ -287,7 +321,7 @@ async function tick(){
   if(info.imageReady){
    await api('/progress',{id:task.id,phase:'saving'});
    const image=await page(current.tabId,'image',current);
-   await api('/result',{id:task.id,...image});await store(null,'图片已交给 Koishi 回传 QQ');return;
+   await api('/result',{id:task.id,...image,probe:info.probe});await store(null,'图片已交给 Koishi 回传 QQ');return;
   }
   // ChatGPT renders the empty assistant turn long before the picture exists, and
   // generation regularly needs a minute or more. Keep waiting while the page

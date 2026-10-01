@@ -34,8 +34,8 @@ function harness() {
   };
   return { ctx, stages, intervals, disposes };
 }
-function session({ userId = 'alice', isDirect = true, channelId = 'alice', messageId = 'm1', elements = [], sent = [] } = {}) {
-  return { platform: 'qq', userId, channelId, isDirect, messageId, elements, sent, timestamp: Date.now(),
+function session({ userId = 'alice', isDirect = true, channelId = 'alice', messageId = 'm1', elements = [], sent = [], stripped } = {}) {
+  return { platform: 'qq', userId, channelId, isDirect, messageId, elements, sent, timestamp: Date.now(), stripped,
     send: async content => { sent.push(content); return ['msg-id']; } };
 }
 async function dispatch({ stages }, s, text) {
@@ -138,9 +138,41 @@ test('unauthorized sessions never reach the handlers or the downloader', async (
   assert.equal(await dispatch(app, outsider, undefined), undefined);
   assert.equal(await dispatch(app, outsider, '画图 猫'), undefined);
   assert.deepEqual(jobFiles(app.root), []);
-  const group = session({ isDirect: false, elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
+  // A mention alone is not enough: group chat stays off unless `groupChat` is set.
+  const group = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '' },
+    elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
   assert.equal(await dispatch(app, group, undefined), undefined);
   assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('a group message is inert unless the bot is mentioned', async () => {
+  const app = apply({ groupChat: true });
+  const silent = session({ isDirect: false, channelId: 'group-1', stripped: { appel: false, content: '画图 猫' },
+    elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
+  assert.equal(await dispatch(app, silent, '画图 猫'), undefined);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('a mentioned group message draws and lands in the group conversation', async () => {
+  const app = apply({ groupChat: true });
+  const s = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '画图 猫' } });
+  await dispatch(app, s, '画图 猫');
+  const jobs = jobFiles(app.root);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].owner, 'alice');
+  assert.equal(jobs[0].conversation, 'qq:group-1');
+  // The receipt goes to the same channel the request came from.
+  assert.match(s.sent[0], /已接收画图任务/);
+});
+
+test('a mentioned group message reaches the natural language router', async () => {
+  const app = apply({ groupChat: true });
+  const s = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '我想画一只穿宇航服的橘猫' } });
+  await dispatch(app, s, undefined);
+  const jobs = jobFiles(app.root);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].prompt, '我想画一只穿宇航服的橘猫');
+  assert.equal(jobs[0].conversation, 'qq:group-1');
 });
 
 test('a job handed to the bridge fails cleanly while no browser is connected', async () => {

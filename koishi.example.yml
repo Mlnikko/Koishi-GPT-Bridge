@@ -6,12 +6,19 @@
 
 plugins:
   codex-image-local:
-    # 必需。允许调用本插件的 QQ openid 列表。
-    # ["*"] 表示允许所有 QQ 私聊用户；群聊始终不会触发本插件。
+    # 必需。允许在【私聊】调用本插件的 QQ openid 列表。
+    # ["*"] 表示允许所有 QQ 私聊用户。群聊是否可用由下面的 groupChat 单独控制，
+    # 本列表不参与群聊判定。
     allowedUsers:
       - '*'
 
     # 以下均为可选，不写即使用默认值。
+
+    # 群聊支持。默认 false，即群聊完全不响应（保持历史行为）。
+    # 设为 true 后，群里任何成员 @ 机器人即可绘图，生成结果直接发到群里，
+    # 群成员均可见。群里的 @ 是硬性前提：Koishi 不会把未被 @ 的群消息交给本插件。
+    # 注意：一旦开启，群里任何人都能消耗你账号的 ChatGPT 网页额度。
+    # groupChat: true
 
     # 本机桥接端口，需与 browser-extension/config.js 中的地址保持一致。
     # 默认 5141。改动后需重跑：node scripts/setup-web-bridge.cjs <端口>

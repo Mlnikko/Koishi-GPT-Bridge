@@ -96,6 +96,15 @@ class WebBridge {
         if(p.cancelled){p.finish(p.cancelled);return send(409,{error:'cancelled'});}
         if(!validThread(body.threadId) || (p.threadId && body.threadId!==p.threadId)) throw error('thread_mismatch','ChatGPT 返回的会话与任务不一致');
         if(!p.threadId){p.threadId=body.threadId;p.onThread(body.threadId);}
+        // The extension also snapshots the page when the answer came from a
+        // whole-page scan rather than the assistant turn, which is how a wrong
+        // picture (e.g. the signed-in account avatar) can be handed back. Keep
+        // that snapshot beside the job so a bad result stays auditable; never let
+        // it break the result itself.
+        try {
+          const probe=body.probe && JSON.stringify(body.probe).length<20000 ? body.probe : null;
+          if(probe)fs.writeFileSync(path.join(p.job.dir,'result-probe.json'),JSON.stringify({at:Date.now(),...probe}),{mode:0o600});
+        } catch {}
         if(p.job.kind==='intent') {
           let value;
           try {

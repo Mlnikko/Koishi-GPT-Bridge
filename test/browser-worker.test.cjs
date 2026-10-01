@@ -124,17 +124,96 @@ test('a generated image is found by its shape, not by a single data-testid',asyn
  const scoped=await run({location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
   document:documentFor([])},{id:'abcdef123456',baseline:0});
  assert.equal(scoped.images,1);assert.equal(scoped.imageReady,true);assert.equal(scoped.generating,false);
- // A preview rendered outside the turn is still picked up, while the reference
- // image the user attached stays excluded.
- const reference=bitmap({currentSrc:'blob:https://chatgpt.com/ref'});
- const outside=bitmap({naturalWidth:1536,naturalHeight:1536});
+ // A preview rendered outside the turn is still picked up when the page files it
+ // under a generated-image gallery. The reference image the user attached is not,
+ // and neither is a large bitmap the page does not mark as a generation.
+ const reference=bitmap({currentSrc:'blob:https://chatgpt.com/ref',getAttribute:name=>({alt:'用户附件','data-testid':null}[name]??null)});
+ const outside=bitmap({naturalWidth:1536,naturalHeight:1536,closest:selector=>/generated-image/.test(selector)?{tagName:'DIV'}:null});
+ const stray=bitmap({naturalWidth:2048,naturalHeight:2048});
  const userEl={closest:()=>Object.assign(userTurn,{contains:img=>img===reference})};
  const fallback=await run({location:{href:'https://chatgpt.com/',pathname:'/'},
   document:{body:{innerText:''},querySelector:()=>null,
    querySelectorAll:sel=>sel==='[data-user-message-bubble]'?[userEl]
     :sel==='[data-conversation-role="assistant"]'?[{closest:()=>Object.assign(assistantTurn,{querySelectorAll:()=>[]})}]
-    :sel==='img'?[reference,outside]:[]}},{id:'abcdef123456',baseline:0});
+    :sel==='img'?[reference,outside,stray]:[]}},{id:'abcdef123456',baseline:0});
  assert.equal(fallback.images,1);assert.equal(fallback.imageReady,true);
+});
+test('the signed-in avatar in the page chrome is never returned as a result',async()=>{
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const bitmap=overrides=>Object.assign({complete:true,naturalWidth:1024,naturalHeight:1024,currentSrc:'blob:https://chatgpt.com/2f3c',
+  getAttribute:name=>({alt:'生成图片','data-testid':null}[name]??null)},overrides);
+ // The account avatar: a large, already-loaded bitmap sitting in the header.
+ const avatar=bitmap({naturalWidth:512,naturalHeight:512,currentSrc:'https://chatgpt.com/avatar/me',
+  closest:selector=>/header|profile/.test(selector)?{tagName:'HEADER'}:null});
+ const generated=bitmap();
+ const run=async(pageImages,turnImages)=>{
+  const main={contains:img=>img!==avatar};
+  const assistantTurn={innerText:'ChatGPT 说：',textContent:'ChatGPT 说：',querySelectorAll:sel=>sel==='img'?turnImages:[]};
+  const userTurn={innerText:'QQ绘图任务 abcdef123456\n一只猫',contains:()=>false};
+  const sandbox={location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
+   document:{body:{innerText:''},
+    querySelector:selector=>selector==='main'?main:null,
+    querySelectorAll:sel=>sel==='[data-user-message-bubble]'?[{closest:()=>userTurn}]
+     :sel==='[data-conversation-role="assistant"]'?[{closest:()=>assistantTurn}]
+     :sel==='img'?pageImages:[]}};
+  vm.createContext(sandbox);vm.runInContext(code,sandbox);
+  return vm.runInContext("pageStep('inspect',{id:'abcdef123456',baseline:0})",sandbox);
+ };
+ // An empty assistant turn plus the avatar is not a finished answer. Returning
+ // the account picture here is exactly the bug this guards.
+ const empty=await run([avatar],[]);
+ assert.equal(empty.images,0);
+ assert.equal(empty.imageReady,false);
+ // The real bitmap inside the turn is still found alongside the chrome avatar.
+ const ready=await run([avatar,generated],[generated]);
+ assert.equal(ready.images,1);
+ assert.equal(ready.imageReady,true);
+});
+test('the attached reference image is never returned while the turn has no picture yet',async()=>{
+ // Real DOM from job 02c2fa8e036a: `[data-testid^="conversation-turn"]` no longer
+ // matches anything, the assistant turn is an <h4 data-conversation-role="assistant">
+ // whose parent holds the generated-image gallery, and that gallery is still a
+ // placeholder while the user's own attachment is already loaded on the page.
+ const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
+ const code=full.slice(full.indexOf('async function pageStep('),full.indexOf('async function page(tabId'));
+ const bitmap=overrides=>Object.assign({complete:true,naturalWidth:1024,naturalHeight:1024,currentSrc:'blob:https://chatgpt.com/2f3c',
+  getAttribute:name=>({alt:'','data-testid':null}[name]??null)},overrides);
+ const attachment=bitmap({naturalWidth:1053,naturalHeight:1920,currentSrc:'blob:https://chatgpt.com/ref',
+  getAttribute:name=>({alt:'用户附件','data-testid':null}[name]??null)});
+ const avatar=bitmap({naturalWidth:512,naturalHeight:512,currentSrc:'https://chatgpt.com/avatar/me',
+  closest:selector=>/header|profile/.test(selector)?{tagName:'HEADER'}:null});
+ const generated=bitmap();
+ const run=async(turnImages)=>{
+  // The placeholder-only gallery: no <img> in the turn yet.
+  const turnBlock={innerText:'ChatGPT 说：',textContent:'ChatGPT 说：',querySelectorAll:sel=>sel==='img'?turnImages:[]};
+  const roleNode={closest:()=>null,parentElement:turnBlock};
+  const userTurn={innerText:'QQ绘图任务 abcdef123456\n参考这个图片',contains:()=>false};
+  const main={contains:img=>img!==avatar};
+  const sandbox={location:{href:'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555',pathname:'/c/11111111-2222-3333-4444-555555555555'},
+   document:{body:{innerText:''},querySelector:selector=>selector==='main'?main:null,
+    querySelectorAll:sel=>sel==='[data-user-message-bubble]'?[{closest:()=>userTurn}]
+     :sel==='[data-conversation-role="assistant"]'?[roleNode]
+     :sel==='img'?[avatar,attachment]:[]}};
+  vm.createContext(sandbox);vm.runInContext(code,sandbox);
+  return vm.runInContext("pageStep('inspect',{id:'abcdef123456',baseline:0})",sandbox);
+ };
+ // The attachment and the chrome avatar are both on the page, but the turn has no
+ // picture: nothing is ready, so the worker waits instead of sending the reference
+ // image back to QQ.
+ const waiting=await run([]);
+ assert.equal(waiting.images,0);
+ assert.equal(waiting.imageReady,false);
+ // Once the real bitmap renders inside the turn it is the one that gets picked.
+ const ready=await run([generated]);
+ assert.equal(ready.images,1);
+ assert.equal(ready.imageReady,true);
+ // If the turn block ever covers the user's message too — the page's user-bubble
+ // marker does not catch the attachment (the probe reported inUser=false) — the
+ // alt text is the only thing keeping the reference image out of the result.
+ const covered=await run([attachment]);
+ assert.equal(covered.images,0);
+ assert.equal(covered.imageReady,false);
 });
 test('ui chrome is never reported as a model reply',async()=>{
  const full=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');

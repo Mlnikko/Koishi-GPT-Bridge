@@ -50,7 +50,17 @@ exports.apply = (ctx, config) => {
     if (!ids?.length) throw new Error('QQ 未确认发送成功');
   };
   const allowedUsers = new Set(config.allowedUsers);
-  const authorized = s => s.platform === 'qq' && (allowedUsers.has('*') || allowedUsers.has(s.userId)) && s.isDirect;
+  // Group access is opt-in and, once enabled, open to every member of the group.
+  // Koishi already refuses to route a guild message at all unless the bot was
+  // mentioned (`stripped.appel`), so mentioning is the whole gate on this side;
+  // `allowedUsers` stays a private-chat concept and is deliberately not applied
+  // to guilds, where the QQ openid is a group-scoped id.
+  const groupChat = config.groupChat === true;
+  const authorized = s => {
+    if (s.platform !== 'qq') return false;
+    if (s.isDirect) return allowedUsers.has('*') || allowedUsers.has(s.userId);
+    return groupChat && !!s.stripped?.appel;
+  };
   const conversation = s => `${s.platform}:${s.channelId}`;
   const status = j => `任务 ${j.id}：${labels[j.status] || j.status}，已等待 ${Math.floor((Date.now()-j.createdAt)/1000)} 秒。`
     + (j.progress && j.status === 'running' ? `\n${j.progress}` : '')

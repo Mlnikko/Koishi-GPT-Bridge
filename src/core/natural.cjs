@@ -23,10 +23,20 @@ class NaturalRouter {
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     fs.writeFileSync(this.file+'.tmp', JSON.stringify(this.receipts), { mode: 0o600 }); fs.renameSync(this.file+'.tmp', this.file);
   }
+  // A guild message arrives with the bot mention as a leading `at` element. The
+  // raw element list would reject it outright (and splice the mention into the
+  // text), so guild sessions read Koishi's `stripped.content`, which has already
+  // dropped the mention and the whitespace behind it. Private sessions keep the
+  // element-level rules: anything that is not plain text is left to the
+  // image/command paths.
+  text(s) {
+    if (!s.isDirect) return (s.stripped?.content || '').trim();
+    if (s.elements?.some(e => e.type !== 'text')) return '';
+    return (s.elements?.length ? s.elements.map(e => e.attrs?.content || '').join('') : s.content || '').trim();
+  }
   async handle(s) {
     if (this.closed || !this.authorized(s) || !s.messageId) return;
-    if (s.elements?.some(e => e.type !== 'text')) return;
-    const input = (s.elements?.length ? s.elements.map(e => e.attrs?.content || '').join('') : s.content || '').trim();
+    const input = this.text(s);
     if (!input || /^[/.]/.test(input)) return;
     if (input.length > 1500) return '自然语言消息最多 1500 字，请缩短描述。';
     const key = this.key(s), receiptKey = JSON.stringify([key, s.messageId]);

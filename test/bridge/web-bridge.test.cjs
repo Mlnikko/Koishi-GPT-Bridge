@@ -53,6 +53,21 @@ test('a page-structure probe from the extension is kept beside the job, never br
  assert.equal((await q).code,'no_image');
  assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).turns,3);
 });
+test('a fallback-scan probe rides along with a result so a wrong picture stays auditable',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const probe={turns:2,images:[{src:'https:',alt:'',testid:'profile-button',w:512,h:512,complete:true,chrome:true,picked:true}],assistantHtml:'<article></article>'};
+ assert.equal((await call('/result',{id:job.id,threadId:id,base64:png(512,512).toString('base64'),probe})).status,200);
+ assert.equal(await p,path.join(job.dir,'result.png'));
+ const saved=JSON.parse(fs.readFileSync(path.join(job.dir,'result-probe.json'),'utf8'));
+ assert.equal(saved.images[0].chrome,true);assert.equal(saved.images[0].w,512);assert.ok(saved.at>0);
+ // A result without a probe writes nothing extra and still lands normally.
+ const second=await setup(t);await second.call('/state');
+ const q=second.b.run(second.job).catch(e=>e);await new Promise(setImmediate);
+ await second.call('/result',{id:second.job.id,threadId:id,base64:png(1024,1024).toString('base64')});
+ assert.equal(await q,path.join(second.job.dir,'result.png'));
+ assert.equal(fs.existsSync(path.join(second.job.dir,'result-probe.json')),false);
+});
 test('web result images are validated from their PNG header without external tools',()=>{
  const dir=temp(),destination=path.join(dir,'result.png');
  assert.throws(()=>saveImage(Buffer.from('not an image at all').toString('base64'),destination),err=>err.code==='image_invalid');
