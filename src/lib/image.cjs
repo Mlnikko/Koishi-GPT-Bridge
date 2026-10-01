@@ -71,20 +71,8 @@ function decodeDataUrl(value) {
   } catch { throw imageError('image_invalid', '图片数据无法解码，未下载'); }
 }
 
-// QQ adapters disagree on the element type and attribute name for a picture, so
-// every observed spelling is accepted and normalised to a single source string.
-const IMAGE_ELEMENT_TYPES = new Set(['img', 'image']);
-function messageImages(elements) {
-  return (elements || [])
-    .filter(element => IMAGE_ELEMENT_TYPES.has(element?.type))
-    .map(element => element.attrs?.src || element.attrs?.url || element.attrs?.file || '')
-    .filter(Boolean);
-}
-function messageText(elements) {
-  return (elements || []).filter(element => element?.type === 'text')
-    .map(element => element.attrs?.content || '').join('').trim();
-}
-
+// 消息元素的归一化（文本与图片、顺序保留）由 core/message.cjs 负责：
+// 它属于领域逻辑，而这里只管「怎么安全地把一张图拿下来」。
 async function readCapped(response, maxBytes) {
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared > maxBytes) throw imageError('image_too_large', `图片超过 ${limitText(maxBytes)} 上限，未下载`);
@@ -156,4 +144,4 @@ async function downloadImage(source, dir, options = {}) {
 }
 
 module.exports = { downloadImage, sniffImage, pngSize, isPrivateAddress, decodeDataUrl,
-  messageImages, messageText, MAX_INPUT_BYTES, MAX_INPUT_IMAGES };
+  MAX_INPUT_BYTES, MAX_INPUT_IMAGES };

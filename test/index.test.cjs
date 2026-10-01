@@ -7,19 +7,26 @@ const plugin = require('../src/index.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-test-'));
 const wait = () => new Promise(resolve => setImmediate(resolve));
-// A 1x1-ish PNG header is enough: the downloader sniffs magic bytes, it never
-// decodes the picture.
-const png = () => `data:image/png;base64,${Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(300)]).toString('base64')}`;
+// A minimal but structurally valid PNG: the downloader only sniffs magic bytes,
+// while the reply validator parses the IHDR header, so both need to be satisfied.
+const pngBytes = (size = 300, width = 8, height = 8) => {
+  const bytes = Buffer.alloc(size);
+  Buffer.from('89504e470d0a1a0a', 'hex').copy(bytes, 0);
+  bytes.writeUInt32BE(13, 8);
+  Buffer.from('IHDR', 'latin1').copy(bytes, 12);
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return bytes;
+};
+const png = (size = 300) => `data:image/png;base64,${pngBytes(size).toString('base64')}`;
 
 const apps = [];
 
 // A minimal stand-in for the parts of the Koishi context this plugin uses. It
 // models the two behaviours the wiring actually depends on: registration order
-// (image middleware, then the drawing commands, then the deferred natural
-// language router) and Koishi's `next(fallback)` semantics, where the remaining
-// stages run first and the fallback only fires when nothing downstream produced
-// a result. Getting this wrong is exactly how a router silently swallows every
-// command, so it is worth asserting against.
+// (management commands first, then the catch-all forwarder) and Koishi's
+// `next(fallback)` semantics, where the remaining stages run first and the
+// fallback only fires when nothing downstream produced a result.
 function harness() {
   const stages = [], intervals = [], disposes = [];
   const scope = filter => ({
@@ -74,8 +81,6 @@ const jobFiles = root => {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir).map(id => JSON.parse(fs.readFileSync(path.join(dir, id, 'job.json'), 'utf8')));
 };
-// Waits for the queue to reach a terminal state; the bridge's listen() callback
-// is asynchronous, so a fixed number of ticks is not a reliable signal.
 const settle = async (root, timeout = 4000) => {
   const started = Date.now();
   for (;;) {
@@ -85,20 +90,41 @@ const settle = async (root, timeout = 4000) => {
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
+// The bridge picks its own port when asked for 0; it records the real one on disk.
+const bridgeOf = async root => {
+  const file = path.join(root, 'web-bridge-port');
+  for (let attempt = 0; attempt < 300; attempt++) {
+    if (fs.existsSync(file)) return {
+      port: Number(fs.readFileSync(file, 'utf8')),
+      token: fs.readFileSync(path.join(root, 'web-bridge-token'), 'utf8').trim(),
+    };
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error('桥接端口未就绪');
+};
 
-test('a private image message becomes a persisted reference-image job', async () => {
+test('a private message is forwarded as-is and persisted as a job', async () => {
   const app = apply();
   const s = session({ elements: [{ type: 'img', attrs: { src: png() } }, { type: 'text', attrs: { content: '把背景改成夜晚' } }] });
   await dispatch(app, s, undefined);
-  assert.match(s.sent[0], /已接收画图任务 \S+（ChatGPT 网页）（参考 1 张图片）/);
+  assert.match(s.sent[0], /已接收 \S+（含 1 张图片）/);
   const jobs = jobFiles(app.root);
   assert.equal(jobs.length, 1);
-  assert.equal(jobs[0].kind, 'image');
-  assert.equal(jobs[0].prompt, '把背景改成夜晚');
-  assert.deepEqual(jobs[0].inputImages.map(image => image.file), ['input-0.png']);
+  assert.equal(jobs[0].version, 2);
+  assert.deepEqual(jobs[0].input, [
+    { type: 'image', file: 'input-0.png', mime: 'image/png', size: 300 },
+    { type: 'text', text: '把背景改成夜晚' },
+  ]);
   assert.equal(fs.existsSync(path.join(app.root, 'jobs', jobs[0].id, 'input-0.png')), true);
-  // No local process, no backend field: the job is handed to the local bridge.
-  assert.equal(jobs[0].backend, undefined);
+});
+
+test('a message that matches no command is forwarded, not dropped', async () => {
+  const app = apply();
+  const s = session({ elements: [{ type: 'text', attrs: { content: '帮我看看这段代码' } }] });
+  await dispatch(app, s, '帮我看看这段代码');
+  const jobs = jobFiles(app.root);
+  assert.equal(jobs.length, 1);
+  assert.deepEqual(jobs[0].input, [{ type: 'text', text: '帮我看看这段代码' }]);
 });
 
 test('a pure image message is accepted with no text at all', async () => {
@@ -108,77 +134,106 @@ test('a pure image message is accepted with no text at all', async () => {
   await wait();
   const jobs = jobFiles(app.root);
   assert.equal(jobs.length, 1);
-  assert.equal(jobs[0].kind, 'image');
-  assert.equal(jobs[0].prompt, '');
+  assert.deepEqual(jobs[0].input, [{ type: 'image', file: 'input-0.png', mime: 'image/png', size: 300 }]);
 });
 
 test('a picture that cannot be downloaded is reported and never enqueued', async () => {
   const app = apply();
   const s = session({ elements: [{ type: 'img', attrs: { src: 'file:///etc/passwd' } }] });
   const reply = await dispatch(app, s, undefined);
-  assert.match(reply, /图片处理失败/);
+  assert.match(reply, /仅支持下载 http/);
   assert.deepEqual(jobFiles(app.root), []);
   assert.equal(s.sent.length, 0);
 });
 
-test('the drawing command still enqueues a plain text job', async () => {
+test('management commands are answered locally and never forwarded', async () => {
   const app = apply();
   const s = session();
-  await dispatch(app, s, '画图 一只穿宇航服的橘猫');
-  const jobs = jobFiles(app.root);
-  assert.equal(jobs.length, 1);
-  assert.equal(jobs[0].kind, 'text');
-  assert.equal(jobs[0].prompt, '一只穿宇航服的橘猫');
-  assert.deepEqual(jobs[0].inputImages, []);
+  const created = await dispatch(app, s, '桥接新建会话 月夜');
+  assert.match(created, /已新建并切换：月夜/);
+  assert.match(await dispatch(app, s, '桥接会话列表'), /月夜/);
+  assert.equal(await dispatch(app, s, '桥接状态'), '未找到你的任务');
+  assert.deepEqual(jobFiles(app.root), [], '命令不该变成发给 ChatGPT 的消息');
 });
 
-test('unauthorized sessions never reach the handlers or the downloader', async () => {
+test('unauthorized sessions never reach the forwarder or the downloader', async () => {
   const app = apply({ allowedUsers: ['someone-else'] });
-  const outsider = session({ userId: 'mallory', elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
-  assert.equal(await dispatch(app, outsider, undefined), undefined);
-  assert.equal(await dispatch(app, outsider, '画图 猫'), undefined);
+  const outsider = session({ userId: 'mallory', elements: [{ type: 'text', attrs: { content: '你好' } }] });
+  assert.equal(await dispatch(app, outsider, '你好'), undefined);
+  const withImage = session({ userId: 'mallory', elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
+  assert.equal(await dispatch(app, withImage, undefined), undefined);
   assert.deepEqual(jobFiles(app.root), []);
   // A mention alone is not enough: group chat stays off unless `groupChat` is set.
-  const group = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '' },
-    elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
+  const group = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '你好' },
+    elements: [{ type: 'text', attrs: { content: '你好' } }] });
   assert.equal(await dispatch(app, group, undefined), undefined);
   assert.deepEqual(jobFiles(app.root), []);
 });
 
 test('a group message is inert unless the bot is mentioned', async () => {
   const app = apply({ groupChat: true });
-  const silent = session({ isDirect: false, channelId: 'group-1', stripped: { appel: false, content: '画图 猫' },
-    elements: [{ type: 'img', attrs: { src: 'http://example.invalid/a.png' } }] });
-  assert.equal(await dispatch(app, silent, '画图 猫'), undefined);
+  const silent = session({ isDirect: false, channelId: 'group-1', stripped: { appel: false, content: '帮我写首诗' },
+    elements: [{ type: 'text', attrs: { content: '帮我写首诗' } }] });
+  assert.equal(await dispatch(app, silent, undefined), undefined);
   assert.deepEqual(jobFiles(app.root), []);
 });
 
-test('a mentioned group message draws and lands in the group conversation', async () => {
+test('a mentioned group message lands in the group conversation', async () => {
   const app = apply({ groupChat: true });
-  const s = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '画图 猫' } });
-  await dispatch(app, s, '画图 猫');
+  const s = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '帮我写首诗' },
+    elements: [{ type: 'at', attrs: { id: 'bot' } }, { type: 'text', attrs: { content: '帮我写首诗' } }] });
+  await dispatch(app, s, undefined);
   const jobs = jobFiles(app.root);
   assert.equal(jobs.length, 1);
   assert.equal(jobs[0].owner, 'alice');
   assert.equal(jobs[0].conversation, 'qq:group-1');
-  // The receipt goes to the same channel the request came from.
-  assert.match(s.sent[0], /已接收画图任务/);
+  // The bot mention is stripped, so no QQ openid is forwarded to the web page.
+  assert.deepEqual(jobs[0].input, [{ type: 'text', text: '帮我写首诗' }]);
+  assert.match(s.sent[0], /已接收/);
 });
 
-test('a mentioned group message reaches the natural language router', async () => {
-  const app = apply({ groupChat: true });
-  const s = session({ isDirect: false, channelId: 'group-1', stripped: { appel: true, content: '我想画一只穿宇航服的橘猫' } });
+test('the reply is delivered in order, with images in their original position', async () => {
+  const app = apply();
+  const { port, token } = await bridgeOf(app.root);
+  const beat = () => fetch(`http://127.0.0.1:${port}/state`, { headers: { 'x-bridge-token': token } });
+  // The bridge refuses to hand a task to a browser it has not heard from, so the
+  // extension heartbeat has to exist before the job is enqueued.
+  await beat();
+  const s = session({ elements: [{ type: 'text', attrs: { content: '给我两个方案' } }] });
   await dispatch(app, s, undefined);
-  const jobs = jobFiles(app.root);
-  assert.equal(jobs.length, 1);
-  assert.equal(jobs[0].prompt, '我想画一只穿宇航服的橘猫');
-  assert.equal(jobs[0].conversation, 'qq:group-1');
+  const running = settle(app.root);
+  let job;
+  for (let attempt = 0; attempt < 300 && !job; attempt++) {
+    job = (await (await beat()).json()).job;
+    if (!job) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.ok(job, '桥接应当已经挂起这个任务');
+  const asset = await fetch(`http://127.0.0.1:${port}/result-asset?id=${job.id}&i=0`,
+    { method: 'POST', headers: { 'x-bridge-token': token, 'Content-Type': 'image/png' }, body: pngBytes(512) });
+  assert.equal(asset.status, 200);
+  const result = await fetch(`http://127.0.0.1:${port}/result`, {
+    method: 'POST', headers: { 'x-bridge-token': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: job.id, threadId: '11111111-2222-3333-4444-555555555555', segments: [
+      { type: 'text', text: '方案一：' },
+      { type: 'image', asset: 0, mime: 'image/png' },
+      { type: 'code', language: 'python', text: 'print(1)' },
+    ] }),
+  });
+  assert.equal(result.status, 200);
+  await running;
+  const [finished] = await settle(app.root);
+  assert.equal(finished.status, 'ready');
+  assert.equal(finished.delivery, 'sent');
+  const delivered = s.sent.slice(1);
+  assert.equal(delivered[0], '方案一：');
+  assert.match(delivered[1], /^<img src="data:image\/png;base64,/);
+  assert.match(delivered[2], /```python\nprint\(1\)\n```/);
 });
 
 test('a job handed to the bridge fails cleanly while no browser is connected', async () => {
   const app = apply();
-  const s = session();
-  await dispatch(app, s, '画图 猫');
+  const s = session({ elements: [{ type: 'text', attrs: { content: '你好' } }] });
+  await dispatch(app, s, undefined);
   const [job] = await settle(app.root);
   assert.equal(job.status, 'failed');
   assert.equal(job.errorCode, 'browser_offline');

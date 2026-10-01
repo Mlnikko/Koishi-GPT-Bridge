@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { downloadImage, sniffImage, pngSize, isPrivateAddress, decodeDataUrl, messageImages, messageText } = require('../../src/lib/image.cjs');
+const { downloadImage, sniffImage, pngSize, isPrivateAddress, decodeDataUrl } = require('../../src/lib/image.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'qq-image-test-'));
 // A minimal but structurally valid PNG: signature + IHDR + padding to a size the
@@ -46,13 +46,7 @@ test('loopback, private and reserved addresses are recognised', () => {
     assert.equal(isPrivateAddress(address), false, address);
 });
 
-test('message elements are normalised across adapter spellings', () => {
-  assert.deepEqual(messageImages([{ type: 'img', attrs: { src: 'http://a/1.png' } }, { type: 'text', attrs: { content: 'x' } }, { type: 'image', attrs: { url: 'http://a/2.png' } }]), ['http://a/1.png', 'http://a/2.png']);
-  assert.deepEqual(messageImages([{ type: 'img', attrs: { file: 'base64://AAA' } }]), ['base64://AAA']);
-  assert.deepEqual(messageImages([{ type: 'text', attrs: { content: 'hi' } }]), []);
-  assert.deepEqual(messageImages(undefined), []);
-  assert.equal(messageText([{ type: 'text', attrs: { content: ' 改成夜晚 ' } }, { type: 'img', attrs: {} }]), '改成夜晚');
-});
+// 消息元素 → 片段的归一化在 test/core/message.test.cjs 里，这里只管图片本身。
 
 test('inline data urls are decoded locally and written with owner-only permissions', async () => {
   const dir = temp();

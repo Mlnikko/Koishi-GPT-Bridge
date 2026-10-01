@@ -68,7 +68,13 @@ class WebBridge {
     this.token=fs.existsSync(tokenFile)?fs.readFileSync(tokenFile,'utf8').trim():randomBytes(32).toString('hex');
     fs.writeFileSync(tokenFile,this.token,{mode:0o600});
     this.server=http.createServer((req,res)=>this.handle(req,res));
-    this.ready=new Promise((resolve,reject)=>{this.server.once('error',reject);this.server.listen(port,'127.0.0.1',()=>{this.port=this.server.address().port;resolve();});});
+    this.ready=new Promise((resolve,reject)=>{this.server.once('error',reject);this.server.listen(port,'127.0.0.1',()=>{
+      this.port=this.server.address().port;
+      // The listening port is recorded next to the token: with `port: 0` the OS
+      // picks it, and even a fixed port is worth confirming from the outside.
+      try{fs.writeFileSync(path.join(root,'web-bridge-port'),String(this.port),{mode:0o600});}catch{}
+      resolve();
+    });});
     this.ready.catch(()=>{});
   }
   requestInfo() {
