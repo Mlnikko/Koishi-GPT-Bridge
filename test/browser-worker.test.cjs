@@ -43,7 +43,7 @@ function worker({state=null,results={},storageSeed={}}={}){
     get:async key=>{const keys=Array.isArray(key)?key:[key];const out={};for(const k of keys)out[k]=storage[k];return out;},
     set:async values=>Object.assign(storage,plain(values)),
    }},
-   tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/'+THREAD}),remove:async()=>{calls.push({route:'tabs.remove'});}},
+   tabs:{create:async()=>({id:1}),reload:async id=>{calls.push({route:'tabs.reload',tabId:id});},get:async()=>({url:'https://chatgpt.com/c/'+THREAD}),remove:async()=>{calls.push({route:'tabs.remove'});}},
    scripting:{executeScript:async({args:[op,job]})=>{calls.push({op,job:plain(job)});return [{result:op==='prepare'?(results.prepare||{prepared:true}):typeof results==='function'?results(op,job):results[op]}];}},
   },
   fetch:async(url,options)=>{
@@ -603,13 +603,13 @@ test('the new user turn is recognised by counting, not by matching a marker', as
 
 test('reference images are attached once, before any submit', async()=>{
  const events=[],input={files:null,dispatchEvent:event=>events.push(event.type)};
- const editor={focus(){}};
+ const editor=el('div',{role:'textbox',contenteditable:'true'});editor.focus=()=>{};
  const document=createDocument();
  document.body.appendChild(el('main'));
  const sandbox=sandboxOf({document});
  sandbox.document.querySelector=selector=>selector==='input[type="file"]'?input:(selector.includes('textbox')?editor:null);
  input.getAttribute=()=>null;
- sandbox.document.querySelectorAll=selector=>selector==='input[type="file"]'?[input]:[];
+ sandbox.document.querySelectorAll=selector=>selector==='input[type="file"]'?[input]:selector==='[contenteditable="true"]'?[editor]:[];
  sandbox.File=class{constructor(parts,name,options){this.parts=parts;this.name=name;this.type=options.type;}};
  sandbox.DataTransfer=class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}};
  sandbox.Event=class{constructor(type){this.type=type;}};
@@ -798,6 +798,7 @@ test('image upload selects the compatible input instead of an unrelated document
  const pdf=el('input',{type:'file',accept:'.pdf'}), image=el('input',{type:'file',accept:'image/*'});
  pdf.dispatchEvent=()=>events.push('pdf');image.dispatchEvent=e=>events.push(e.type);
  document.body.appendChild(pdf);document.body.appendChild(image);
+ document.body.appendChild(el('div',{role:'textbox',contenteditable:'true'}));
  const sandbox=sandboxOf({document});
  sandbox.File=class{constructor(parts,name,options){this.name=name;this.type=options.type;}};
  sandbox.DataTransfer=class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}};
@@ -834,7 +835,7 @@ test('all reference attachments must settle before filling and upload is never r
 
 for(const phase of ['attaching','waiting'])test(phase+' failure captures an early diagnostic probe',async()=>{
  const task={id:'abcdef123456',images:[{name:'a.jpg'}]};
- const {sandbox,storage,calls}=worker({state:task,results:{inspect:{attachments:0,submitted:false},probe:{phase,attachments:0,userNodes:0}}});
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,attachments:0,submitted:false},probe:{phase,attachments:0,userNodes:0}}});
  await wait();
  storage.current={...task,tabId:1,phase,attachSent:true,attachAt:Date.now()-50000,sentAt:Date.now()-25000};
  await sandbox.tick();
@@ -899,8 +900,185 @@ test('message-author-role is supported when the old role anchors are absent', as
 
 test('navigation between preparation and sending cannot send into the wrong thread',async()=>{
  const sandbox=sandboxOf({location:{href:'https://chatgpt.com/',pathname:'/'}});
- for(const operation of ['attach','prepare','submit','send']){
+ for(const operation of ['attach','prepare','submit','send','read','image','stop']){
   const result=await sandbox.pageStep(operation,{threadId:THREAD,message:'hello'});
   assert.match(result.error,/会话与任务不一致/);
  }
+});
+
+
+// Regression shape from bb40e293ae7d: a generated writing-block textbox (523
+// chars) and the real composer (1 char), neither with prompt-textarea id.
+function composerFixture(){
+ const document=createDocument();
+ const history=el('div',{'data-content-search-unit-key':'turn:assistant'});
+ const writing=el('div',{class:'group/writing-block-surface'});
+ const artifact=el('div',{role:'textbox',contenteditable:'true'},['x'.repeat(523)]);
+ writing.appendChild(artifact);history.appendChild(writing);document.body.appendChild(history);
+ const form=el('form'),editor=el('div',{role:'textbox',contenteditable:'true'},[' ']);
+ const send=el('button',{'aria-label':'发送'});send.click=()=>{send.clicks=(send.clicks||0)+1;};
+ form.appendChild(editor);form.appendChild(send);document.body.appendChild(form);
+ editor.focus=()=>{};editor.dispatchEvent=()=>{};
+ document.execCommand=(command,_ui,value)=>{
+  if(command==='insertText')editor.childNodes=[{nodeType:3,nodeValue:value,parentElement:editor}];
+ };
+ return {document,artifact,editor,form,send};
+}
+
+test('bb40e293ae7d writing-block editor does not compete with the message composer',async()=>{
+ const {document,artifact,editor,send}=composerFixture();
+ const sandbox=sandboxOf({document});
+ const info=await sandbox.pageStep('inspect',{});
+ assert.equal(info.editor,true);assert.equal(info.editorAmbiguous,false);
+ assert.equal((await sandbox.pageStep('submit',{message:'new question'})).filled,true);
+ assert.equal(editor.innerText,'new question');assert.equal(artifact.innerText,'x'.repeat(523));
+ assert.equal((await sandbox.pageStep('send',{message:'new question'})).clicked,true);
+ assert.equal(send.clicks,1);
+ const probe=await sandbox.pageStep('probe',{});
+ assert.equal(probe.editorCandidates[0].excluded,'reply-or-history');
+ assert.equal(probe.editorCandidates[1].selected,true);
+});
+
+test('an unrelated empty editor never wins against a nonempty structural composer',async()=>{
+ const {document,editor}=composerFixture();
+ document.body.appendChild(el('div',{role:'textbox',contenteditable:'true'}));
+ editor.childNodes=[{nodeType:3,nodeValue:'user-owned draft'}];
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).editor,true);
+ assert.match((await sandbox.pageStep('prepare',{message:'new'})).error,/已有内容/);
+ assert.equal(editor.innerText,'user-owned draft');
+});
+
+test('send and attachment controls are scoped to the resolved composer',async()=>{
+ const {document,form,send}=composerFixture();
+ const wrongButton=el('button',{'aria-label':'发送'});wrongButton.click=()=>assert.fail('wrong send');
+ document.body.childNodes.unshift(wrongButton);
+ const foreign=el('input',{type:'file',accept:'image/*'});foreign.dispatchEvent=()=>assert.fail('wrong upload');
+ document.body.childNodes.unshift(foreign);
+ const local=el('input',{type:'file',accept:'image/*'});local.dispatchEvent=()=>{};form.appendChild(local);
+ const sandbox=sandboxOf({document});
+ sandbox.File=class{};sandbox.DataTransfer=class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}};
+ assert.equal((await sandbox.pageStep('attach',{images:[{name:'a.png',mime:'image/png',base64:'AQID'}]})).attached,1);
+ assert.equal(local.files.length,1);assert.equal(foreign.files,undefined);
+ assert.equal((await sandbox.pageStep('send',{message:' '})).clicked,true);assert.equal(send.clicks,1);
+});
+
+test('two genuine composers remain ambiguous and neither can send or upload',async()=>{
+ const document=createDocument();
+ for(let i=0;i<2;i++){
+  const form=el('form'),editor=el('div',{role:'textbox',contenteditable:'true'}),button=el('button',{'aria-label':'发送'});
+  button.click=()=>assert.fail('must not click');form.appendChild(editor);form.appendChild(button);document.body.appendChild(form);
+ }
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).editorAmbiguous,true);
+ assert.match((await sandbox.pageStep('send',{message:''})).error,/无法确定/);
+ assert.match((await sandbox.pageStep('attach',{images:[]})).error,/无法确定/);
+});
+
+function openingJob(overrides={}){
+ return {id:'session-management',tabId:1,threadId:THREAD,phase:'opening',openedAt:Date.now()-10000,
+  sentText:'hello',historySeen:'1/1',historyStreak:2,...overrides};
+}
+function openingWorker(info){
+ if(info.recoverySafe===undefined)info.recoverySafe=true;
+ return worker({state:{id:'session-management',threadId:THREAD,text:'hello'},
+  results:op=>op==='inspect'?info:op==='submit'?{filled:true}:op==='probe'?{phase:'opening'}:{}});
+}
+
+test('transient duplicate composers settle without reloading or dropping the task',async()=>{
+ const info={editor:false,editorAmbiguous:true,threadId:THREAD,assistants:1,users:1};
+ const {sandbox,storage,calls}=openingWorker(info);await wait();storage.current=openingJob();
+ await sandbox.tick();assert.equal(storage.current.phase,'opening');assert.equal(routeOf(calls,'/failure').length,0);
+ info.editor=true;info.editorAmbiguous=false;
+ await sandbox.tick();assert.equal(storage.current.phase,'filled');
+ assert.equal(routeOf(calls,'tabs.reload').length,0);assert.equal(opsOf(calls,'submit').length,1);
+});
+
+test('persistent duplicate composers allow only one durable reload of the same thread',async()=>{
+ const info={editor:false,editorAmbiguous:true,threadId:THREAD,assistants:1,users:1};
+ const {sandbox,storage,calls}=openingWorker(info);await wait();
+ storage.current=openingJob({composerWaitAt:Date.now()-16000});
+ await sandbox.tick();assert.equal(storage.current.recoveryCount,1);assert.equal(storage.current.threadId,THREAD);
+ assert.equal(storage.current.historySeen,undefined);assert.equal(routeOf(calls,'tabs.reload').length,1);
+ // Storage survives worker suspension: a second observation must not reload again.
+ storage.current.composerWaitAt=Date.now()-16000;
+ await sandbox.tick();assert.equal(routeOf(calls,'tabs.reload').length,1);
+ assert.equal(routeOf(calls,'/failure').length,1);assert.equal(storage.current,null);
+ assert.equal(storage.lastFailure.recoveryCount,1);assert.equal(storage.lastFailure.tabId,1);
+ assert.equal(opsOf(calls,'submit').length,0);
+});
+
+for(const unsafe of [{unknownDrafts:true},{attachments:1}])test('unknown draft or existing attachments prevent destructive page recovery '+JSON.stringify(unsafe),async()=>{
+ const {sandbox,storage,calls}=openingWorker({editor:false,editorAmbiguous:true,threadId:THREAD,...unsafe});
+ await wait();storage.current=openingJob({composerWaitAt:Date.now()-16000});
+ await sandbox.tick();assert.equal(routeOf(calls,'tabs.reload').length,0);assert.equal(routeOf(calls,'/failure').length,1);
+});
+
+test('composer loss after upload waits but never refreshes or reattaches',async()=>{
+ const {sandbox,storage,calls}=openingWorker({editor:false,editorAmbiguous:true,threadId:THREAD});await wait();
+ storage.current=openingJob({phase:'attaching',attachSent:true,attachAt:Date.now()});
+ await sandbox.tick();assert.equal(routeOf(calls,'/failure').length,0);
+ storage.current.composerWaitAt=Date.now()-16000;await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);assert.equal(routeOf(calls,'tabs.reload').length,0);
+ assert.equal(opsOf(calls,'attach').length,0);assert.equal(opsOf(calls,'send').length,0);
+});
+
+test('a busy bound conversation is waited for without stopping another generation',async()=>{
+ const info={editor:true,stopping:true,threadId:THREAD,assistants:1,users:1};
+ const {sandbox,storage,calls}=openingWorker(info);await wait();storage.current=openingJob();
+ await sandbox.tick();assert.equal(routeOf(calls,'/failure').length,0);assert.equal(opsOf(calls,'stop').length,0);
+ info.stopping=false;await sandbox.tick();assert.equal(storage.current.phase,'filled');
+});
+
+
+test('ambiguous composers with an attachment cannot be classified safe to refresh',async()=>{
+ const document=createDocument();
+ for(let i=0;i<2;i++){
+  const form=el('form');form.appendChild(el('div',{role:'textbox',contenteditable:'true'}));
+  form.appendChild(el('button',{'aria-label':'发送'}));
+  if(i===0)form.appendChild(el('div',{'data-testid':'attachment-pending'}));
+  document.body.appendChild(form);
+ }
+ const sandbox=sandboxOf({document});const info=await sandbox.pageStep('inspect',{});
+ assert.equal(info.editorAmbiguous,true);assert.equal(info.recoverySafe,false);
+});
+
+test('cancel before submission does not stop existing generation in the conversation',async()=>{
+ const {sandbox,storage,calls}=worker({state:{id:'session-management',cancelled:true},results:{stop:{stopped:true}}});
+ await wait();calls.length=0;storage.current=openingJob();
+ await sandbox.tick();assert.equal(opsOf(calls,'stop').length,0);assert.equal(routeOf(calls,'/failure').length,1);
+});
+
+test('a loading tab waits before injecting any page script',async()=>{
+ const sandbox=sandboxOf();await wait();
+ sandbox.chrome.tabs.get=async()=>({url:'https://chatgpt.com/c/'+THREAD,status:'loading'});
+ sandbox.chrome.scripting.executeScript=async()=>assert.fail('do not inject during navigation');
+ assert.equal((await sandbox.page(1,'inspect',openingJob())).loading,true);
+});
+
+test('new conversation ID is persisted after submission and guards subsequent navigation',async()=>{
+ const info={editor:true,submitted:true,threadId:THREAD,assistants:0,users:1};
+ const {sandbox,storage,calls}=openingWorker(info);await wait();
+ storage.current=openingJob({threadId:'',phase:'waiting',sentAt:Date.now(),baseline:0});
+ await sandbox.tick();assert.equal(storage.current.threadId,THREAD);
+ info.threadId='99999999-2222-3333-4444-555555555555';await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);assert.equal(routeOf(calls,'/result').length,0);
+});
+
+test('opening has a global deadline even while Chat mode never settles',async()=>{
+ const {sandbox,storage,calls}=openingWorker({editor:true,needsChat:true,threadId:THREAD});await wait();
+ storage.current=openingJob({openedAt:Date.now()-91000});await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);assert.equal(opsOf(calls,'chat').length,0);
+});
+
+
+test('a nested composer textbox does not hide the form send button or attachment',async()=>{
+ const document=createDocument(),form=el('form');
+ form.appendChild(el('div',{'data-testid':'composer-input',role:'textbox',contenteditable:'true'},['hello']));
+ const send=el('button',{'aria-label':'发送'});let clicked=0;send.click=()=>clicked++;
+ form.appendChild(send);form.appendChild(img('blob:https://chatgpt.com/upload'));
+ document.body.appendChild(form);
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).attachments,1);
+ assert.equal((await sandbox.pageStep('send',{message:'hello'})).clicked,true);assert.equal(clicked,1);
 });

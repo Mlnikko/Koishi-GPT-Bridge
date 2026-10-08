@@ -59,18 +59,63 @@ async function pageStep(operation,job){
   return node.parentElement||node;
  };
  const user=roles('user'),assistant=roles('assistant'),lastUser=turn(user.at(-1)),lastAssistant=turn(assistant.at(-1));
- // A page can also contain message-editing or hidden textboxes. Prefer the
- // actual prompt composer; never pick an arbitrary first textbox.
- const visible=node=>!node.closest?.('[hidden], [aria-hidden="true"]') &&
-  (typeof node.getClientRects!=='function'||node.getClientRects().length>0);
- const editors=Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible);
- const prompts=editors.filter(node=>node.getAttribute('id')==='prompt-textarea');
- const candidates=prompts.length?prompts:editors.filter(node=>node.getAttribute('role')==='textbox');
+ // A generated writing block is editable too. Resolve by structure, never by
+ // text length, document order, or whichever textbox happens to have focus.
+ const visible=node=>{
+  if(node.closest?.('[hidden], [aria-hidden="true"], [inert]'))return false;
+  if(typeof node.getClientRects==='function'&&!node.getClientRects().length)return false;
+  if(typeof getComputedStyle==='function'){
+   const style=getComputedStyle(node);
+   if(style.visibility==='hidden'||style.visibility==='collapse'||style.display==='none')return false;
+  }
+  return true;
+ };
+ const historySelector='[data-testid^="conversation-turn"], [data-message-author-role], [data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-chatgpt-selection-message-id], [data-dil-message-id], [class*="writing-block"], [data-testid*="canvas" i]';
+ const exclusion=node=>!visible(node)?'hidden':node.closest?.(historySelector)?'reply-or-history':
+  node.closest?.('nav, aside, [role="dialog"], [aria-modal="true"]')?'outside-chat':
+  node.getAttribute('aria-disabled')==='true'||node.getAttribute('aria-readonly')==='true'?'disabled':'';
+ const allEditors=Array.from(document.querySelectorAll('[contenteditable="true"]'));
+ const editors=allEditors.filter(node=>!exclusion(node));
+ const sendLabels=['发送','Send','发送提示','Send prompt'];
+ const isSend=button=>visible(button)&&(sendLabels.includes(button.getAttribute('aria-label')||'')||sendLabels.includes(button.innerText.trim())||button.getAttribute('data-testid')==='send-button');
+ const composerSelector='[data-testid*="composer" i], [id="composer-background"], [data-type="unified-composer"]';
+ const scopeOf=node=>{
+  const form=node.closest?.('form');
+  if(form&&!form.querySelector?.(historySelector)&&editors.filter(candidate=>form.contains(candidate)).length===1
+   &&Array.from(form.querySelectorAll?.('button')||[]).some(isSend))return form;
+  const explicit=node.closest?.(composerSelector);
+  if(explicit&&Array.from(explicit.querySelectorAll?.('button')||[]).some(isSend))return explicit;
+  let parent=node.parentElement;
+  for(let depth=0;parent&&depth<8;depth++,parent=parent.parentElement){
+   if(['BODY','MAIN','HTML'].includes(parent.tagName))break;
+   // Do not associate a button across a wrapper that also contains another
+   // editor or message history; that recreates the original global-selector bug.
+   if(parent.querySelector?.(historySelector))break;
+   if(editors.filter(candidate=>parent.contains(candidate)).length!==1)break;
+   if(Array.from(parent.querySelectorAll?.('button')||[]).some(isSend))return parent;
+  }
+  const fallback=explicit||form||node.parentElement;
+  return fallback&&!['BODY','MAIN','HTML'].includes(fallback.tagName)?fallback:null;
+ };
+ const score=node=>node.getAttribute('id')==='prompt-textarea'?3:
+  node.closest?.(composerSelector)?2:
+  Array.from(scopeOf(node)?.querySelectorAll?.('button')||[]).some(isSend)?1:0;
+ const eligible=editors.filter(node=>node.getAttribute('id')==='prompt-textarea'||node.getAttribute('role')==='textbox');
+ const best=eligible.length?Math.max(...eligible.map(score)):-1;
+ const candidates=eligible.filter(node=>score(node)===best);
  const editor=candidates.length===1?candidates[0]:null;
+ const composer=editor?scopeOf(editor):null;
+ const sendButtons=Array.from((composer||document).querySelectorAll?.('button')||[]).filter(isSend);
+ const sendButton=sendButtons.length===1?sendButtons[0]:null;
+ const normalized=value=>String(value||'').replace(/\s+/g,' ').trim();
+ const ownedDraft=node=>[job.draft,...(job.drafts||[])].some(text=>text&&normalized(text)===normalized(node.innerText));
+ const unknownDrafts=eligible.some(node=>normalized(node.innerText)&&!['询问 ChatGPT','Ask ChatGPT'].includes(normalized(node.innerText))&&!ownedDraft(node));
+ const attachmentSelector='img[src^="blob:"], img[src^="data:image/"], img[src^="https://"], [data-testid*="attachment" i], [data-testid*="composer-file" i]';
+ const recoverySafe=!unknownDrafts&&!eligible.some(node=>scopeOf(node)?.querySelector?.(attachmentSelector+', [role="progressbar"], [aria-busy="true"]'));
  const stop=byLabel(['停止','Stop','停止生成','Stop generating']);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
- if(['attach','prepare','submit','send'].includes(operation) && job.threadId && job.threadId!==threadId)
+ if(['attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)
   throw Error('网页会话与任务不一致');
 // ChatGPT has shipped several wrappers for a generated image, so identify one by
 // what it is — a large bitmap — instead of a single data-testid that can be
@@ -267,10 +312,8 @@ const probeDom=()=>({
  assistantHtml:String(lastAssistant?.outerHTML||'').slice(0,2500)});
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.
- const composer=editor && typeof editor.closest==='function'
-  ?(editor.closest('form')||editor.closest('[data-testid*="composer" i]')||editor.parentElement||null):null;
  const attachmentNodes=composer && typeof composer.querySelectorAll==='function'
-  ?Array.from(composer.querySelectorAll('img[src^="blob:"], img[src^="data:image/"], img[src^="https://"], [data-testid*="attachment" i], [data-testid*="composer-file" i]')):[];
+  ?Array.from(composer.querySelectorAll(attachmentSelector)):[];
  // A card and its thumbnail describe one attachment, not two uploaded files.
  const attachments=attachmentNodes.filter(node=>!attachmentNodes.some(parent=>parent!==node&&parent.contains(node)));
  const uploading=!!composer?.querySelector?.('[role="progressbar"], [aria-busy="true"]')
@@ -289,16 +332,20 @@ const probeDom=()=>({
  const checksum=value=>{let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))|0;return hash;};
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,submitted,
   textMatched:sameText(job.sentText,userText),userText:userText.slice(0,120),
-  editor:!!editor,editorAmbiguous:candidates.length>1,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:attachments.length,uploading,
+  editor:!!editor,editorAmbiguous:candidates.length>1,editorSelection:best,unknownDrafts,recoverySafe,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:attachments.length,uploading,
   replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(source).join('|')),
   busyText:String(lastAssistant?.innerText||'').slice(0,600),
   needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
  if(operation==='probe')return {...probeDom(),phase:job.phase,users:user.length,userBaseline:job.userBaseline,
+  recoveryCount:job.recoveryCount||0,openingStartedAt:job.openingStartedAt||job.openedAt,threadId,expectedThreadId:job.threadId||'',
   attachments:attachments.length,expectedAttachments:job.images?.length||0,uploading,
   editorPresent:!!editor,editorChars:String(editor?.innerText||'').length,
-  editorCandidates:candidates.map(node=>({id:node.getAttribute('id'),role:node.getAttribute('role'),chars:String(node.innerText||'').length})),
+  editorCandidates:allEditors.slice(0,20).map(node=>({id:node.getAttribute('id'),role:node.getAttribute('role'),
+   chars:String(node.innerText||'').length,excluded:exclusion(node),selected:node===editor,score:exclusion(node)?-1:score(node),
+   ancestors:ancestorChain(node),testid:node.getAttribute('data-testid'),label:node.getAttribute('aria-label')})),
+  composerTag:composer?.tagName||null,sendCandidates:sendButtons.length,
   draftMatched:!!editor && [job.draft,...(job.drafts||[])].some(text=>text && normalize(text)===normalize(editor.innerText)),
   fileInputs:Array.from(document.querySelectorAll('input[type="file"]')).map(input=>({accept:input.getAttribute('accept'),disabled:!!input.disabled})),
   buttons:buttons().map(b=>({label:b.getAttribute('aria-label')||b.innerText.trim(),disabled:!!b.disabled})).filter(b=>/send|发送|upload|上传/i.test(b.label)).slice(0,10)};
@@ -311,6 +358,7 @@ const probeDom=()=>({
  if(operation==='chat'){if(chatButton)chatButton.click();return snapshot;}
  if(operation==='stop'){if(stop)stop.click();return {stopped:!!stop};}
  if(operation==='attach'){
+  if(!editor||candidates.length>1)throw Error('无法确定 ChatGPT 消息输入框，未上传附件');
   const list=Array.isArray(job.images)?job.images:[];
   if(!list.length)return {attached:0};
   const transfer=new DataTransfer();
@@ -321,15 +369,16 @@ const probeDom=()=>({
    transfer.items.add(new File([bytes],item.name||'image.png',{type:item.mime||'image/png'}));
   }
   // The first file input may belong to another tool (e.g. document upload).
-  const candidates=Array.from(document.querySelectorAll('input[type="file"]')).filter(input=>!input.disabled);
+  const local=Array.from(composer?.querySelectorAll?.('input[type="file"]')||[]).filter(input=>!input.disabled);
+  const fileCandidates=local.length?local:Array.from(document.querySelectorAll('input[type="file"]')).filter(input=>!input.disabled&&!input.closest?.(historySelector));
   const acceptsImages=input=>{
    const accept=String(input.getAttribute('accept')||'').toLowerCase().split(',').map(value=>value.trim());
    return list.every(item=>accept.includes('image/*')||accept.includes(item.mime)||accept.includes('.'+item.name.split('.').pop().toLowerCase()));
   };
-  const compatible=candidates.filter(acceptsImages);
+  const compatible=fileCandidates.filter(acceptsImages);
   // A video/media picker can accept image/* but belong to another tool.
   const input=compatible.find(input=>!/(?:video|audio)\//i.test(input.getAttribute('accept')||''))
-    ||compatible[0]||candidates.find(input=>!input.getAttribute('accept'));
+    ||compatible[0]||fileCandidates.find(input=>!input.getAttribute('accept'));
   if(input){
    input.files=transfer.files;
    input.dispatchEvent(new Event('input',{bubbles:true}));
@@ -367,7 +416,9 @@ const probeDom=()=>({
   const message=normalize(job.message);
   // React may render the button before it has committed the editor value. This is
   // a safe retry point because no click has happened yet.
-  const send=byLabel(['发送','Send','发送提示','Send prompt']);
+  if(!editor||candidates.length>1)throw Error('无法确定 ChatGPT 消息输入框，未发送');
+  if(sendButtons.length>1)throw Error('消息输入框对应多个发送按钮，未发送');
+  const send=sendButton;
   if(normalize(editor?.innerText||'')!==message)throw Error('输入内容已变化，未发送');
   if(!send || send.disabled)return {ready:false};
   send.click();return {clicked:true};
@@ -396,6 +447,7 @@ async function page(tabId,op,job){
   throw Error('ChatGPT 专用标签页加载超时，请检查网络和登录状态');
  }
  if(!tab.url.startsWith('https://chatgpt.com/'))throw Error('专用标签页已离开 ChatGPT，任务停止');
+ if(tab.status==='loading'&&job.phase==='opening')return {loading:true};
  const results=await chrome.scripting.executeScript({target:{tabId},func:pageStep,args:[op,job]});
  if(!results[0]?.result)throw Error('ChatGPT 页面脚本未返回结果，请检查扩展错误');
  if(results[0].result.error)throw Error(results[0].result.error);
@@ -405,6 +457,25 @@ async function store(current,status){if(!current)inputs.clear();await chrome.sto
 // The draft record is what replaces the old in-prompt marker: it lets the worker
 // recognise its own leftover text without putting anything into the user's prompt.
 async function saveDraft(text){await chrome.storage.local.set({draft:text||null});}
+// Refresh only an untouched task tab, at most once, retaining the same thread.
+// Recovery state is durable before reload, including across MV3 suspension.
+async function waitForComposer(current,info){
+ const now=Date.now();
+ current.composerWaitAt=current.composerWaitAt||now;
+ current.openingStartedAt=current.openingStartedAt||current.openedAt||now;
+ if(now-current.openingStartedAt>90000)throw Error('ChatGPT 页面加载超时，输入框仍未就绪；本次未提交');
+ if(now-current.composerWaitAt<15000){
+  await store(current,'正在等待 ChatGPT 消息输入框稳定');return;
+ }
+ if(!current.recoveryCount&&!current.sentAt&&!current.attachSent&&info.recoverySafe===true&&!info.unknownDrafts&&!info.attachments&&!info.stopping){
+  current.recoveryCount=1;current.openedAt=now;delete current.composerWaitAt;
+  delete current.historySeen;delete current.historyStreak;
+  await store(current,'输入框未就绪，正在重新加载原网页会话（仅一次）');
+  await chrome.tabs.reload(current.tabId);return;
+ }
+ throw Error(info.editorAmbiguous?'检测到多个输入框，等待恢复后仍无法确定 ChatGPT 消息输入框；本次未提交，请检查专用标签页':
+  'ChatGPT 页面加载超时，无法定位消息输入框；本次未提交，请检查专用标签页');
+}
 async function returnReply(current){
  const reply=current.reply;
  for(let index=current.uploaded||0;index<reply.imageCount;index++){
@@ -425,7 +496,7 @@ async function tick(){
   current=stored.current;
   if(!remote.job){
    // A completed/orphaned task is never resubmitted, even after service restarts.
-   if(current?.tabId)await page(current.tabId,'stop',current).catch(()=>{});
+   if(current?.tabId&&current.sentAt)await page(current.tabId,'stop',current).catch(()=>{});
    await store(null,'已连接本机 Koishi，等待任务');return;
   }
   const task=remote.job;
@@ -433,7 +504,7 @@ async function tick(){
    await api('/failure',{id:task.id,message:'任务已取消，未提交网页'});return;
   }
   if(!current || current.id!==task.id){
-   if(current?.tabId)await page(current.tabId,'stop',current).catch(()=>{});
+   if(current?.tabId&&current.sentAt)await page(current.tabId,'stop',current).catch(()=>{});
    const tab=await chrome.tabs.create({url:task.threadId?'https://chatgpt.com/c/'+task.threadId:'https://chatgpt.com/',active:false});
    current={...task,tabId:tab.id,phase:'opening',openedAt:Date.now(),hasImages:!!(task.images&&task.images.length),
     sentText:task.text||'',draft:stored.draft||null,
@@ -441,6 +512,7 @@ async function tick(){
    await store(current,'正在打开 ChatGPT 标签页');await api('/progress',{id:task.id,phase:'opening'});return;
   }
   if(task.cancelled){
+   if(!current.sentAt){await api('/failure',{id:task.id,message:'任务已取消，未提交网页'});await store(null,'任务已取消');return;}
    await page(current.tabId,'stop',current);
    const stopped=await page(current.tabId,'inspect',current);
    if(stopped.stopping){await store(current,'等待网页确认停止');return;}
@@ -456,9 +528,7 @@ async function tick(){
   if(info.challenge)throw Error('ChatGPT 网页需要人工验证，请完成页面验证后重新发送任务');
   if(current.threadId && info.threadId && current.threadId!==info.threadId)throw Error('ChatGPT 会话不匹配，未执行操作');
   if(current.phase==='opening'){
-   if(info.editorAmbiguous)throw Error('检测到多个输入框，无法确定 ChatGPT 消息输入框');
-   if(!info.editor){if(Date.now()-current.openedAt>60000)throw Error('ChatGPT 页面加载超时，请检查网络和登录');return;}
-   if(info.needsChat){await page(current.tabId,'chat',current);return;}
+   if(Date.now()-(current.openingStartedAt||current.openedAt)>90000)throw Error('ChatGPT 页面加载超时，会话未能准备就绪；本次未提交');
    // 续聊时页面必须落到同一个 thread 上。地址被重定向走（会话被删除、链接失效）时
    // info.threadId 会变空，继续等只会一路空耗到桥接超时，所以这里明确失败：桥接收到
    // 这个原因会解绑失效编号，下一条消息自动开一个新会话。
@@ -466,7 +536,15 @@ async function tick(){
     if(Date.now()-current.openedAt>15000)throw Error('ChatGPT 网页会话已不存在或无法打开');
     return;
    }
-   if(info.stopping)throw Error('该 ChatGPT 会话正在处理其他请求，请稍后再试');
+   if(info.stopping){
+    current.busyWaitAt=current.busyWaitAt||Date.now();
+    if(Date.now()-current.busyWaitAt>30000)throw Error('该 ChatGPT 会话仍在处理其他请求，本次未提交，请稍后再试');
+    await store(current,'原网页会话仍在生成，正在等待空闲');return;
+   }
+   delete current.busyWaitAt;
+   if(info.editorAmbiguous||!info.editor){await waitForComposer(current,info);return;}
+   delete current.composerWaitAt;
+   if(info.needsChat){await page(current.tabId,'chat',current);return;}
    // 复用已有会话时，历史轮次是页面异步渲染出来的：输入框先出现，历史要几秒后才补齐。
    // 轮次基线必须等历史渲染稳定之后再采样 —— 页面刚打开时计数还是 0，历史一渲染出来
    // 计数就从 0 变成 1，会被读成「本轮回复已经出现」，结果是十几秒就把上一轮的图当成
@@ -493,6 +571,12 @@ async function tick(){
    if(current.hasImages){current.phase='attaching';await store(current,'正在上传参考图片到 ChatGPT');return;}
    current.phase='filling';await store(current,'正在填写消息');
   }
+  if(['attaching','filling','filled'].includes(current.phase)&&(info.editorAmbiguous||!info.editor)){
+   current.composerWaitAt=current.composerWaitAt||Date.now();
+   if(Date.now()-current.composerWaitAt>15000)throw Error('消息输入框在准备过程中发生变化，未重复上传或提交；请检查专用标签页');
+   await store(current,'正在等待原消息输入框恢复');return;
+  }
+  delete current.composerWaitAt;
   if(current.phase==='attaching'){
    if(current.attachSent && info.attachments>=current.images.length && !info.uploading){current.phase='filling';await store(current,'参考图片已上传，正在填写消息');}
    else {
@@ -560,7 +644,10 @@ async function tick(){
   }
   if(!info.submitted){if(Date.now()-current.sentAt>20000)throw Error('消息未出现在专用标签页上，未取得本轮回复');return;}
   await saveDraft(null);
-  if(info.threadId)await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted'});
+  if(info.threadId){
+   await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted'});
+   if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
+  }
   const waited=Date.now()-current.sentAt;
   const newAssistant=current.assistantId && info.assistantId && current.assistantId!==info.assistantId;
   if((info.assistants<=current.baseline && !newAssistant) || info.stopping){
@@ -609,7 +696,11 @@ async function tick(){
    // Early upload/submission failures also need evidence; the 90-second reply
    // probe cannot capture these. A diagnostic failure must preserve the error.
    if(!err.probe)err.probe=await page(current.tabId,'probe',current).catch(()=>undefined);
-   try{await api('/failure',{id:current.id,message,probe:err.probe});await store(null,'任务失败：'+message);}catch{await chrome.storage.local.set({status:'本机连接中断，未重发网页请求'});}
+   try{
+    await chrome.storage.local.set({lastFailure:{id:current.id,tabId:current.tabId,threadId:current.threadId||'',phase:current.phase,
+     recoveryCount:current.recoveryCount||0,message,at:Date.now()}});
+    await api('/failure',{id:current.id,message,probe:err.probe});await store(null,'任务失败：'+message);
+   }catch{await chrome.storage.local.set({status:'本机连接中断，未重发网页请求'});}
   }else await chrome.storage.local.set({status:'等待本机 Koishi 连接：'+message});
  }finally{ticking=false;}
 }
@@ -618,6 +709,8 @@ chrome.alarms.onAlarm.addListener(()=>void tick());
 chrome.runtime.onStartup.addListener(()=>void tick());
 chrome.runtime.onInstalled.addListener(()=>void tick());
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
- if(message.type==='status'){tick().then(()=>chrome.storage.local.get('status')).then(data=>reply({status:data.status||'等待连接'}));return true;}
+ if(message.type==='status'){tick().then(()=>chrome.storage.local.get(['status','lastFailure']))
+  .then(data=>reply({status:data.status||'等待连接',lastFailure:data.lastFailure||null}))
+  .catch(()=>reply({status:'无法读取连接状态，请检查扩展错误'}));return true;}
 });
 setInterval(()=>void tick(),2000);void tick();
