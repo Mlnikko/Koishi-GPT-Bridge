@@ -55,10 +55,38 @@ async function pageStep(operation,job){
  };
  const turn=node=>{
   if(!node)return null;
-  if(typeof node.closest==='function'){const found=node.closest('[data-testid^="conversation-turn"]');if(found)return found;}
+  if(typeof node.closest==='function'){const found=node.closest('[data-testid^="conversation-turn"], [data-content-search-unit-key], [data-chatgpt-search-unit-key], [data-message-author-role]');if(found)return found;}
   return node.parentElement||node;
  };
  const user=roles('user'),assistant=roles('assistant'),lastUser=turn(user.at(-1)),lastAssistant=turn(assistant.at(-1));
+ // DOM order, rather than the number of mounted history entries, bounds a
+ // reply. Virtualized conversations can remove old bubbles while adding new ones.
+ const order=new Map(),ends=new Map();let ordinal=0;
+ const indexTree=node=>{order.set(node,ordinal++);for(const child of node.children||[])indexTree(child);ends.set(node,ordinal-1);};
+ indexTree(document.body);
+ const after=(node,boundary)=>order.has(node)&&order.has(boundary)&&order.get(node)>order.get(boundary);
+ const userAnchor=user.at(-1);
+ const messageId=node=>{
+  const attrs=['data-message-id','data-chatgpt-selection-message-id','data-chatgpt-search-message-ids'];
+  for(const attr of attrs){
+   const carrier=node?.getAttribute?.(attr)?node:node?.closest?.('['+attr+']')||node?.querySelector?.('['+attr+']');
+   const value=carrier?.getAttribute?.(attr);
+   if(value)return [...new Set(value.trim().split(/\s+/))].join(' ');
+  }
+  return '';
+ };
+ // A reply may consist of a generated-image block plus a separate, empty final
+ // assistant block. Keep all reply blocks after the latest user bubble.
+ const roots=userAnchor?assistant.filter(node=>after(node,userAnchor)).map(turn):[lastAssistant].filter(Boolean);
+ if(userAnchor){
+  for(const gallery of Array.from(document.querySelectorAll('[data-testid*="generated-image-gallery" i]'))){
+   if(after(gallery,userAnchor)&&!gallery.closest?.('form, nav, aside, header, [role="dialog"]')
+    &&!user.some(node=>node.contains?.(gallery)))roots.push(gallery);
+  }
+ }
+ const uniqueRoots=[...new Set(roots)].filter(Boolean);
+ const replyRoots=uniqueRoots.filter(node=>!uniqueRoots.some(parent=>parent!==node&&parent.contains?.(node)))
+  .sort((a,b)=>(order.get(a)||0)-(order.get(b)||0));
  // A generated writing block is editable too. Resolve by structure, never by
  // text length, document order, or whichever textbox happens to have focus.
  const visible=node=>{
@@ -129,7 +157,7 @@ const conversationArea=document.querySelector('main');
 // 「不在 <main> 内」是一条依赖页面结构的假设，ChatGPT 一旦把会话渲染到 <main> 之外，
 // 它就会把真正的生成图整批判成页面框架 —— 任务 e1d8e9675311 就是这样等满 240 秒后
 // 报「未检测到本轮图片」，而页面上那张 1367×1150 的图一直都在。
-const inReplyTurn=img=>!!lastAssistant && typeof lastAssistant.contains==='function' && lastAssistant.contains(img);
+const inReplyTurn=img=>replyRoots.some(root=>root.contains?.(img));
 const chromeReason=img=>{
  if(typeof img.closest!=='function')return '';
  const ancestor=img.closest('header, nav, aside, [data-testid*="profile" i], [data-testid*="sidebar" i]');
@@ -152,30 +180,20 @@ const looksGenerated=img=>{
  const width=Number(img.naturalWidth)||0,height=Number(img.naturalHeight)||0;
  return width>=200 && height>=200;
 };
-const insideUser=img=>user.some(node=>{const scope=turn(node);return scope && typeof scope.contains==='function' && scope.contains(img);});
+const userScopes=user.map(node=>{
+ const scope=turn(node);
+ // A shared conversation wrapper is not a user-only boundary.
+ return assistant.some(anchor=>scope?.contains?.(anchor))?node:scope;
+});
+const insideUser=img=>userScopes.some(scope=>scope?.contains?.(img));
 // The account avatar is also rendered inside the user's own turn. The newest
 // assistant turn can resolve to a wrapper that covers that turn as well, so an
 // image sitting in the user turn is never part of the reply.
-const inUserTurn=img=>!!lastUser && typeof lastUser.contains==='function' && lastUser.contains(img);
-// Only pictures inside the newest assistant turn count. The whole-page fallback
-// scan was deleted on purpose: it is what handed back the account avatar
-// (job f948b24235f4) and the user's own reference image (job 02c2fa8e036a). If a
-// selector breaks the scan now finds nothing and we keep waiting, which fails
-// safe instead of returning a wrong picture.
-const replyImages=()=>{
- if(!lastAssistant || typeof lastAssistant.querySelectorAll!=='function')return [];
- return Array.from(lastAssistant.querySelectorAll('img')).filter(img=>looksGenerated(img)&&!inUserTurn(img)&&!insideUser(img));
-};
-// The reply body. The assistant role heading and the action buttons live beside
-// the content, not inside it, so the markdown container is preferred whenever the
-// page still exposes one.
-const replyRoot=()=>{
- if(!lastAssistant)return null;
- const find=selector=>typeof lastAssistant.querySelector==='function'?lastAssistant.querySelector(selector):null;
- // 找不到 markdown 容器时会退到整个轮次容器，而那里还带着「ChatGPT 说：」这类
- // 无障碍标题，所以 walk() 里另外要按角色属性把它过滤掉。
- return find('[class*="markdown"]')||find('[data-message-author-role="assistant"]')||lastAssistant;
-};
+const inUserTurn=img=>!!userScopes.at(-1)?.contains?.(img);
+// Never scan arbitrary page images: candidates must belong to bounded reply
+// blocks or an explicit generated gallery after this turn's user message.
+const replyImages=()=>[...new Set(replyRoots.flatMap(root=>Array.from(root.querySelectorAll?.('img')||[])))]
+ .filter(img=>(!userAnchor||after(img,userAnchor))&&looksGenerated(img)&&!inUserTurn(img)&&!insideUser(img));
 const BLOCKS=new Set(['P','DIV','SECTION','ARTICLE','FIGURE','UL','OL','LI','BLOCKQUOTE','PRE','TABLE','H1','H2','H3','H4','H5','H6','HR']);
 // Inline rendering keeps the structure a reader would see: links carry their
 // target, inline code keeps its backticks, line breaks survive.
@@ -203,13 +221,17 @@ const tableText=table=>Array.from(table.querySelectorAll?.('tr')||[])
 const serializeReply=()=>{
  const segments=[],images=[];
  const pushImage=img=>{
-  if(!looksGenerated(img)||inUserTurn(img)||insideUser(img)||images.includes(img))return;
+  if((userAnchor&&!after(img,userAnchor))||!looksGenerated(img)||inUserTurn(img)||insideUser(img)||images.includes(img))return;
   segments.push({type:'image',asset:images.length,mime:'image/png'});
   images.push(img);
  };
  const walk=node=>{
   for(const child of node.children||[]){
    const tag=child.tagName;
+   if(userAnchor&&ends.has(child)&&ends.get(child)<order.get(userAnchor))continue;
+   if(child.getAttribute?.('data-user-message-bubble')!==null&&child.getAttribute?.('data-user-message-bubble')!==undefined)continue;
+   if(child.getAttribute?.('data-message-author-role')==='user')continue;
+   if(child.closest?.('[hidden], [aria-hidden="true"], nav, aside, form'))continue;
    // Generated-image previews are interactive BUTTONs. Ignore their control text,
    // but keep any valid image nested inside; otherwise the real ChatGPT gallery
    // shape produces picked=true in the probe while serializeReply() returns zero.
@@ -220,7 +242,7 @@ const serializeReply=()=>{
    if(tag==='SVG'||tag==='STYLE'||tag==='SCRIPT')continue;
    // 「ChatGPT 说：」这类无障碍标题是页面框架，不是回复内容。轮次容器把标题和
    // 正文放在一起，少了这道过滤，一个还没出图的空轮次也会被读成一条回复。
-   if(child.getAttribute?.('data-conversation-role')||child.getAttribute?.('data-message-author-role'))continue;
+   if(child.getAttribute?.('data-conversation-role')||(/^H[1-6]$/.test(tag)&&child.getAttribute?.('data-message-author-role')))continue;
    if(tag==='IMG'){pushImage(child);continue;}
    if(tag==='PRE'){
     const code=(typeof child.querySelector==='function'&&child.querySelector('code'))||child;
@@ -252,8 +274,7 @@ const serializeReply=()=>{
    walk(child);
   }
  };
- const root=replyRoot();
- if(root){
+ for(const root of replyRoots){
   const rootHasBlock=Array.from(root.children||[]).some(node=>BLOCKS.has(node.tagName));
   if(rootHasBlock)walk(root);
   else{
@@ -274,15 +295,19 @@ const sameText=(sent,seen)=>{
  if(a===b||b.includes(a))return true;
  return b.length>=20&&a.startsWith(b);
 };
-const userText=String(lastUser?.innerText||'');
-// Counting is the primary signal: the rendered user bubble can differ from what
-// was typed (markdown, collapsing), so a text mismatch alone must never be read
-// as "our message never landed".
-const submitted=user.length>(job.userBaseline||0);
-// 每条 assistant 消息在 DOM 里带一个稳定的 message id。它是判断「最新轮次是不是
-// 提交前那一条」最直接的证据 —— 轮次计数会被页面异步渲染历史带偏，这个不会。
-// 属性缺失时是空串，防线自动失效，不会把任务卡死。
-const assistantId=String(lastAssistant?.getAttribute?.('data-message-id')||lastAssistant?.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id')||lastAssistant?.querySelector?.('[data-chatgpt-search-message-ids]')?.getAttribute?.('data-chatgpt-search-message-ids')||'');
+const userText=String(userAnchor?.innerText||'');
+const userId=messageId(userAnchor);
+const userChanged=!!((job.submittedUserId&&userId&&job.submittedUserId!==userId)||
+ (!job.submittedUserId&&job.submittedUserText!==undefined&&normalize(job.submittedUserText)!==normalize(userText)));
+const identityChanged=!!(job.userId&&userId&&job.userId!==userId);
+// Without IDs, exact new text is additional evidence when history counts shrink.
+// Repeated identical prompts or image-only prompts still require IDs or counts.
+const newExactText=job.userText!==undefined&&normalize(job.sentText)&&normalize(userText)===normalize(job.sentText)
+ &&normalize(userText)!==normalize(job.userText);
+const submitted=job.submittedConfirmed?!userChanged:
+ identityChanged||!!newExactText||user.length>(job.userBaseline||0);
+const assistantId=replyRoots.map(messageId).filter(Boolean).join('|')||(!userAnchor?messageId(lastAssistant):'');
+if(['read','image'].includes(operation)&&userChanged)throw Error('网页出现其他用户轮次，未读取不属于本任务的回复');
 // 排查用：把一张图的祖先链记下来。只看 tag 名和 testid，
 // 一旦某张图被判掉，就能直接看出是哪一层祖先触发的规则。
 const ancestorChain=img=>{
@@ -297,8 +322,13 @@ const ancestorChain=img=>{
  return out.join(' < ');
 };
 const probeDom=()=>({
+ workerVersion:job.workerVersion||'unknown',stopping:!!stop,replyLength,readableImages:images.length,
  turns:document.querySelectorAll('[data-testid^="conversation-turn"]').length,
  userNodes:user.length,assistantAnchor:!!lastAssistant,main:!!conversationArea,
+ userId,baselineUserId:job.userId||'',submitted,submittedConfirmed:!!job.submittedConfirmed,userChanged,
+ baselineUsers:job.userBaseline,baselineAssistants:job.baseline,assistantId,baselineAssistantId:job.assistantId||'',
+ replyRoots:replyRoots.map(root=>({tag:root.tagName,id:messageId(root),key:root.getAttribute?.('data-content-search-unit-key'),
+  images:root.querySelectorAll?.('img').length||0,chars:String(root.innerText||'').length})),
  roleNodes:Array.from(document.querySelectorAll('[data-message-author-role],[data-conversation-role]')).slice(0,20)
   .map(el=>el.tagName.toLowerCase()+'@'+(el.getAttribute('data-message-author-role')||el.getAttribute('data-conversation-role')||'')),
  images:Array.from(document.querySelectorAll('img')).slice(0,20).map(img=>({
@@ -328,13 +358,18 @@ const probeDom=()=>({
  const replyLength=answerText.replace(/\s+/g,'').length;
  const imageLoading=images.some(image=>image.complete===false||!(Number(image.naturalWidth)>0));
  // 画廊已经出现但还没有可用图片，说明图正在画。
- const gallery=!!(typeof lastAssistant?.querySelector==='function'&&lastAssistant.querySelector('[data-testid*="generated-image" i]'));
+ const galleries=[...new Set(replyRoots.flatMap(root=>[
+  ...(root.getAttribute?.('data-testid')?.includes('generated-image-gallery')?[root]:[]),
+  ...Array.from(root.querySelectorAll?.('[data-testid*="generated-image-gallery" i]')||[]),
+ ]))].filter(visible);
+ const gallery=galleries.length>0;
+ const pendingGallery=galleries.some(root=>!Array.from(root.querySelectorAll('img')).some(img=>images.includes(img)&&img.complete!==false));
  const checksum=value=>{let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))|0;return hash;};
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,submitted,
-  textMatched:sameText(job.sentText,userText),userText:userText.slice(0,120),
-  editor:!!editor,editorAmbiguous:candidates.length>1,editorSelection:best,unknownDrafts,recoverySafe,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:attachments.length,uploading,
+  textMatched:sameText(job.sentText,userText),userText,userId,userChanged,replyBlocks:replyRoots.length,replyBounded:!!userAnchor,
+  editor:!!editor,editorAmbiguous:candidates.length>1,editorSelection:best,unknownDrafts,recoverySafe,stopping:!!stop,images:images.length,imageLoading,gallery,pendingGallery,attachments:attachments.length,uploading,
   replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(source).join('|')),
-  busyText:String(lastAssistant?.innerText||'').slice(0,600),
+  busyText:replyRoots.map(root=>String(root.innerText||'')).join('\n').slice(0,600),
   needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
@@ -448,7 +483,8 @@ async function page(tabId,op,job){
  }
  if(!tab.url.startsWith('https://chatgpt.com/'))throw Error('专用标签页已离开 ChatGPT，任务停止');
  if(tab.status==='loading'&&job.phase==='opening')return {loading:true};
- const results=await chrome.scripting.executeScript({target:{tabId},func:pageStep,args:[op,job]});
+ const results=await chrome.scripting.executeScript({target:{tabId},func:pageStep,
+  args:[op,{...job,workerVersion:chrome.runtime.getManifest?.().version||'development'}]});
  if(!results[0]?.result)throw Error('ChatGPT 页面脚本未返回结果，请检查扩展错误');
  if(results[0].result.error)throw Error(results[0].result.error);
  return results[0].result;
@@ -551,7 +587,7 @@ async function tick(){
    // 本轮结果回传（任务 0f24faeed208 / 988bca02fb9f 就是这样，回传的 PNG 与上一轮字节完全相同）。
    // 全新会话页面上本来就没有历史，基线天然是 0，不必付这个等待。
    if(current.threadId){
-    const seen=info.assistants+'/'+info.users;
+    const seen=info.assistants+'/'+info.users+(info.userId||info.assistantId?'/'+(info.userId||'')+'/'+(info.assistantId||''):'');
     if(current.historySeen!==seen){
      current.historySeen=seen;current.historyStreak=1;
      await store(current,'正在等待 ChatGPT 载入会话历史');return;
@@ -567,7 +603,7 @@ async function tick(){
    current.assistantId=info.assistantId;
    // Count the user's turns before submitting: the new turn is what proves the
    // message actually landed, and it does so without a marker in the prompt.
-   current.userBaseline=info.users;
+   current.userBaseline=info.users;current.userId=info.userId||'';current.userText=info.userText;
    if(current.hasImages){current.phase='attaching';await store(current,'正在上传参考图片到 ChatGPT');return;}
    current.phase='filling';await store(current,'正在填写消息');
   }
@@ -642,22 +678,32 @@ async function tick(){
    await saveDraft(null);
    current.phase='waiting';await store(current,'ChatGPT 正在生成回复');
   }
+  if(info.userChanged)throw Error('网页出现其他用户轮次，为避免回传错误回复，已停止读取本轮');
   if(!info.submitted){if(Date.now()-current.sentAt>20000)throw Error('消息未出现在专用标签页上，未取得本轮回复');return;}
   await saveDraft(null);
+  if(!current.submittedConfirmed){
+   current.submittedConfirmed=true;current.submittedUserId=info.userId||'';current.submittedUserText=info.userText;
+   await store(current,'本轮消息已确认，正在等待回复');
+  }
   if(info.threadId){
-   await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted'});
+   await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted',evidence:{
+    workerVersion:chrome.runtime.getManifest?.().version||'development',userId:info.userId||'',
+    userBaseline:current.userBaseline,users:info.users,assistantBaseline:current.baseline,assistants:info.assistants,
+    assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
+   }});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
   }
   const waited=Date.now()-current.sentAt;
   const newAssistant=current.assistantId && info.assistantId && current.assistantId!==info.assistantId;
-  if((info.assistants<=current.baseline && !newAssistant) || info.stopping){
+  const boundedReply=current.submittedConfirmed&&info.replyBounded&&info.replyBlocks>0;
+  if((info.assistants<=current.baseline && !newAssistant&&!boundedReply) || info.stopping){
    if(waited>240000)throw Object.assign(Error('等待网页回复超时，生成未结束或尚未出现本轮回复'),{probe:info.probe});
    return;
   }
   // 双重确认：最新 assistant 轮次必须不是提交前那一条。计数只说明「轮次变多了」，
   // 说明不了「多出来的是我这一轮」；message id 直接回答这个问题。读不到属性时
   // assistantId 是空串，这条自动跳过，退回纯计数判定。
-  if(current.assistantId && info.assistantId===current.assistantId){
+  if(!boundedReply&&current.assistantId && info.assistantId===current.assistantId){
    if(waited>240000)throw Object.assign(Error('等待网页回复超时，尚未出现本轮回复'),{probe:info.probe});
    return;
   }
@@ -670,7 +716,7 @@ async function tick(){
   // assistant 轮次（只有无障碍标题），图片要几十秒后才出现；在这里提前收工，
   // 后面的 chrome.tabs.remove 会把还在生成的图片一起关掉。
   const empty=!info.replyLength && !info.images;
-  const pendingImage=info.imageLoading || (info.gallery && !info.images);
+  const pendingImage=info.imageLoading || info.pendingGallery || (info.gallery && !info.images);
   // The hard cap rejects only a reply that still has no usable content. A complete
   // image or text can become visible on the boundary tick; throwing before this
   // check discarded that valid result (job d4a2a235d1c0). At the cap, stale busy

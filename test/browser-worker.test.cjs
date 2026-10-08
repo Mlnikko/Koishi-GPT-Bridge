@@ -1082,3 +1082,123 @@ test('a nested composer textbox does not hide the form send button or attachment
  assert.equal((await sandbox.pageStep('inspect',{})).attachments,1);
  assert.equal((await sandbox.pageStep('send',{message:'hello'})).clicked,true);assert.equal(clicked,1);
 });
+
+
+function splitReplyFixture(){
+ const document=createDocument(),main=el('main');document.body.appendChild(main);
+ const oldGallery=el('div',{'data-testid':'generated-image-gallery'},[img('blob:old',{alt:'已生成图像 1'})]);
+ main.appendChild(oldGallery);
+ const user=el('div',{'data-message-id':'new-user','data-user-message-bubble':''},['new prompt']);
+ main.appendChild(el('div',{'data-content-search-unit-key':'fallback-turn-5:user'},[user]));
+ const gallery=el('div',{'data-testid':'generated-image-gallery'},[
+  el('button',{'data-testid':'generated-image-preview'},[img('blob:new',{alt:'已生成图像 1'})])]);
+ main.appendChild(gallery);
+ const empty=el('div',{'data-content-search-unit-key':'fallback-turn-5:2:assistant','data-chatgpt-search-message-ids':'new-assistant new-assistant'},[
+  el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']),el('div',{'data-dil-message-id':'new-assistant'})]);
+ main.appendChild(empty);
+ return {document,main,user,gallery,empty,oldGallery};
+}
+
+test('ad5024437133: a generated gallery before the empty final assistant block is returned',async()=>{
+ const {document}=splitReplyFixture();const sandbox=sandboxOf({document});
+ const job={userBaseline:6,userId:'previous-user',sentText:'new prompt'};
+ const info=await sandbox.pageStep('inspect',job);
+ assert.equal(info.submitted,true);assert.equal(info.users,1);assert.equal(info.images,1);
+ assert.equal(info.assistantId,'new-assistant');
+ const reply=await sandbox.pageStep('read',job);
+ assert.deepEqual(plain(reply.segments),[{type:'image',asset:0,mime:'image/png'}]);
+ const probe=await sandbox.pageStep('probe',job);
+ assert.equal(probe.images.find(i=>i.picked).inReplyTurn,true);
+ assert.equal(probe.images.filter(i=>i.picked).length,1);
+ assert.equal(probe.images[0].picked,false,'previous gallery before the user boundary stays excluded');
+});
+
+test('all assistant blocks after the current user are serialized in order',async()=>{
+ const {document,main,gallery,empty}=splitReplyFixture();
+ const intro=el('div',{'data-content-search-unit-key':'fallback-turn-5:0:assistant'},[
+  el('h4',{'data-conversation-role':'assistant'}),el('p',{},['first block'])]);
+ main.childNodes.splice(main.childNodes.indexOf(gallery),0,intro);intro.parentElement=main;
+ empty.appendChild(el('p',{},['last block']));
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[{type:'text',text:'first block'},{type:'image',asset:0,mime:'image/png'},{type:'text',text:'last block'}]);
+});
+
+test('3922523b3763: exact new user text confirms submission despite reduced history counts',async()=>{
+ const {document,user}=splitReplyFixture();delete user.attrs['data-message-id'];
+ const sandbox=sandboxOf({document});
+ const info=await sandbox.pageStep('inspect',{userBaseline:5,userText:'previous question',sentText:'new prompt'});
+ assert.equal(info.users,1);assert.equal(info.submitted,true);
+ const repeated=await sandbox.pageStep('inspect',{userBaseline:5,userText:'new prompt',sentText:'new prompt'});
+ assert.equal(repeated.submitted,false,'identical text alone cannot prove a repeated submission');
+});
+
+test('confirmed submission survives count changes but detects a foreign user turn',async()=>{
+ const {document}=splitReplyFixture();const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{submittedConfirmed:true,submittedUserId:'new-user',userBaseline:9})).submitted,true);
+ const changed=await sandbox.pageStep('inspect',{submittedConfirmed:true,submittedUserId:'other-user'});
+ assert.equal(changed.userChanged,true);assert.equal(changed.submitted,false);
+});
+
+test('20049f082c1d: bounded current reply bypasses decreasing assistant counts',async()=>{
+ const task={id:'bounded',text:'new prompt',threadId:THREAD};
+ const {sandbox,storage,calls}=worker({state:task,results:{
+  inspect:{editor:true,submitted:true,users:1,userId:'new-user',assistants:1,threadId:THREAD,replyBounded:true,replyBlocks:2,
+   replyLength:3,images:0,replySignature:'answer',stopping:false,busyText:''},
+  read:{threadId:THREAD,segments:[{type:'text',text:'new answer'}],imageCount:0},
+ }});
+ await wait();storage.current={...task,tabId:1,phase:'waiting',sentAt:Date.now()-10000,baseline:5,
+  userBaseline:6,assistantId:'old-assistant',lastSignature:'answer',stableAt:Date.now()-5000};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/result').length,1);assert.equal(routeOf(calls,'/failure').length,0);
+});
+
+test('reply root identity reads attributes on the root itself and deduplicates IDs',async()=>{
+ const {document}=splitReplyFixture();
+ const info=await sandboxOf({document}).pageStep('inspect',{});
+ assert.equal(info.assistantId,'new-assistant');assert.equal(info.userId,'new-user');
+});
+
+
+test('real page extraction feeds the worker image upload without waiting for count growth',async()=>{
+ const fixture=splitReplyFixture(),task={id:'dom-pipeline',threadId:THREAD,text:'new prompt'};
+ const {sandbox,storage,calls}=worker({state:task});await wait();
+ sandbox.document=fixture.document;sandbox.location={href:'https://chatgpt.com/c/'+THREAD,pathname:'/c/'+THREAD};
+ sandbox.chrome.scripting.executeScript=async({args:[op,job]})=>{
+  calls.push({op});
+  if(op==='image')return [{result:{base64:Buffer.from('fake-png').toString('base64')}}];
+  return [{result:await sandbox.pageStep(op,job)}];
+ };
+ storage.current={...task,tabId:1,phase:'waiting',sentText:'new prompt',sentAt:Date.now()-10000,
+  baseline:5,userBaseline:6,userId:'previous-user',assistantId:'previous-assistant'};
+ await sandbox.tick();storage.current.stableAt=Date.now()-5000;
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,0);
+ assert.equal(routeOf(calls,'/result-asset').length,1);
+ const result=routeOf(calls,'/result')[0];assert.ok(result);
+ assert.deepEqual(result.body.segments,[{type:'image',asset:0,mime:'image/png'}]);
+ assert.equal(opsOf(calls,'send').length,0);assert.equal(storage.current,null);
+});
+
+test('one completed gallery cannot hide a second gallery still generating',async()=>{
+ const {document,main}=splitReplyFixture();
+ main.appendChild(el('div',{'data-testid':'generated-image-gallery'},[el('div',{},['generating'])]));
+ const sandbox=sandboxOf({document});const info=await sandbox.pageStep('inspect',{});
+ assert.equal(info.images,1);assert.equal(info.pendingGallery,true);
+});
+
+test('late image reads refuse a reply after another user message replaced the owner',async()=>{
+ const {document}=splitReplyFixture();const sandbox=sandboxOf({document});
+ for(const op of ['read','image'])assert.match((await sandbox.pageStep(op,{submittedUserId:'older-user'})).error,/其他用户轮次/);
+});
+
+
+test('a wrapper shared by user and assistant excludes the reference but keeps the generated image',async()=>{
+ const document=createDocument(),wrapper=el('div',{'data-testid':'conversation-turn-1'});
+ const user=el('div',{'data-user-message-bubble':''},['question',img('blob:reference',{alt:'用户附件'})]);
+ wrapper.appendChild(user);wrapper.appendChild(el('h4',{'data-conversation-role':'assistant'}));
+ wrapper.appendChild(el('div',{'data-testid':'generated-image-gallery'},[img('blob:answer',{alt:'已生成图像 1'})]));
+ document.body.appendChild(wrapper);
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('read',{})).imageCount,1);
+ const probe=await sandbox.pageStep('probe',{});assert.equal(probe.images[0].picked,false);assert.equal(probe.images[1].picked,true);
+});

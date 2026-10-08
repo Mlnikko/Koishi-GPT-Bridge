@@ -221,3 +221,16 @@ test('a task without reference images advertises an empty list',async t=>{
  await call('/failure',{id:job.id,message:'页面加载超时'});
  await p;
 });
+
+
+test('bound conversation ID and first submission evidence remain available for diagnosis',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');let bound;
+ const result=b.run(job,{threadId:id,onThread:value=>{bound=value;}});await new Promise(setImmediate);
+ assert.equal(bound,id);
+ const evidence={workerVersion:'0.3.2',userId:'user-message',userBaseline:5,users:3,replyBlocks:2};
+ await call('/progress',{id:job.id,threadId:id,phase:'submitted',evidence});
+ await call('/progress',{id:job.id,threadId:id,phase:'submitted',evidence:{users:99}});
+ const saved=JSON.parse(fs.readFileSync(path.join(job.dir,'submission.json')));
+ assert.equal(saved.users,3);assert.equal(saved.userId,'user-message');
+ await call('/result',{id:job.id,threadId:id,segments:[{type:'text',text:'done'}]});await result;
+});

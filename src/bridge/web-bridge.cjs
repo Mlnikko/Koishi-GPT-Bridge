@@ -157,6 +157,9 @@ class WebBridge {
           if(!validThread(body.threadId) || (p.threadId && body.threadId!==p.threadId)) throw error('thread_mismatch','ChatGPT 会话不匹配，已停止');
           if(!p.threadId){p.threadId=body.threadId;p.onThread(body.threadId);}
         }
+        if(body.phase==='submitted'&&body.evidence&&!p.submissionSaved){
+          saveProbe(p.job.dir,'submission.json',body.evidence);p.submissionSaved=true;
+        }
         const phase=PHASES[body.phase];
         if(phase)p.onProgress(phase);
         return send(200,{ok:true,cancelled:!!p.cancelled});
@@ -209,6 +212,7 @@ class WebBridge {
     if(threadId && !validThread(threadId))throw error('thread_invalid','ChatGPT 会话编号无效');
     if(signal?.aborted)throw error('cancelled','任务已取消');
     if(Date.now()-this.lastSeen>90000)throw error('browser_offline','ChatGPT 网页连接器未在线。请打开 Chrome 并启用扩展，等待连接后重试');
+    if(threadId)onThread(threadId);
     const report=onProgress;
     onProgress=phase=>{try{report(phase);}catch{}};
     return new Promise((resolve,reject)=>{

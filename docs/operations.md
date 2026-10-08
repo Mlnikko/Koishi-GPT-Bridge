@@ -188,3 +188,12 @@ sendTimeoutMs 默认 20000；它限制等待确认，不会取消适配器已经
 如果仍失败，点击扩展弹窗中的“查看最近故障网页”，或查看任务目录 dom-probe.json 的 editorCandidates（excluded、selected、score、ancestors）、sendCandidates、expectedThreadId、recoveryCount。新探针不保存输入框正文，仅记录长度与结构属性。不要将完整探针作为公开日志分享，其他回复探针字段仍可能含对话内容。
 
 实际验收：在曾出现可编辑写作块的同一会话发送一条短文字，确认只修改底部消息输入框、网页只新增一轮用户消息且 QQ 收到本轮回复；再验证图片附件只出现在该撰写区。原失败任务 bb40e293ae7d 不会自动重发，需在扩展更新后重新发送所需消息。
+
+
+## 0.3.2 网页已回复但 QQ 没有结果
+
+完成当前任务后重启 Koishi 实例，并在 Chrome 扩展管理页重新加载扩展，确认版本 0.3.2。网页提取修复在扩展侧；重启插件可启用 submission.json 和复用会话 threadId 诊断记录。
+
+本次已确认的漏图原因是末尾 assistant 块为空、生成画廊在其外侧，且可见历史数量会回落。新版本按本轮用户消息边界收集多个回复块；检查新探针中的 replyRoots、readableImages、baselineUsers、baselineAssistants、assistantId 和 workerVersion，可验证识别结果。
+
+真实验收应在同一会话连续发两条不同的短消息，再验证一次图像回复。确认每轮网页新增正确的用户消息、只提取本轮画廊，并检查 job.json 的 ready、delivery=sent 与 QQ 实际收到的消息。历史失败任务没有落盘 result.json/result-*.png 时，“桥接重发”不会重新读取网页，也不会再次生成；所需旧图片需从保留的网页会话中获取。
