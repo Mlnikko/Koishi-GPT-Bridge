@@ -1,4 +1,6 @@
-# Koishi 本机 ChatGPT 网页桥接
+# Koishi-GPT-Bridge
+
+Koishi 本机 ChatGPT 网页桥接。
 
 把 QQ 消息原样送进 Chrome 里**已登录的 ChatGPT 普通聊天页面**，再把网页的回复原样送回 QQ。
 不调用 OpenAI 接口，不需要 API Key，也不调用任何本地 CLI。请保持 Chrome、扩展和 Koishi 运行；
