@@ -56,3 +56,10 @@ test('local paths are masked on Windows hosts too, not only POSIX', () => {
   assert.equal(safeReason('图片生成失败，请稍后重试'), '图片生成失败，请稍后重试');
   assert.equal(safeReason('https://chatgpt.com/c/abc'), '[服务地址]');
 });
+
+
+test('numeric browser tab IDs cannot masquerade as HTTP quota or authentication errors',()=>{
+ assert.equal(failureInfo({technical:'No tab with id: 1175825429.'}).code,'browser_interaction');
+ assert.equal(failureInfo({technical:'No tab with id: 14011234.'}).code,'browser_interaction');
+ assert.equal(failureInfo({technical:'HTTP 429'}).code,'rate_limit');
+});

@@ -17,7 +17,7 @@ const LIMITS = {
   maxImages: 10,
 };
 
-const TRUNCATED_NOTICE = '（回复过长，以上为前一部分；完整内容保留在本机任务记录中，可用「桥接重发」重新获取。）';
+const TRUNCATED_NOTICE = '（回复过长，以上为前一部分；完整内容保留在本机任务记录 reply.md 中；重发仍受长度上限限制。）';
 
 function replyError(code, message) { return Object.assign(new Error(message), { code }); }
 
@@ -71,30 +71,49 @@ function replyText(segments) {
 // 按长度拆分，优先在段落边界断开，绝不在代码块内部切断。
 // 代码块本身超过上限时按行拆开，并在每块重复围栏，保证每块都是合法 Markdown。
 function splitText(text, maxChars) {
-  const limit = Math.max(1, Number(maxChars) || 0);
   const value = String(text ?? '');
+  const limit = Math.floor(Number(maxChars));
   if (!value) return [];
-  if (value.length <= limit) return [value];
-
+  if (!(limit > 0) || value.length <= limit) return [value];
   const chunks = [];
-  let current = [];
-  let fence = '';
-  const size = () => current.length ? current.join('\n').length : 0;
-  const close = () => {
-    if (!current.length) return;
-    chunks.push((fence ? [...current, '```'] : current).join('\n'));
-    current = fence ? [fence] : [];
+  // Prefer line/paragraph boundaries, but hard-wrap long lines too. Keep UTF-16
+  // surrogate pairs intact (QQ limits are measured conservatively in code units).
+  const plain = (input, width) => {
+    const result = [];
+    while (input.length > width) {
+      let end = input.lastIndexOf('\n', width);
+      if (end < width / 2) end = width;
+      if (end > 0 && /[\uD800-\uDBFF]/.test(input[end - 1])) end--;
+      if (!end) end = Math.min(2, input.length);
+      result.push(input.slice(0, end));
+      input = input.slice(end).replace(/^\n+/, '');
+    }
+    if (input) result.push(input);
+    return result;
   };
-
+  let pending = [], fence = null, code = [];
+  const flush = () => { chunks.push(...plain(pending.join('\n'), limit)); pending = []; };
+  const flushCode = () => {
+    const open = fence.open, close = fence.marker;
+    const width = limit - open.length - close.length - 2;
+    if (width < 2) chunks.push(...plain([open, ...code, close].join('\n'), limit));
+    else for (const part of plain(code.join('\n'), width)) chunks.push(open + '\n' + part + '\n' + close);
+    fence = null; code = [];
+  };
   for (const line of value.split('\n')) {
-    const isFence = FENCE.test(line);
-    // 段落边界优先：只在围栏外、且当前块已过半时才提前换块，避免把短回复切碎。
-    if (!fence && !line.trim() && size() >= limit / 2) { close(); continue; }
-    if (current.length && size() + line.length + 1 > limit) close();
-    if (isFence) fence = fence ? '' : line.trim();
-    current.push(line);
+    const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (match && match[1][0] === fence.marker[0] && match[1].length >= fence.marker.length && !match[2].trim()) flushCode();
+      else code.push(line);
+    } else if (match) {
+      flush(); fence = { open: line.trim(), marker: match[1] };
+    } else {
+      if (!line.trim() && pending.join('\n').length >= limit / 2) flush();
+      else pending.push(line);
+    }
   }
-  close();
+  if (fence) flushCode();
+  flush();
   return chunks.filter(chunk => chunk.trim());
 }
 
@@ -122,7 +141,7 @@ function toMessages(segments, { maxChars = 1500, maxTotal = 6000 } = {}) {
     pending.push(text);
   }
   flush();
-  if (truncated) messages.push({ type: 'text', text: TRUNCATED_NOTICE });
+  if (truncated) for (const text of splitText(TRUNCATED_NOTICE, maxChars)) messages.push({ type: 'text', text });
   return { messages, truncated };
 }
 

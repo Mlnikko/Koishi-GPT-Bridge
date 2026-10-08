@@ -121,3 +121,41 @@ test('a public image download is validated and stored under a generated name', a
   assert.deepEqual(pngSize(fs.readFileSync(result.file)), { width: 12, height: 34 });
   assert.equal(decodeDataUrl('data:image/png;base64,AAAA').toString('base64'), 'AAAA');
 });
+
+
+test('IPv6 hex-mapped private addresses and transition ranges are blocked',()=>{
+ for(const address of ['::ffff:7f00:1','::ffff:a00:1','::ffff:c0a8:101','fe90::1','ff02::1','2002:7f00:1::'])
+  assert.equal(isPrivateAddress(address),true,address);
+});
+
+test('DNS validation is bounded even when the resolver never completes',async()=>{
+ await assert.rejects(downloadImage('https://example.com/x.png',temp(),{
+  timeoutMs:10,lookup:()=>new Promise(()=>{}),fetchImpl:()=>assert.fail('must not fetch'),
+ }),/域名无法解析/);
+});
+
+test('native image transport pins validated DNS addresses to the socket lookup',async t=>{
+ const http=require('node:http'),{Readable}=require('node:stream'),{EventEmitter}=require('node:events');
+ let lookups=0,connections=0;
+ t.mock.method(http,'get',(url,options,callback)=>{
+  connections++;
+  options.lookup(url.hostname,{all:true},(err,addresses)=>{
+   assert.equal(err,null);assert.deepEqual(addresses,[{address:'8.8.8.8',family:4}]);
+  });
+  const response=Readable.from([png()]);response.statusCode=200;response.headers={};
+  queueMicrotask(()=>callback(response));return new EventEmitter();
+ });
+ const result=await downloadImage('http://example.com/a.png',temp(),{
+  lookup:async()=>{lookups++;return [{address:lookups===1?'8.8.8.8':'127.0.0.1'}];},
+ });
+ assert.equal(lookups,1);assert.equal(connections,1);assert.equal(result.mime,'image/png');
+});
+
+test('native HTTP transport reads and validates a real streamed image',async t=>{
+ const http=require('node:http');
+ const server=http.createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'image/png'});res.end(png());});
+ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ t.after(()=>server.close());
+ const result=await downloadImage(`http://127.0.0.1:${server.address().port}/image`,temp(),{allowPrivate:true});
+ assert.deepEqual(fs.readFileSync(result.file),png());
+});

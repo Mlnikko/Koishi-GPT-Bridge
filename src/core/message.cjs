@@ -2,7 +2,7 @@
 
 // QQ 消息元素 → 有序片段。
 //
-// 只认识文本与图片两类元素，其余（at、quote、face、file、card、markdown…）一律跳过。
+// toSegments 只认识文本与图片，其余元素跳过；sessionSegments 单独处理直接引用。
 // 跳过是刻意的：
 //   - `at` 元素带的是 QQ openid，转发到外部网页既无意义也是隐私泄漏；
 //   - 表情、文件、卡片在 ChatGPT 网页里没有对应表达，硬转成文字只会失真。
@@ -19,38 +19,28 @@ const asText = (element, attrs) => {
   return '';
 };
 
-// QQ 适配器在群聊里会把「@机器人」补成首个 `at` 元素，Koishi 的 `stripped` 也会剥掉它。
-// 这里做同样的事，否则 @ 会变成正文的一部分。
-function trimLeadingMentions(elements) {
-  const list = (elements || []).slice();
-  while (list[0]?.type === 'at') list.shift();
-  return list;
-}
-
 // 裁掉每段文字首尾多余的空白：先去掉行内的空格与制表符，再去掉整行空行。
 // 刻意不跨越换行裁剪 —— 否则用户粘贴的代码第一行缩进会被吃掉。
 const trimLead = value => value.replace(/^[ \t]+/, '').replace(/^\n+/, '');
 const trimTail = value => value.replace(/[ \t]+$/, '').replace(/\n+$/, '');
 
 function toSegments(elements) {
-  const raw = [];
-  for (const element of trimLeadingMentions(elements)) {
+  const merged = [];
+  for (const element of elements || []) {
     if (element?.type === 'text') {
       const text = asText(element, TEXT_ATTRS);
-      if (text) raw.push({ type: 'text', text });
+      if (text) {
+        // 适配器拆开的相邻文本直接合并；被跳过的元素不打断文本。
+        const last = merged[merged.length - 1];
+        if (last?.type === 'text') last.text += text;
+        else merged.push({ type: 'text', text });
+      }
       continue;
     }
     if (IMAGE_TYPES.has(element?.type)) {
       const source = asText(element, IMAGE_ATTRS);
-      if (source) raw.push({ type: 'image', source });
+      if (source) merged.push({ type: 'image', source });
     }
-  }
-  // 相邻文本元素合并，适配器把一条消息拆成多个 text 元素时不会多出分隔。
-  const merged = [];
-  for (const segment of raw) {
-    const last = merged[merged.length - 1];
-    if (segment.type === 'text' && last?.type === 'text') last.text += segment.text;
-    else merged.push({ ...segment });
   }
   // 段内空格与换行原样保留 —— 用户贴的代码不能被动过。
   for (const segment of merged) if (segment.type === 'text') segment.text = trimTail(trimLead(segment.text));
@@ -59,6 +49,27 @@ function toSegments(elements) {
 
 const isImage = segment => segment?.type === 'image';
 const isText = segment => segment?.type === 'text';
+
+// Read only the directly quoted message supplied by the adapter. Do not fetch
+// arbitrary message IDs or recursively follow quotes into another conversation.
+function sessionSegments(session) {
+  const current = toSegments(session.elements);
+  const inline = (session.elements || []).find(element => element?.type === 'quote');
+  const quote = session.quote || session.event?.message?.quote || inline;
+  if (!quote) return current;
+  let quoted = toSegments(quote.elements || quote.children);
+  if (!quoted.length && !quote.elements && !quote.children && typeof quote.content === 'string') {
+    quoted = toSegments([{ type: 'text', attrs: { content: quote.content } }]);
+  }
+  if (!quoted.length) throw Error('无法读取被引用消息的文字或图片，请复制原文或重新发送原图后再试。');
+  const imageCount = quoted.filter(isImage).length;
+  return [
+    { type: 'text', text: `【引用消息】${imageCount ? `（前 ${imageCount} 张附件图片属于引用消息）` : ''}` },
+    ...quoted,
+    { type: 'text', text: '【引用消息结束】' },
+    ...(current.length ? [{ type: 'text', text: '【本次消息】' }, ...current] : []),
+  ];
+}
 
 function textOf(segments) {
   return (segments || []).filter(isText).map(segment => segment.text).join('');
@@ -84,4 +95,4 @@ function isEmpty(segments) {
   return !(segments || []).some(segment => isImage(segment) || (isText(segment) && segment.text.trim()));
 }
 
-module.exports = { toSegments, submissionText, imagesOf, textOf, textLength, isEmpty };
+module.exports = { toSegments, sessionSegments, submissionText, imagesOf, textOf, textLength, isEmpty };

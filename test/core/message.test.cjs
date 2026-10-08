@@ -77,3 +77,26 @@ test('an empty or unusable message produces no segments', () => {
   assert.equal(isEmpty(toSegments([text('  ')])), true);
   assert.equal(textOf([]), '');
 });
+
+const { sessionSegments } = require('../../src/core/message.cjs');
+test('quoted text is separated from the request without leaking sender identifiers or nested quotes', () => {
+  const segments = sessionSegments({ elements: [text('解释这段')], quote: {
+    id: 'secret-id', user: { id: 'secret-user' }, elements: [text('原文'), at('secret-user')],
+    quote: { elements: [text('不应该读取的更早消息')] },
+  } });
+  assert.equal(submissionText(segments), '【引用消息】\n原文\n【引用消息结束】\n【本次消息】\n解释这段');
+  assert.ok(!JSON.stringify(segments).includes('secret'));
+});
+test('quoted and current images keep attachment order with a visible boundary', () => {
+  const segments = sessionSegments({ elements: [text('比较'), img('data:current')],
+    event: { message: { quote: { elements: [img('data:quoted')] } } } });
+  assert.deepEqual(imagesOf(segments).map(s => s.source), ['data:quoted', 'data:current']);
+  assert.match(submissionText(segments), /前 1 张附件图片属于引用消息/);
+});
+test('inline quotes and plain quoted content are supported without recursive interpretation', () => {
+  assert.match(submissionText(sessionSegments({ elements: [{ type: 'quote', children: [text('/logs off')] }, text('这是啥')] })), /\/logs off/);
+  assert.match(submissionText(sessionSegments({ elements: [], quote: { content: '原文' } })), /原文/);
+  assert.throws(() => sessionSegments({ elements: [text('解释')], quote: { id: 'only-id' } }), /无法读取被引用消息/);
+  assert.throws(() => sessionSegments({ elements: [], quote: { elements: [{ type: 'file' }] } }), /无法读取被引用消息/);
+  assert.deepEqual(sessionSegments({ elements: [text('普通消息')] }), toSegments([text('普通消息')]));
+});

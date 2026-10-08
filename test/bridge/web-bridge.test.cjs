@@ -4,6 +4,46 @@ const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
+test('a late upload from an ended task cannot write assets or fail the next task', async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const first=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ let release;
+ const body=new Promise(resolve=>{release=resolve;});
+ let status;
+ const request={method:'POST',url:`/result-asset?id=${job.id}&i=0`,headers:{'x-bridge-token':b.token},
+  async *[Symbol.asyncIterator](){yield await body;}};
+ const upload=b.handle(request,{writeHead:code=>{status=code;},end:()=>{}});
+ await call('/failure',{id:job.id,message:'页面加载失败'});await first;
+ const next={...job,id:'123456abcdef'};
+ const second=b.run(next).catch(e=>e);await new Promise(setImmediate);
+ release(png());await upload;
+ assert.equal(status,409);assert.equal(b.pending.job.id,next.id);
+ assert.equal(fs.existsSync(path.join(job.dir,'result-0.png')),false);
+ await call('/failure',{id:next.id,message:'页面加载失败'});await second;
+});
+test('an asset retry after a lost acknowledgement is idempotent', async t=>{
+ const {b,job,call,asset}=await setup(t); await call('/state');
+ const result=b.run(job); await new Promise(setImmediate);
+ for(let attempt=0;attempt<2;attempt++)assert.equal((await asset(`/result-asset?id=${job.id}&i=0`,png())).status,200);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[{type:'image',asset:0}]})).status,200);
+ assert.equal((await result)[0].asset,0);
+ assert.equal(JSON.parse(fs.readFileSync(path.join(job.dir,'result.json'))).id,job.id);
+});
+
+test('failure diagnostics cannot strand a promise when the job directory disappears', async t=>{
+ const {b,job,call}=await setup(t); await call('/state');
+ job.dir=path.join(job.dir,'missing');
+ const result=b.run(job).catch(e=>e); await new Promise(setImmediate);
+ await call('/failure',{id:job.id,message:'ChatGPT 页面加载超时'});
+ assert.equal((await result).code,'browser_interaction');
+ assert.equal(b.pending,null);
+});
+
+test('a same-character-length non-ASCII token is rejected without crashing', async t=>{
+ const {b,call}=await setup(t);
+ assert.equal((await call('/state',undefined,'é'.repeat(b.token.length))).status,401);
+ assert.equal((await call('/state')).status,200);
+});
 function png(width=8,height=8,size=256){const bytes=Buffer.alloc(size);Buffer.from('89504e470d0a1a0a','hex').copy(bytes,0);bytes.writeUInt32BE(13,8);Buffer.from('IHDR','latin1').copy(bytes,12);bytes.writeUInt32BE(width,16);bytes.writeUInt32BE(height,20);return bytes;}
 async function setup(t){
  const root=temp(),b=new WebBridge({root,port:0});await b.ready;t.after(()=>b.close());
@@ -64,6 +104,9 @@ test('only technical problems are classified as failures',()=>{
  assert.equal(webFailure('参考图片上传超时，未提交请求').code,'browser_interaction');
  assert.equal(webFailure('读取不到回复内容').code,'reply_unreadable');
  assert.equal(webFailure('ECONNRESET').code,'network');
+ // 会话消失必须是独立的码：调用方靠它解绑 webThreadId，让下一条消息能自愈。
+ assert.equal(webFailure('ChatGPT 网页会话已不存在或无法打开').code,'thread_gone');
+ assert.equal(webFailure('ChatGPT 会话不匹配，未执行操作').code,'thread_mismatch');
  // 拒绝文案不再被当成失败分类。
  assert.equal(webFailure('抱歉，我不能生成该图片。').code,'execution_failed');
 });

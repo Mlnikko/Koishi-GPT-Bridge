@@ -21,13 +21,13 @@ function safeReason(value) {
 // refused / tool_unavailable / content_rejected 这类判定，也没有「没有图片」这种推断。
 function failureInfo({ technical = '' } = {}) {
   let code, title;
-  if (/401|unauthorized|authentication|not logged in/i.test(technical)) {
+  if (/\b401\b|unauthorized|authentication|not logged in/i.test(technical)) {
     code = 'authentication'; title = 'ChatGPT 网页登录认证失败，请检查登录状态';
-  } else if (/rate.limit|quota|usage.limit|429/i.test(technical)) {
+  } else if (/rate.limit|quota|usage.limit|\b429\b/i.test(technical)) {
     code = 'rate_limit'; title = 'ChatGPT 网页额度或速率受限，请稍后重试';
   } else if (/ECONN|ENOTFOUND|ETIMEDOUT|fetch failed|network|connection.*(?:closed|reset)|stream disconnected/i.test(technical)) {
     code = 'network'; title = '网络连接失败，未自动重试';
-  } else if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加/.test(technical)) {
+  } else if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加|No tab with id|Frame .*error page|Cannot access contents/i.test(technical)) {
     code = 'browser_interaction'; title = 'ChatGPT 网页操作未完成';
   } else if (/没有返回|内容为空|读取不到|无法读取回复|回复结构/.test(technical)) {
     code = 'reply_unreadable'; title = '网页已结束回答，但没有读到可回传的内容';

@@ -7,6 +7,35 @@ const { JobQueue, JOB_VERSION } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, segments: [{ type: 'text', text: 'a cat' }] });
 
+test('restart recovers an acknowledged structured result without resubmitting', () => {
+  const dir = root(), q = new JobQueue(dir, async () => {});
+  const j = q.enqueue(input('receipt')).job;
+  j.status = 'running'; q.save(j);
+  const segments = [{ type: 'text', text: 'already generated' }];
+  fs.writeFileSync(path.join(j.dir, 'result.json'), JSON.stringify({ id: j.id, segments }));
+  const recovered = new JobQueue(dir, () => assert.fail('must not resubmit'));
+  assert.equal(recovered.jobs[0].status, 'ready');
+  assert.deepEqual(recovered.jobs[0].output, segments);
+});
+
+test('a failing notification does not prevent submission or block the next task', async () => {
+  let runs = 0;
+  const q = new JobQueue(root(), async () => { runs++; return [{ type: 'text', text: 'ok' }]; }, async () => { throw Error('notification failed'); });
+  q.enqueue(input('a')); q.enqueue(input('b'));
+  await q.pump(); await new Promise(setImmediate); await new Promise(setImmediate);
+  assert.equal(runs, 2); assert.equal(q.active, null); q.close();
+});
+
+test('a save failure releases the active slot and does not submit untracked work', async () => {
+  let runs = 0;
+  const q = new JobQueue(root(), async () => { runs++; });
+  const j = q.enqueue(input('a')).job;
+  q.save = () => { throw Error('disk full'); };
+  await q.pump(); q.close();
+  assert.equal(runs, 0); assert.equal(q.active, null);
+  assert.equal(j.status, 'failed'); assert.match(j.persistenceError, /disk full/);
+});
+
 test('duplicate incoming message does not enqueue another job; owner and chat are isolated', () => {
   const q = new JobQueue(root(), async () => {});
   const a = q.enqueue(input('m1')); const b = q.enqueue(input('m1'));
@@ -107,4 +136,37 @@ test('retention pruning is off by default and never touches fresh or pending job
   assert.equal(q.find(stale.id, 'alice', 'qq:alice'), undefined);
   assert.equal(fs.existsSync(fresh.dir), true);
   assert.equal(fs.existsSync(pending.dir), true, '排队中的任务即使很旧也不能删');
+});
+
+test('enqueue atomically rejects a second pending message in the same session', () => {
+  const q = new JobQueue(root(), async () => {});
+  const first = q.enqueue({ ...input('m1'), sessionId: 'same' }).job;
+  assert.throws(() => q.enqueue({ ...input('m2'), sessionId: 'same' }), /仍在处理上一条/);
+  assert.equal(q.enqueue({ ...input('m1'), sessionId: 'same' }).duplicate, true);
+  q.cancel(first);
+  assert.ok(first.finishedAt);
+  assert.ok(q.enqueue({ ...input('m2'), sessionId: 'same' }).job);
+});
+
+test('restart preserves terminal retention timestamps and chronological history', () => {
+  const dir = root();
+  const q = new JobQueue(dir, async () => {});
+  for (let index = 0; index < 4; index++) {
+    const job = q.enqueue(input(`old-${index}`)).job;
+    job.status = 'failed';
+    job.createdAt = Date.now() - (20 - index) * 86400000;
+    job.updatedAt = job.createdAt;
+    fs.writeFileSync(path.join(job.dir, 'job.json'), JSON.stringify(job));
+  }
+  const restored = new JobQueue(dir, async () => {});
+  assert.deepEqual(restored.jobs.map(j => j.messageId), ['old-0', 'old-1', 'old-2', 'old-3']);
+  assert.equal(restored.prune(7), 4);
+});
+
+test('messages without platform IDs are not mistaken for duplicates', async () => {
+  const q = new JobQueue(root(), async () => []);
+  q.enqueue(input(undefined));
+  q.enqueue(input(undefined));
+  assert.equal(q.jobs.length, 2);
+  q.close();
 });

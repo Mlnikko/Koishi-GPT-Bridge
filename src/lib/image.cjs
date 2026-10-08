@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const dns = require('node:dns');
+const http = require('node:http');
+const https = require('node:https');
 const { randomBytes } = require('node:crypto');
 
 const MAX_INPUT_BYTES = 10 * 1024 * 1024;
@@ -45,19 +47,26 @@ function isPrivateAddress(address) {
   const value = String(address || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
   if (!value) return true;
   if (net.isIPv4(value)) {
-    const [a, b] = value.split('.').map(Number);
+    const [a, b, c] = value.split('.').map(Number);
     if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
     if (a === 169 && b === 254) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
     if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
     return false;
   }
   if (net.isIPv6(value)) {
-    if (value === '::' || value === '::1') return true;
-    if (value.startsWith('fe80') || value.startsWith('fc') || value.startsWith('fd')) return true;
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
-    return mapped ? isPrivateAddress(mapped[1]) : false;
+    const normalized = new URL(`http://[${value}]/`).hostname.slice(1, -1);
+    const mapped = /^::ffff:([a-f0-9]+):([a-f0-9]+)$/.exec(normalized);
+    if (mapped) {
+      const n = parseInt(mapped[1], 16), m = parseInt(mapped[2], 16);
+      return isPrivateAddress(`${n >> 8}.${n & 255}.${m >> 8}.${m & 255}`);
+    }
+    // Only global unicast; exclude documentation and transition mechanisms.
+    return !/^[23]/.test(normalized) || /^2001:(?:db8|0):|^2001::|^2002:/.test(normalized);
   }
   return true;
 }
@@ -75,7 +84,11 @@ function decodeDataUrl(value) {
 // 它属于领域逻辑，而这里只管「怎么安全地把一张图拿下来」。
 async function readCapped(response, maxBytes) {
   const declared = Number(response.headers.get('content-length') || 0);
-  if (declared > maxBytes) throw imageError('image_too_large', `图片超过 ${limitText(maxBytes)} 上限，未下载`);
+  if (declared > maxBytes) {
+    response.body?.destroy?.();
+    await response.body?.cancel?.();
+    throw imageError('image_too_large', `图片超过 ${limitText(maxBytes)} 上限，未下载`);
+  }
   if (!response.body) {
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length > maxBytes) throw imageError('image_too_large', `图片超过 ${limitText(maxBytes)} 上限，未下载`);
@@ -90,17 +103,44 @@ async function readCapped(response, maxBytes) {
   return Buffer.concat(chunks);
 }
 
-async function assertPublicHost(url, { lookup, allowPrivate }) {
+async function assertPublicHost(url, { lookup, allowPrivate, timeoutMs }) {
   if (allowPrivate) return;
   const host = url.hostname.replace(/^\[|\]$/g, '');
   let addresses;
   if (net.isIP(host)) addresses = [{ address: host }];
   else {
-    try { addresses = await lookup(host, { all: true }); }
+    let timer;
+    try { addresses = await Promise.race([
+      lookup(host, { all: true }),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('DNS timeout')), timeoutMs); }),
+    ]); }
     catch { throw imageError('image_download', '图片域名无法解析，未下载'); }
+    finally { clearTimeout(timer); }
   }
   if (!addresses?.length) throw imageError('image_download', '图片域名无法解析，未下载');
   if (addresses.some(entry => isPrivateAddress(entry.address))) throw imageError('image_blocked', '图片地址指向本机或内网，已拒绝下载');
+  return addresses;
+}
+
+// Pin the checked DNS answers to the actual socket: a second DNS lookup by
+// fetch would allow DNS rebinding between validation and connection.
+function pinnedFetch(url, { signal, addresses }) {
+  return new Promise((resolve, reject) => {
+    const request = (url.protocol === 'https:' ? https : http).get(url, {
+      signal,
+      lookup: addresses ? (_host, options, callback) => {
+        const candidates = addresses.map(entry => ({ address: entry.address, family: net.isIP(entry.address) }))
+          .filter(entry => !options.family || options.family === entry.family);
+        if (!candidates.length) return callback(Error('No permitted address'));
+        if (options.all) callback(null, candidates);
+        else callback(null, candidates[0].address, candidates[0].family);
+      } : undefined,
+    }, response => resolve({
+      status: response.statusCode, ok: response.statusCode >= 200 && response.statusCode < 300,
+      headers: { get: name => response.headers[name.toLowerCase()] }, body: response,
+    }));
+    request.on('error', reject);
+  });
 }
 
 // Download one QQ image into `dir` and return its validated local metadata.
@@ -108,10 +148,13 @@ async function assertPublicHost(url, { lookup, allowPrivate }) {
 // else (file://, ftp://, ...) is refused so no local path can be read.
 async function downloadImage(source, dir, options = {}) {
   const { maxBytes = MAX_INPUT_BYTES, timeoutMs = 30000, redirects = 3,
-    lookup = dns.promises.lookup, fetchImpl = globalThis.fetch, allowPrivate = false } = options;
+    lookup = dns.promises.lookup, fetchImpl, allowPrivate = false } = options;
   const value = String(source || '').trim();
   if (!value) throw imageError('image_invalid', '消息中没有可用的图片地址');
   let bytes;
+  // Reject oversized inline payloads before allocating their decoded buffer.
+  if (/^(?:data:[^,]*;base64,|base64:\/\/)/i.test(value) && value.length > maxBytes * 4 / 3 + 1024)
+    throw imageError('image_too_large', `图片超过 ${limitText(maxBytes)} 上限，未下载`);
   if (/^data:/i.test(value)) bytes = decodeDataUrl(value);
   else if (/^base64:\/\//i.test(value)) bytes = Buffer.from(value.slice('base64://'.length), 'base64');
   else {
@@ -119,11 +162,14 @@ async function downloadImage(source, dir, options = {}) {
     try { url = new URL(value); } catch { throw imageError('image_invalid', '图片地址无效，未下载'); }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw imageError('image_invalid', '出于安全考虑，仅支持下载 http(s) 图片');
     for (let hop = 0; ; hop++) {
-      await assertPublicHost(url, { lookup, allowPrivate });
+      const addresses = await assertPublicHost(url, { lookup, allowPrivate, timeoutMs });
       let response;
-      try { response = await fetchImpl(url.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) }); }
+      try { response = fetchImpl
+        ? await fetchImpl(url.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
+        : await pinnedFetch(url, { addresses, signal: AbortSignal.timeout(timeoutMs) }); }
       catch { throw imageError('image_download', '图片下载失败，请稍后重试'); }
       if ([301, 302, 303, 307, 308].includes(response.status)) {
+        response.body?.destroy?.();
         if (hop >= redirects) throw imageError('image_download', '图片重定向次数过多，未下载');
         const location = response.headers.get('location');
         if (!location) throw imageError('image_download', '图片重定向地址缺失，未下载');
@@ -131,7 +177,7 @@ async function downloadImage(source, dir, options = {}) {
         if (url.protocol !== 'http:' && url.protocol !== 'https:') throw imageError('image_invalid', '图片重定向到不支持的协议，未下载');
         continue;
       }
-      if (!response.ok) throw imageError('image_download', `图片下载失败（HTTP ${response.status}）`);
+      if (!response.ok) { response.body?.destroy?.(); throw imageError('image_download', `图片下载失败（HTTP ${response.status}）`); }
       bytes = await readCapped(response, maxBytes);
       break;
     }

@@ -3,6 +3,17 @@ let ticking=false;
 // Reference-image bytes are cached per task while the service worker lives, so a
 // slow upload is never restarted and the data never touches persistent storage.
 const inputs=new Map();
+// Only bridge I/O is retryable. Never automatically repeat a DOM send click.
+async function bridgeFetch(url,options){
+ try{
+  const response=await fetch(url,options);
+  if(!response.ok)throw Object.assign(Error('本机连接器返回 '+response.status),{retryable:response.status>=500||response.status===429});
+  return response;
+ }catch(err){
+  if(err.retryable===undefined)err.retryable=true;
+  throw err;
+ }
+}
 function toBase64(bytes){
  let binary='';
  for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode.apply(null,bytes.subarray(i,i+0x8000));
@@ -12,7 +23,7 @@ async function loadInputs(task){
  if(inputs.has(task.id))return inputs.get(task.id);
  const list=[];
  for(const image of task.images||[]){
-  const response=await fetch(BRIDGE.url+'/input?id='+encodeURIComponent(task.id)+'&i='+image.index,
+  const response=await bridgeFetch(BRIDGE.url+'/input?id='+encodeURIComponent(task.id)+'&i='+image.index,
    {headers:{'x-bridge-token':BRIDGE.token},signal:AbortSignal.timeout(30000)});
   if(!response.ok)throw Error('无法读取本机参考图片（'+response.status+'）');
   list.push({name:image.name||('image-'+image.index+'.png'),mime:image.mime||'image/png',base64:toBase64(new Uint8Array(await response.arrayBuffer()))});
@@ -20,9 +31,9 @@ async function loadInputs(task){
  inputs.set(task.id,list);return list;
 }
 async function api(route,body){
- const response=await fetch(BRIDGE.url+route,{method:body?'POST':'GET',headers:{'x-bridge-token':BRIDGE.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});
+ const response=await bridgeFetch(BRIDGE.url+route,{method:body?'POST':'GET',headers:{'x-bridge-token':BRIDGE.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});
  if(!response.ok)throw new Error('本机连接器返回 '+response.status);
- return response.json();
+ try{return await response.json();}catch(err){err.retryable=true;throw err;}
 }
 // Reply images travel as raw bytes: base64 inside the JSON result would inflate
 // every picture by a third and blow the bridge body limit on a multi-image answer.
@@ -30,7 +41,7 @@ async function uploadAsset(id,index,base64){
  const binary=atob(base64);
  const bytes=new Uint8Array(binary.length);
  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
- const response=await fetch(BRIDGE.url+'/result-asset?id='+encodeURIComponent(id)+'&i='+index,
+ const response=await bridgeFetch(BRIDGE.url+'/result-asset?id='+encodeURIComponent(id)+'&i='+index,
   {method:'POST',headers:{'x-bridge-token':BRIDGE.token,'Content-Type':'image/png'},body:bytes,signal:AbortSignal.timeout(60000)});
  if(!response.ok)throw new Error('回复图片上传失败（'+response.status+'）');
 }
@@ -38,17 +49,29 @@ async function pageStep(operation,job){
  try {
  const buttons=()=>Array.from(document.querySelectorAll('button'));
  const byLabel=labels=>buttons().find(b=>labels.includes(b.getAttribute('aria-label')||'') || labels.includes(b.innerText.trim()));
- const roles=role=>Array.from(document.querySelectorAll(role==='user'?'[data-user-message-bubble]':`[data-conversation-role="${role}"]`));
+ const roles=role=>{
+  const primary=Array.from(document.querySelectorAll(role==='user'?'[data-user-message-bubble]':`[data-conversation-role="${role}"]`));
+  return primary.length?primary:Array.from(document.querySelectorAll(`[data-message-author-role="${role}"]`));
+ };
  const turn=node=>{
   if(!node)return null;
   if(typeof node.closest==='function'){const found=node.closest('[data-testid^="conversation-turn"]');if(found)return found;}
   return node.parentElement||node;
  };
  const user=roles('user'),assistant=roles('assistant'),lastUser=turn(user.at(-1)),lastAssistant=turn(assistant.at(-1));
- const editor=document.querySelector('[role="textbox"][contenteditable="true"]');
+ // A page can also contain message-editing or hidden textboxes. Prefer the
+ // actual prompt composer; never pick an arbitrary first textbox.
+ const visible=node=>!node.closest?.('[hidden], [aria-hidden="true"]') &&
+  (typeof node.getClientRects!=='function'||node.getClientRects().length>0);
+ const editors=Array.from(document.querySelectorAll('[contenteditable="true"]')).filter(visible);
+ const prompts=editors.filter(node=>node.getAttribute('id')==='prompt-textarea');
+ const candidates=prompts.length?prompts:editors.filter(node=>node.getAttribute('role')==='textbox');
+ const editor=candidates.length===1?candidates[0]:null;
  const stop=byLabel(['停止','Stop','停止生成','Stop generating']);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
+ if(['attach','prepare','submit','send'].includes(operation) && job.threadId && job.threadId!==threadId)
+  throw Error('网页会话与任务不一致');
 // ChatGPT has shipped several wrappers for a generated image, so identify one by
 // what it is — a large bitmap — instead of a single data-testid that can be
 // renamed without notice.
@@ -135,14 +158,21 @@ const tableText=table=>Array.from(table.querySelectorAll?.('tr')||[])
 const serializeReply=()=>{
  const segments=[],images=[];
  const pushImage=img=>{
-  if(!looksGenerated(img)||images.includes(img))return;
+  if(!looksGenerated(img)||inUserTurn(img)||insideUser(img)||images.includes(img))return;
   segments.push({type:'image',asset:images.length,mime:'image/png'});
   images.push(img);
  };
  const walk=node=>{
   for(const child of node.children||[]){
    const tag=child.tagName;
-   if(tag==='BUTTON'||tag==='SVG'||tag==='STYLE'||tag==='SCRIPT')continue;
+   // Generated-image previews are interactive BUTTONs. Ignore their control text,
+   // but keep any valid image nested inside; otherwise the real ChatGPT gallery
+   // shape produces picked=true in the probe while serializeReply() returns zero.
+   if(tag==='BUTTON'){
+    for(const img of Array.from(child.querySelectorAll?.('img')||[]))pushImage(img);
+    continue;
+   }
+   if(tag==='SVG'||tag==='STYLE'||tag==='SCRIPT')continue;
    // 「ChatGPT 说：」这类无障碍标题是页面框架，不是回复内容。轮次容器把标题和
    // 正文放在一起，少了这道过滤，一个还没出图的空轮次也会被读成一条回复。
    if(child.getAttribute?.('data-conversation-role')||child.getAttribute?.('data-message-author-role'))continue;
@@ -204,6 +234,23 @@ const userText=String(lastUser?.innerText||'');
 // was typed (markdown, collapsing), so a text mismatch alone must never be read
 // as "our message never landed".
 const submitted=user.length>(job.userBaseline||0);
+// 每条 assistant 消息在 DOM 里带一个稳定的 message id。它是判断「最新轮次是不是
+// 提交前那一条」最直接的证据 —— 轮次计数会被页面异步渲染历史带偏，这个不会。
+// 属性缺失时是空串，防线自动失效，不会把任务卡死。
+const assistantId=String(lastAssistant?.getAttribute?.('data-message-id')||lastAssistant?.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id')||lastAssistant?.querySelector?.('[data-chatgpt-search-message-ids]')?.getAttribute?.('data-chatgpt-search-message-ids')||'');
+// 排查用：把一张图的祖先链记下来。只看 tag 名和 testid，
+// 一旦某张图被判掉，就能直接看出是哪一层祖先触发的规则。
+const ancestorChain=img=>{
+ const out=[];
+ let node=img?.parentElement,depth=0;
+ while(node&&depth<14){
+  const testid=node.getAttribute?.('data-testid');
+  const role=node.getAttribute?.('data-conversation-role')||node.getAttribute?.('data-message-author-role');
+  out.push(String(node.tagName||'').toLowerCase()+(testid?'['+String(testid).slice(0,40)+']':'')+(role?'@'+role:''));
+  node=node.parentElement;depth++;
+ }
+ return out.join(' < ');
+};
 const probeDom=()=>({
  turns:document.querySelectorAll('[data-testid^="conversation-turn"]').length,
  userNodes:user.length,assistantAnchor:!!lastAssistant,main:!!conversationArea,
@@ -216,14 +263,18 @@ const probeDom=()=>({
   w:Number(img.naturalWidth)||0,h:Number(img.naturalHeight)||0,complete:img.complete!==false,
   inUser:insideUser(img),inUserTurn:inUserTurn(img),inReplyTurn:inReplyTurn(img),
   chrome:isChrome(img),chromeReason:chromeReason(img),gallery:!!img.closest?.('[data-testid*="generated-image" i]'),
-  picked:replyImages().includes(img)})),
+  picked:replyImages().includes(img),ancestors:ancestorChain(img)})),
  assistantHtml:String(lastAssistant?.outerHTML||'').slice(0,2500)});
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.
  const composer=editor && typeof editor.closest==='function'
   ?(editor.closest('form')||editor.closest('[data-testid*="composer" i]')||editor.parentElement||null):null;
  const attachmentNodes=composer && typeof composer.querySelectorAll==='function'
-  ?Array.from(composer.querySelectorAll('img[src^="blob:"], [data-testid*="attachment" i], [data-testid*="composer-file" i]')):[];
+  ?Array.from(composer.querySelectorAll('img[src^="blob:"], img[src^="data:image/"], img[src^="https://"], [data-testid*="attachment" i], [data-testid*="composer-file" i]')):[];
+ // A card and its thumbnail describe one attachment, not two uploaded files.
+ const attachments=attachmentNodes.filter(node=>!attachmentNodes.some(parent=>parent!==node&&parent.contains(node)));
+ const uploading=!!composer?.querySelector?.('[role="progressbar"], [aria-busy="true"]')
+  || attachmentNodes.some(node=>node.tagName==='IMG'&&node.complete===false);
  const chatGroup=document.querySelector('[aria-label="撰写器模式"], [aria-label="Composer mode"]');
  const chatButton=chatGroup && Array.from(chatGroup.querySelectorAll('button')).find(b=>['聊天','Chat'].includes(b.innerText.trim()));
  // 完成判定必须看**读出来的内容**，而不是整个轮次的文本：空轮次里也有
@@ -238,12 +289,19 @@ const probeDom=()=>({
  const checksum=value=>{let hash=0;for(let i=0;i<value.length;i++)hash=(hash*31+value.charCodeAt(i))|0;return hash;};
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,submitted,
   textMatched:sameText(job.sentText,userText),userText:userText.slice(0,120),
-  editor:!!editor,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:new Set(attachmentNodes).size,
-  replyLength,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length,
+  editor:!!editor,editorAmbiguous:candidates.length>1,stopping:!!stop,images:images.length,imageLoading,gallery,attachments:attachments.length,uploading,
+  replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(source).join('|')),
   busyText:String(lastAssistant?.innerText||'').slice(0,600),
   needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
+ if(operation==='probe')return {...probeDom(),phase:job.phase,users:user.length,userBaseline:job.userBaseline,
+  attachments:attachments.length,expectedAttachments:job.images?.length||0,uploading,
+  editorPresent:!!editor,editorChars:String(editor?.innerText||'').length,
+  editorCandidates:candidates.map(node=>({id:node.getAttribute('id'),role:node.getAttribute('role'),chars:String(node.innerText||'').length})),
+  draftMatched:!!editor && [job.draft,...(job.drafts||[])].some(text=>text && normalize(text)===normalize(editor.innerText)),
+  fileInputs:Array.from(document.querySelectorAll('input[type="file"]')).map(input=>({accept:input.getAttribute('accept'),disabled:!!input.disabled})),
+  buttons:buttons().map(b=>({label:b.getAttribute('aria-label')||b.innerText.trim(),disabled:!!b.disabled})).filter(b=>/send|发送|upload|上传/i.test(b.label)).slice(0,10)};
  if(operation==='inspect'){
   // Ground truth for the next failure: when nothing readable shows up, keep the
   // page structure so the selectors can be corrected without guessing.
@@ -262,7 +320,16 @@ const probeDom=()=>({
    for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
    transfer.items.add(new File([bytes],item.name||'image.png',{type:item.mime||'image/png'}));
   }
-  const input=document.querySelector('input[type="file"]');
+  // The first file input may belong to another tool (e.g. document upload).
+  const candidates=Array.from(document.querySelectorAll('input[type="file"]')).filter(input=>!input.disabled);
+  const acceptsImages=input=>{
+   const accept=String(input.getAttribute('accept')||'').toLowerCase().split(',').map(value=>value.trim());
+   return list.every(item=>accept.includes('image/*')||accept.includes(item.mime)||accept.includes('.'+item.name.split('.').pop().toLowerCase()));
+  };
+  const compatible=candidates.filter(acceptsImages);
+  // A video/media picker can accept image/* but belong to another tool.
+  const input=compatible.find(input=>!/(?:video|audio)\//i.test(input.getAttribute('accept')||''))
+    ||compatible[0]||candidates.find(input=>!input.getAttribute('accept'));
   if(input){
    input.files=transfer.files;
    input.dispatchEvent(new Event('input',{bubbles:true}));
@@ -274,8 +341,9 @@ const probeDom=()=>({
   }
   return {attached:transfer.files.length};
  }
- if(operation==='submit'){
+ if(operation==='prepare'||operation==='submit'){
   if(submitted)return {alreadySent:true};
+  if(candidates.length>1)throw Error('检测到多个输入框，无法确定 ChatGPT 消息输入框');
   if(!editor || stop || snapshot.needsChat)throw Error('网页未就绪或不在普通 Chat 模式');
   if(job.threadId && job.threadId!==threadId)throw Error('网页会话与任务不一致');
   const current=editor.innerText.trim();
@@ -284,8 +352,9 @@ const probeDom=()=>({
   // the last text it filled in, so the connector's leftovers are recognisable
   // without writing a marker into the user's prompt; anything else is the user's
   // own input and is never overwritten.
-  const leftover=!!job.draft && normalize(current)===normalize(job.draft);
+  const leftover=[job.draft,...(job.drafts||[])].some(text=>text && normalize(current)===normalize(text));
   if(current && !placeholder.includes(current) && !leftover)throw Error('专用标签页输入框已有内容，请清空后重新发送任务');
+  if(operation==='prepare')return {prepared:true};
   editor.focus();
   if(leftover){document.execCommand('selectAll',false);document.execCommand('delete',false);}
   const message=String(job.message||'');
@@ -299,7 +368,7 @@ const probeDom=()=>({
   // React may render the button before it has committed the editor value. This is
   // a safe retry point because no click has happened yet.
   const send=byLabel(['发送','Send','发送提示','Send prompt']);
-  if(message && !normalize(editor?.innerText||'').includes(message.slice(0,60)))throw Error('输入内容已变化，未发送');
+  if(normalize(editor?.innerText||'')!==message)throw Error('输入内容已变化，未发送');
   if(!send || send.disabled)return {ready:false};
   send.click();return {clicked:true};
  }
@@ -336,36 +405,88 @@ async function store(current,status){if(!current)inputs.clear();await chrome.sto
 // The draft record is what replaces the old in-prompt marker: it lets the worker
 // recognise its own leftover text without putting anything into the user's prompt.
 async function saveDraft(text){await chrome.storage.local.set({draft:text||null});}
+async function returnReply(current){
+ const reply=current.reply;
+ for(let index=current.uploaded||0;index<reply.imageCount;index++){
+  const image=await page(current.tabId,'image',{...current,imageIndex:index});
+  await uploadAsset(current.id,index,image.base64);
+  current.uploaded=index+1;await store(current,'正在回传回复图片');
+ }
+ await api('/result',{id:current.id,threadId:reply.threadId,segments:reply.segments,probe:reply.probe});
+ await store(null,'回复已交给 Koishi 回传 QQ');
+ await chrome.tabs.remove(current.tabId).catch(()=>{});
+}
 async function tick(){
  if(ticking)return;ticking=true;
  let current;
  try{
   const remote=await api('/state');
-  const stored=await chrome.storage.local.get(['current','draft']);
+  const stored=await chrome.storage.local.get(['current','draft','drafts']);
   current=stored.current;
   if(!remote.job){
    // A completed/orphaned task is never resubmitted, even after service restarts.
+   if(current?.tabId)await page(current.tabId,'stop',current).catch(()=>{});
    await store(null,'已连接本机 Koishi，等待任务');return;
   }
   const task=remote.job;
+  if(task.cancelled && (!current || current.id!==task.id)){
+   await api('/failure',{id:task.id,message:'任务已取消，未提交网页'});return;
+  }
   if(!current || current.id!==task.id){
+   if(current?.tabId)await page(current.tabId,'stop',current).catch(()=>{});
    const tab=await chrome.tabs.create({url:task.threadId?'https://chatgpt.com/c/'+task.threadId:'https://chatgpt.com/',active:false});
    current={...task,tabId:tab.id,phase:'opening',openedAt:Date.now(),hasImages:!!(task.images&&task.images.length),
-    sentText:task.text||'',draft:stored.draft||null,padded:false};
+    sentText:task.text||'',draft:stored.draft||null,
+    drafts:(stored.drafts||[]).filter(entry=>entry.threadId===(task.threadId||'')).map(entry=>entry.text),padded:false};
    await store(current,'正在打开 ChatGPT 标签页');await api('/progress',{id:task.id,phase:'opening'});return;
   }
-  if(task.cancelled){await page(current.tabId,'stop',current).catch(()=>{});await api('/failure',{id:task.id,message:'任务已取消'});await store(null,'任务已取消');return;}
+  if(task.cancelled){
+   await page(current.tabId,'stop',current);
+   const stopped=await page(current.tabId,'inspect',current);
+   if(stopped.stopping){await store(current,'等待网页确认停止');return;}
+   await api('/failure',{id:task.id,message:'任务已取消'});await store(null,'任务已取消');return;
+  }
+  if(current.phase==='returning'){await returnReply(current);return;}
   const info=await page(current.tabId,'inspect',current);
-  if(info.loading) return;
+  if(info.loading){
+   if(Date.now()-(current.sentAt||current.openedAt)> (current.sentAt?240000:60000))throw Error('ChatGPT 页面加载超时，请检查专用标签页');
+   return;
+  }
   if(info.login)throw Error('ChatGPT 网页需要登录，请在专用标签页登录');
   if(info.challenge)throw Error('ChatGPT 网页需要人工验证，请完成页面验证后重新发送任务');
   if(current.threadId && info.threadId && current.threadId!==info.threadId)throw Error('ChatGPT 会话不匹配，未执行操作');
   if(current.phase==='opening'){
+   if(info.editorAmbiguous)throw Error('检测到多个输入框，无法确定 ChatGPT 消息输入框');
    if(!info.editor){if(Date.now()-current.openedAt>60000)throw Error('ChatGPT 页面加载超时，请检查网络和登录');return;}
    if(info.needsChat){await page(current.tabId,'chat',current);return;}
-   if(current.threadId && info.threadId!==current.threadId)return;
+   // 续聊时页面必须落到同一个 thread 上。地址被重定向走（会话被删除、链接失效）时
+   // info.threadId 会变空，继续等只会一路空耗到桥接超时，所以这里明确失败：桥接收到
+   // 这个原因会解绑失效编号，下一条消息自动开一个新会话。
+   if(current.threadId && info.threadId!==current.threadId){
+    if(Date.now()-current.openedAt>15000)throw Error('ChatGPT 网页会话已不存在或无法打开');
+    return;
+   }
    if(info.stopping)throw Error('该 ChatGPT 会话正在处理其他请求，请稍后再试');
+   // 复用已有会话时，历史轮次是页面异步渲染出来的：输入框先出现，历史要几秒后才补齐。
+   // 轮次基线必须等历史渲染稳定之后再采样 —— 页面刚打开时计数还是 0，历史一渲染出来
+   // 计数就从 0 变成 1，会被读成「本轮回复已经出现」，结果是十几秒就把上一轮的图当成
+   // 本轮结果回传（任务 0f24faeed208 / 988bca02fb9f 就是这样，回传的 PNG 与上一轮字节完全相同）。
+   // 全新会话页面上本来就没有历史，基线天然是 0，不必付这个等待。
+   if(current.threadId){
+    const seen=info.assistants+'/'+info.users;
+    if(current.historySeen!==seen){
+     current.historySeen=seen;current.historyStreak=1;
+     await store(current,'正在等待 ChatGPT 载入会话历史');return;
+    }
+    current.historyStreak=(current.historyStreak||1)+1;
+    // 计数连续两次不变才算稳；再叠一个时间下限。页面上一个 assistant 轮次都没有时
+    // （可能是真没回复过，也可能只是还没渲染出来）给更长的耐心，宁可多等几秒，
+    // 也不能把「历史还没出来」当成「这个会话本来就是空的」。
+    if(current.historyStreak<2)return;
+    if(Date.now()-current.openedAt<(info.assistants?8000:15000))return;
+   }
    current.baseline=info.assistants;
+   current.assistantId=info.assistantId;
    // Count the user's turns before submitting: the new turn is what proves the
    // message actually landed, and it does so without a marker in the prompt.
    current.userBaseline=info.users;
@@ -373,7 +494,7 @@ async function tick(){
    current.phase='filling';await store(current,'正在填写消息');
   }
   if(current.phase==='attaching'){
-   if(info.attachments>=1){current.phase='filling';await store(current,'参考图片已上传，正在填写消息');}
+   if(current.attachSent && info.attachments>=current.images.length && !info.uploading){current.phase='filling';await store(current,'参考图片已上传，正在填写消息');}
    else {
     // Upload exactly once. If it cannot be confirmed we fail closed rather than
     // submitting a text-only request that would silently drop the reference image.
@@ -383,9 +504,9 @@ async function tick(){
     }
     if(Date.now()-current.openedAt>90000)throw Error('参考图片上传超时，未提交请求');
     const images=await loadInputs(task);
-    await page(current.tabId,'attach',{...current,images});
     current.attachSent=true;current.attachAt=Date.now();
     await store(current,'参考图片已提交上传，等待 ChatGPT 处理');
+    await page(current.tabId,'attach',{...current,images});
     return;
    }
   }
@@ -394,9 +515,22 @@ async function tick(){
    // button refuses to unlock does one space get added — never a marker, and never
    // an instruction the user did not write.
    const message=current.padded?' ':(current.sentText||'');
+   // Check ownership before recording intent: recording arbitrary existing text
+   // would incorrectly authorise overwriting a user's draft on the next retry.
+   const prepared=await page(current.tabId,'prepare',{...current,message});
+   if(!prepared.prepared && !prepared.alreadySent)throw Error('无法检查 ChatGPT 输入框');
+   if(!prepared.alreadySent){
+    const threadId=current.threadId||'';
+    const drafts=(stored.drafts||[]).filter(entry=>entry.threadId!==threadId||entry.text!==message);
+    if(message.trim())drafts.push({threadId,text:message});
+    current.drafts=[...(current.drafts||[]),message].slice(-32);
+    // Persist before touching the DOM, including current for worker restarts.
+    // Keep a bounded history after successful sends: ChatGPT may restore an old
+    // draft later, after a different conversation has replaced the legacy slot.
+    await chrome.storage.local.set({current,draft:message||null,drafts:drafts.slice(-32)});
+   }
    const filled=await page(current.tabId,'submit',{...current,message});
    if(!filled.filled && !filled.alreadySent)throw Error('无法填写 ChatGPT 输入框');
-   await saveDraft(message);
    current.phase='filled';current.filledAt=Date.now();await store(current,'消息已填写，等待输入框完成更新');return;
   }
   if(current.phase==='filled'){
@@ -414,7 +548,9 @@ async function tick(){
     await store(current,'等待 ChatGPT 启用发送按钮');
     return;
    }
-   await saveDraft(null);
+   // 草稿留到「确认消息真的落到页面上」之后再清（见下面的 sending 分支）：点击发送
+   // 不等于提交成功。提前清掉，输入框里残留的文本就变成认不出的东西，下一个任务只会
+   // 报「输入框已有内容」——线上就是这么连环失败两次的。
    current.phase='waiting';await store(current,'ChatGPT 正在生成回复');return;
   }
   if(current.phase==='sending'){
@@ -423,40 +559,56 @@ async function tick(){
    current.phase='waiting';await store(current,'ChatGPT 正在生成回复');
   }
   if(!info.submitted){if(Date.now()-current.sentAt>20000)throw Error('消息未出现在专用标签页上，未取得本轮回复');return;}
+  await saveDraft(null);
   if(info.threadId)await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted'});
-  if(info.assistants<=current.baseline || info.stopping)return;
+  const waited=Date.now()-current.sentAt;
+  const newAssistant=current.assistantId && info.assistantId && current.assistantId!==info.assistantId;
+  if((info.assistants<=current.baseline && !newAssistant) || info.stopping){
+   if(waited>240000)throw Object.assign(Error('等待网页回复超时，生成未结束或尚未出现本轮回复'),{probe:info.probe});
+   return;
+  }
+  // 双重确认：最新 assistant 轮次必须不是提交前那一条。计数只说明「轮次变多了」，
+  // 说明不了「多出来的是我这一轮」；message id 直接回答这个问题。读不到属性时
+  // assistantId 是空串，这条自动跳过，退回纯计数判定。
+  if(current.assistantId && info.assistantId===current.assistantId){
+   if(waited>240000)throw Object.assign(Error('等待网页回复超时，尚未出现本轮回复'),{probe:info.probe});
+   return;
+  }
   // ChatGPT renders the empty assistant turn long before the answer exists, and a
   // text answer can stream for minutes. Silence is not a finished answer: only a
   // stable reply on a page that is no longer busy counts as done.
-  const waited=Date.now()-current.sentAt;
   if(waited<1500)return;
-  // Checked before the busy branch below, otherwise a page that never stops
-  // looking busy would wait out the bridge timeout instead of failing clearly.
-  if(waited>240000)throw Object.assign(
-   Error(info.gallery&&!info.images?'等待网页出图超时，未检测到本轮图片':'等待网页回复超时，未读取到内容'),
-   {probe:info.probe});
   const busy=info.stopping||/正在生成|生成中|正在创建|正在思考|正在调用|Generating|Thinking|Creating image/i.test(info.busyText);
   // 「没有任何可读内容」和「图还在画」都算没完成。ChatGPT 会先渲染一个空的
   // assistant 轮次（只有无障碍标题），图片要几十秒后才出现；在这里提前收工，
   // 后面的 chrome.tabs.remove 会把还在生成的图片一起关掉。
   const empty=!info.replyLength && !info.images;
   const pendingImage=info.imageLoading || (info.gallery && !info.images);
-  if(busy||empty||pendingImage){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成回复');return;}
+  // The hard cap rejects only a reply that still has no usable content. A complete
+  // image or text can become visible on the boundary tick; throwing before this
+  // check discarded that valid result (job d4a2a235d1c0). At the cap, stale busy
+  // wording is ignored and the normal signature-stability check decides instead.
+  if(waited>240000 && (empty||pendingImage))throw Object.assign(
+   Error(info.gallery&&!info.images?'等待网页出图超时，未检测到本轮图片':'等待网页回复超时，未读取到内容'),
+   {probe:info.probe});
+  if((busy&&waited<=240000)||empty||pendingImage){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成回复');return;}
   if(current.lastSignature!==info.replySignature){current.lastSignature=info.replySignature;current.stableAt=Date.now();await store(current,'正在等待网页回复结束');return;}
   if(Date.now()-current.stableAt<3000)return;
   await api('/progress',{id:task.id,threadId:info.threadId,phase:'reading'});
   const reply=await page(current.tabId,'read',current);
   if(!reply.segments||!reply.segments.length)throw Object.assign(Error('网页已结束回答，但没有读取到可回传的内容'),{probe:reply.probe});
-  for(let index=0;index<reply.imageCount;index++){
-   const image=await page(current.tabId,'image',{...current,imageIndex:index});
-   await uploadAsset(task.id,index,image.base64);
-  }
-  await api('/result',{id:task.id,threadId:reply.threadId||info.threadId,segments:reply.segments,probe:reply.probe});
-  await store(null,'回复已交给 Koishi 回传 QQ');
-  await chrome.tabs.remove(current.tabId).catch(()=>{});
+  current.phase='returning';current.reply={...reply,threadId:reply.threadId||info.threadId};
+  await store(current,'回复已读取，正在回传');
+  await returnReply(current);
  }catch(err){
   const message=String(err.message||err).slice(0,1800);
+  if(err.retryable){
+   await chrome.storage.local.set({status:'本机连接暂时中断，保留任务等待恢复：'+message});return;
+  }
   if(current?.id){
+   // Early upload/submission failures also need evidence; the 90-second reply
+   // probe cannot capture these. A diagnostic failure must preserve the error.
+   if(!err.probe)err.probe=await page(current.tabId,'probe',current).catch(()=>undefined);
    try{await api('/failure',{id:current.id,message,probe:err.probe});await store(null,'任务失败：'+message);}catch{await chrome.storage.local.set({status:'本机连接中断，未重发网页请求'});}
   }else await chrome.storage.local.set({status:'等待本机 Koishi 连接：'+message});
  }finally{ticking=false;}

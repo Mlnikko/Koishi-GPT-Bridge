@@ -2,6 +2,25 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { validateSegments, splitText, toMessages, replyText, TRUNCATED_NOTICE } = require('../../src/lib/reply.cjs');
 
+test('long single lines and emoji fit the message limit without lost characters', () => {
+  const value = '长'.repeat(99) + '😀'.repeat(80);
+  const chunks = splitText(value, 100);
+  assert.equal(chunks.join(''), value);
+  for (const chunk of chunks) {
+    assert.ok(chunk.length <= 100);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(chunk));
+  }
+});
+
+test('code chunks include fences in their size budget, including oversized lines', () => {
+  for (const marker of ['```', '~~~']) {
+    const chunks = splitText(marker + 'js\n' + 'x'.repeat(500) + '\n' + marker, 100);
+    assert.ok(chunks.every(chunk => chunk.length <= 100));
+    assert.ok(chunks.every(chunk => chunk.startsWith(marker + 'js\n') && chunk.endsWith('\n' + marker)));
+    assert.equal(chunks.map(chunk => chunk.slice(marker.length + 3, -marker.length - 1)).join(''), 'x'.repeat(500));
+  }
+});
+
 test('only text, code and image segments are accepted', () => {
   const segments = validateSegments([
     { type: 'text', text: '看这个：' },

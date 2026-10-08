@@ -44,7 +44,7 @@ function worker({state=null,results={},storageSeed={}}={}){
     set:async values=>Object.assign(storage,plain(values)),
    }},
    tabs:{create:async()=>({id:1}),get:async()=>({url:'https://chatgpt.com/c/'+THREAD}),remove:async()=>{calls.push({route:'tabs.remove'});}},
-   scripting:{executeScript:async({args:[op,job]})=>{calls.push({op,job:plain(job)});return [{result:typeof results==='function'?results(op,job):results[op]}];}},
+   scripting:{executeScript:async({args:[op,job]})=>{calls.push({op,job:plain(job)});return [{result:op==='prepare'?(results.prepare||{prepared:true}):typeof results==='function'?results(op,job):results[op]}];}},
   },
   fetch:async(url,options)=>{
    const route=String(url).replace('http://local','').split('?')[0];
@@ -245,6 +245,36 @@ test('the account avatar is still excluded when the conversation sits outside <m
  assert.equal(probe.gallery,true);
 });
 
+test('a generated picture nested in a preview button is serialized', async()=>{
+ // 任务 d4a2a235d1c0 的真实层级：画廊经过多个 DIV 后，图片放在 BUTTON 内，
+ // 同级还有一个 DIV。旧 walk() 因为看到同级 DIV 而递归，却又直接跳过 BUTTON，
+ // 导致探针 picked=true，serializeReply() 的 images 却仍然是 0。
+ const document=createDocument();
+ const turn=el('div',{class:'block-BQZwFn'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']));
+ const search=el('div',{'data-chatgpt-search-message-ids':'message'});
+ const wrapper=el('div');
+ const gallery=el('div',{'data-testid':'generated-image-gallery'});
+ const track=el('div');
+ const preview=el('div');
+ const button=el('button',{'data-testid':'generated-image-preview','aria-label':'已生成图像 1'});
+ button.appendChild(img('blob:https://chatgpt.com/real',{width:1254,height:1254,alt:'已生成图像 1'}));
+ preview.appendChild(button);
+ preview.appendChild(el('div',{class:'preview-controls'}));
+ track.appendChild(preview);
+ gallery.appendChild(track);
+ wrapper.appendChild(gallery);
+ search.appendChild(wrapper);
+ turn.appendChild(search);
+ document.body.appendChild(turn);
+ const sandbox=sandboxOf({document});
+ const read=await sandbox.pageStep('read',{});
+ assert.equal(read.imageCount,1);
+ assert.deepEqual(plain(read.segments),[{type:'image',asset:0,mime:'image/png'}]);
+ const info=await sandbox.pageStep('inspect',{id:'abcdef123456'});
+ assert.equal(info.images,1);
+});
+
 // ---------------------------------------------------------------- 完成判定
 
 test('a reply whose picture is still rendering is waited out, and the tab stays open', async()=>{
@@ -293,15 +323,146 @@ test('a turn that never produces anything fails at the hard cap instead of hangi
  assert.match(storage.status,/任务失败/);
 });
 
+test('a complete picture found at the hard cap is delivered instead of discarded', async()=>{
+ const segments=[{type:'image',asset:0,mime:'image/png'}];
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'画一只猫',threadId:'',cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+    replyLength:0,images:1,gallery:true,imageLoading:false,busyText:'',replySignature:'0/0/1'},
+   read:{threadId:THREAD,segments,imageCount:1},
+   image:{base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-250000,stableAt:Date.now()-200000,
+  lastSignature:'0/0/1',baseline:0,userBaseline:1,sentText:'画一只猫',threadId:'',draft:null};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,0);
+ assert.equal(routeOf(calls,'/result-asset').length,1);
+ assert.equal(routeOf(calls,'/result').length,1);
+});
+
+// ---------------------------------------------------------------- 复用网页会话
+
+test('reusing a ChatGPT thread that no longer opens fails instead of waiting forever', async()=>{
+ // 默认就是持续会话，所以用户不会自己去换会话。地址被重定向回首页（threadId 变空）
+ // 说明这个会话已经打不开，必须立刻给出可分类的失败，而不是一路空耗到桥接超时。
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'再改一版',threadId:THREAD,cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,
+   replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'opening',openedAt:Date.now()-20000,hasImages:false,
+  sentText:'再改一版',draft:null,padded:false,threadId:THREAD};
+ await sandbox.tick();
+ const failures=routeOf(calls,'/failure');
+ assert.equal(failures.length,1);
+ assert.match(failures[0].body.message,/会话已不存在或无法打开/);
+ assert.match(storage.status,/任务失败/);
+});
+
+test('a thread that has just been opened is given time to settle before being declared gone', async()=>{
+ // 反向验证：刚打开的标签页还没导航完时不能立刻判死，否则正常续聊会误报。
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'再改一版',threadId:THREAD,cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,
+   replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'opening',openedAt:Date.now(),hasImages:false,
+  sentText:'再改一版',draft:null,padded:false,threadId:THREAD};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,0,'刚打开的会话还没稳定，不能判死');
+});
+
+test('history that renders late in a reused thread is never mistaken for this turn', async()=>{
+ // 线上事故的形状（任务 0f24faeed208 / 988bca02fb9f）：复用已有会话时页面异步渲染历史，
+ // 刚打开标签页时轮次计数还是 0。若此刻就采样基线，历史一渲染出来计数就从 0 变 1，
+ // 于是上一轮的图被当成本轮回复 —— 14 秒就收工，回传的 PNG 与上一轮字节完全相同。
+ let inspects=0;
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'去掉袖子',threadId:THREAD,cancelled:false,images:[]},
+  results:(op)=>{
+   if(op==='inspect'){
+    inspects++;
+    // 前两次：标签页刚打开，历史还没渲染出来。
+    if(inspects<=2)return {editor:true,assistants:0,users:0,threadId:THREAD,submitted:false,stopping:false,
+     replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0',assistantId:''};
+    // 之后：历史渲染出来了，但那是上一轮的消息，不是本轮。
+    return {editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+     replyLength:0,images:1,gallery:true,imageLoading:false,replySignature:'1/0/1',assistantId:'previous-turn'};
+   }
+   if(op==='submit')return {filled:true};
+   if(op==='send')return {clicked:true};
+   if(op==='read')return {threadId:THREAD,segments:[{type:'image',asset:0,mime:'image/png'}],imageCount:1};
+   if(op==='image')return {base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')};
+   return {};
+  },
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'opening',openedAt:Date.now(),hasImages:false,
+  sentText:'去掉袖子',draft:null,padded:false,threadId:THREAD};
+ await sandbox.tick();
+ assert.equal(storage.current.phase,'opening','历史还没渲染出来时不能开始填字');
+ await sandbox.tick();
+ assert.equal(storage.current.phase,'opening','页面上一轮都还没有，不能急着采样基线');
+ storage.current.openedAt=Date.now()-20000;   // 模拟标签页已经打开 20 秒
+ await sandbox.tick();   // 历史刚渲染出来，计数变了，要重新计稳定
+ assert.equal(storage.current.phase,'opening','计数刚变化时不能采样基线');
+ await sandbox.tick();   // 连续两次相同，才允许采样
+ assert.equal(storage.current.baseline,1,'轮次基线必须在历史渲染稳定之后采样');
+ assert.equal(storage.current.userBaseline,1);
+ assert.equal(routeOf(calls,'/result').length,0,'上一轮的图不能被当成本轮回复回传');
+ assert.equal(calls.filter(call=>call.route==='tabs.remove').length,0);
+});
+
+test('this turn is only finished once a new assistant message actually exists', async()=>{
+ // 计数只能说明「轮次变多了」，说明不了「多出来的是我这一轮」。最新 assistant 消息的
+ // message id 没变，就说明本轮回复还没出现，此时收工就是把上一轮的图回传。
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'去掉袖子',threadId:THREAD,cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:2,users:2,threadId:THREAD,submitted:true,stopping:false,
+   replyLength:0,images:1,gallery:true,imageLoading:false,replySignature:'1/0/1',assistantId:'previous-turn'},
+   read:{threadId:THREAD,segments:[{type:'image',asset:0,mime:'image/png'}],imageCount:1},
+   image:{base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')}},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-30000,stableAt:Date.now()-20000,
+  lastSignature:'1/0/1',baseline:1,userBaseline:1,assistantId:'previous-turn',
+  sentText:'去掉袖子',draft:null,padded:false,threadId:THREAD};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,0,'不该因为别的原因失败 —— 否则这条断言就是空转');
+ assert.equal(routeOf(calls,'/result').length,0,'最新轮次还是提交前那一条，说明本轮回复还没出现');
+ assert.equal(calls.filter(call=>call.route==='tabs.remove').length,0);
+});
+
+test('a draft is kept until the message is confirmed on the page', async()=>{
+ // 点击发送不等于提交成功。提前清掉草稿，输入框里留下的文本就变成认不出来的残留，
+ // 下一个任务只会报「输入框已有内容」——线上就是这么连环失败两次的。
+ const {sandbox,storage,calls}=worker({
+  state:{id:'abcdef123456',text:'去掉袖子',threadId:THREAD,cancelled:false,images:[]},
+  results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:false,stopping:false,
+   replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0',assistantId:'previous-turn'},
+   send:{clicked:true}},
+  storageSeed:{draft:'去掉袖子'},
+ });
+ await wait();
+ storage.current={id:'abcdef123456',tabId:1,phase:'filled',filledAt:Date.now()-10000,hasImages:false,
+  sentText:'去掉袖子',draft:'去掉袖子',padded:false,threadId:THREAD,baseline:1,userBaseline:1};
+ await sandbox.tick();
+ assert.equal(storage.draft,'去掉袖子','没有确认消息落到页面上之前，草稿不能被清掉');
+ assert.equal(routeOf(calls,'/result').length,0);
+});
+
 // ---------------------------------------------------------------- 回合识别
 
 test('the prompt is forwarded verbatim, with no connector marker in it', async()=>{
- const editor={innerText:'',focus(){},dispatchEvent(){}};
+ const editor={innerText:'',getAttribute:key=>key==='role'?'textbox':null,focus(){},dispatchEvent(){}};
  const document=createDocument();
  document.body.appendChild(el('main'));
  const sandbox=sandboxOf({document});
  sandbox.document.querySelector=selector=>selector.includes('textbox')?editor:null;
- sandbox.document.querySelectorAll=()=>[];
+ sandbox.document.querySelectorAll=selector=>selector==='[contenteditable="true"]'?[editor]:[];
  sandbox.document.execCommand=(command,_ui,value)=>{if(command==='insertText')editor.innerText=value;return true;};
  const message='帮我写一个快排，用 Python';
  const result=await sandbox.pageStep('submit',{id:'abcdef123456',message,threadId:''});
@@ -312,12 +473,12 @@ test('the prompt is forwarded verbatim, with no connector marker in it', async()
 
 test('a stale connector draft is cleared, but the user\'s own text is never overwritten', async()=>{
  const commands=[];
- const editor={innerText:'旧的任务正文',focus(){},dispatchEvent(){}};
+ const editor={innerText:'旧的任务正文',getAttribute:key=>key==='role'?'textbox':null,focus(){},dispatchEvent(){}};
  const document=createDocument();
  document.body.appendChild(el('main'));
  const sandbox=sandboxOf({document});
  sandbox.document.querySelector=selector=>selector.includes('textbox')?editor:null;
- sandbox.document.querySelectorAll=()=>[];
+ sandbox.document.querySelectorAll=selector=>selector==='[contenteditable="true"]'?[editor]:[];
  sandbox.document.execCommand=(command,_ui,value)=>{
   commands.push(command);
   if(command==='delete')editor.innerText='';
@@ -336,6 +497,83 @@ test('a stale connector draft is cleared, but the user\'s own text is never over
   if(result.error)throw Error(result.error);
  },/已有内容/);
  assert.equal(editor.innerText,'用户自己打的字');
+});
+
+test('the real composer wins over another textbox and hidden composers are ignored', async()=>{
+ const document=createDocument();
+ const other=el('div',{role:'textbox',contenteditable:'true'},['x'.repeat(609)]);
+ const hidden=el('div',{id:'prompt-textarea',contenteditable:'true',hidden:''},['hidden draft']);
+ const editor=el('div',{id:'prompt-textarea',contenteditable:'true'});
+ document.body.appendChild(other);document.body.appendChild(hidden);document.body.appendChild(editor);
+ editor.focus=()=>{};editor.dispatchEvent=()=>{};
+ document.execCommand=(command,_ui,text)=>{if(command==='insertText')editor.childNodes=[{nodeType:3,nodeValue:text}];};
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('submit',{message:'重新生成'})).filled,true);
+ assert.equal(other.innerText,'x'.repeat(609));
+ assert.equal(hidden.innerText,'hidden draft');
+});
+
+test('ambiguous textboxes are diagnosed without editing either one', async()=>{
+ const document=createDocument();
+ for(let i=0;i<2;i++)document.body.appendChild(el('div',{role:'textbox',contenteditable:'true'},['draft']));
+ document.execCommand=()=>assert.fail('must not edit');
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).editorAmbiguous,true);
+ assert.match((await sandbox.pageStep('prepare',{})).error,/多个输入框/);
+ const probe=await sandbox.pageStep('probe',{});
+ assert.equal(probe.editorCandidates.length,2);
+ assert.equal(probe.editorCandidates[0].chars,5);
+});
+
+test('prepare accepts a recorded older draft without editing and rejects unknown text', async()=>{
+ const document=createDocument();
+ const editor=el('div',{id:'prompt-textarea',contenteditable:'true'},['older draft']);
+ document.body.appendChild(editor);
+ document.execCommand=()=>assert.fail('prepare must not edit');
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('prepare',{draft:'latest draft',drafts:['older draft']})).prepared,true);
+ assert.match((await sandbox.pageStep('prepare',{draft:'latest draft',drafts:['other thread']})).error,/已有内容/);
+});
+
+test('draft intent is durable before DOM filling and remains recoverable after a failed fill', async()=>{
+ let instance;
+ instance=worker({state:{id:'draft-task'},storageSeed:{drafts:[{threadId:THREAD,text:'old draft'}]},results:(op,job)=>{
+  if(op==='inspect')return {editor:true,submitted:false};
+  if(op==='submit'){
+   assert.equal(instance.storage.draft,'new draft');
+   assert.equal(instance.storage.current.phase,'filling');
+   assert.ok(instance.storage.current.drafts.includes('new draft'));
+   assert.deepEqual(instance.storage.drafts,[{threadId:THREAD,text:'old draft'},{threadId:THREAD,text:'new draft'}]);
+   return {error:'模拟填写后脚本失败'};
+  }
+  return {};
+ }});
+ await wait();
+ instance.storage.current={id:'draft-task',tabId:1,phase:'filling',threadId:THREAD,sentText:'new draft'};
+ await instance.sandbox.tick();
+ assert.equal(instance.storage.current,null);
+ assert.equal(instance.storage.draft,'new draft');
+ assert.equal(instance.storage.drafts.length,2);
+ await instance.sandbox.tick();
+ assert.deepEqual(instance.storage.current.drafts,[],'new chats must not inherit another thread history');
+});
+
+test('rejected preparation never records intent or fills the composer', async()=>{
+ const {sandbox,storage,calls}=worker({state:{id:'draft-task'},storageSeed:{draft:'previous'},
+  results:{inspect:{editor:true},prepare:{error:'专用标签页输入框已有内容'}}});
+ await wait();
+ storage.current={id:'draft-task',tabId:1,phase:'filling',sentText:'new draft'};
+ await sandbox.tick();
+ assert.equal(storage.draft,'previous');assert.equal(storage.drafts,undefined);
+ assert.equal(opsOf(calls,'submit').length,0);
+});
+
+test('opening a task only loads the draft history of its conversation', async()=>{
+ const {storage}=worker({state:{id:'draft-task',threadId:THREAD},storageSeed:{drafts:[
+  {threadId:THREAD,text:'old draft'},{threadId:'another',text:'unrelated'},
+ ]}});
+ await wait();
+ assert.deepEqual(storage.current.drafts,['old draft']);
 });
 
 test('the new user turn is recognised by counting, not by matching a marker', async()=>{
@@ -370,7 +608,8 @@ test('reference images are attached once, before any submit', async()=>{
  document.body.appendChild(el('main'));
  const sandbox=sandboxOf({document});
  sandbox.document.querySelector=selector=>selector==='input[type="file"]'?input:(selector.includes('textbox')?editor:null);
- sandbox.document.querySelectorAll=()=>[];
+ input.getAttribute=()=>null;
+ sandbox.document.querySelectorAll=selector=>selector==='input[type="file"]'?[input]:[];
  sandbox.File=class{constructor(parts,name,options){this.parts=parts;this.name=name;this.type=options.type;}};
  sandbox.DataTransfer=class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}};
  sandbox.Event=class{constructor(type){this.type=type;}};
@@ -479,11 +718,13 @@ test('a refusal is delivered as an ordinary reply, never as a failure', async()=
  assert.deepEqual(routeOf(calls,'/result')[0].body.segments,segments);
 });
 
-test('a page that never stops looking busy is waited out, then fails at the hard cap', async()=>{
+test('a readable reply is recovered at the hard cap even if stale busy text remains', async()=>{
+ const segments=[{type:'text',text:'完成了。'}];
  const {sandbox,storage,calls}=worker({
   state:{id:'abcdef123456',text:'一只猫',threadId:'',cancelled:false,images:[]},
   results:{inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
-    replyLength:4,images:0,gallery:false,imageLoading:false,busyText:'正在生成',replySignature:'4/4/0'}},
+    replyLength:4,images:0,gallery:false,imageLoading:false,busyText:'正在生成',replySignature:'4/4/0'},
+   read:{threadId:THREAD,segments,imageCount:0}},
  });
  await wait();
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now()-60000,stableAt:Date.now(),baseline:0,
@@ -493,8 +734,10 @@ test('a page that never stops looking busy is waited out, then fails at the hard
  assert.match(storage.status,/正在生成/);
  storage.current.sentAt=Date.now()-250000;
  await sandbox.tick();
- assert.equal(routeOf(calls,'/failure').length,1);
- assert.match(storage.status,/任务失败/);
+ assert.equal(routeOf(calls,'/failure').length,0);
+ storage.current.stableAt=Date.now()-4000;
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/result').length,1);
 });
 
 test('a page with nothing readable fails once, with a page snapshot attached', async()=>{
@@ -520,10 +763,144 @@ test('a task cancelled by the bridge is stopped and reported, never submitted', 
   results:{inspect:{editor:true,assistants:0,users:0,threadId:'',submitted:false,stopping:false,replyLength:0,images:0,gallery:false,imageLoading:false,replySignature:'0/0/0'},stop:{stopped:true}},
  });
  await wait();
+ calls.length=0; // Ignore the initial tick acknowledging an unstarted cancelled task.
  storage.current={id:'abcdef123456',tabId:1,phase:'waiting',sentAt:Date.now(),stableAt:Date.now(),baseline:0,
   userBaseline:0,sentText:'一只猫',threadId:'',draft:null};
  await sandbox.tick();
  assert.equal(opsOf(calls,'stop').length,1);
  assert.equal(opsOf(calls,'submit').length,0);
  assert.equal(routeOf(calls,'/failure').length,1);
+});
+
+for (const info of [
+ { stopping: true, assistants: 1 },
+ { stopping: false, assistants: 0 },
+ { stopping: false, assistants: 1, assistantId: 'old' },
+ { loading: true },
+]) {
+ test(`hard deadline also covers early waiting branches ${JSON.stringify(info)}`, async () => {
+  const { sandbox, storage, calls } = worker({
+   state: { id: 'abcdef123456', text: '你好', threadId: '', cancelled: false, images: [] },
+   results: { inspect: { editor: true, submitted: true, threadId: THREAD, ...info } },
+  });
+  await wait();
+  storage.current = { id: 'abcdef123456', tabId: 1, phase: 'waiting', sentAt: Date.now() - 245000,
+   baseline: 0, assistantId: 'old', userBaseline: 0, threadId: '' };
+  await sandbox.tick();
+  assert.equal(routeOf(calls, '/failure').length, 1);
+  assert.match(routeOf(calls, '/failure')[0].body.message, /超时/);
+  assert.equal(routeOf(calls, '/result').length, 0);
+ });
+}
+
+test('image upload selects the compatible input instead of an unrelated document picker', async()=>{
+ const document=createDocument(),events=[];
+ const pdf=el('input',{type:'file',accept:'.pdf'}), image=el('input',{type:'file',accept:'image/*'});
+ pdf.dispatchEvent=()=>events.push('pdf');image.dispatchEvent=e=>events.push(e.type);
+ document.body.appendChild(pdf);document.body.appendChild(image);
+ const sandbox=sandboxOf({document});
+ sandbox.File=class{constructor(parts,name,options){this.name=name;this.type=options.type;}};
+ sandbox.DataTransfer=class{constructor(){this.files=[];this.items={add:file=>this.files.push(file)};}};
+ const result=await sandbox.pageStep('attach',{images:[{name:'input.jpg',mime:'image/jpeg',base64:'AQID'}]});
+ assert.equal(result.attached,1);assert.equal(pdf.files,undefined);assert.equal(image.files.length,1);
+ assert.deepEqual(events,['input','change']);
+});
+
+test('composer counts remote thumbnails once per attachment and exposes uploading state', async()=>{
+ const document=createDocument(),form=el('form');
+ form.appendChild(el('div',{role:'textbox',contenteditable:'true'}));
+ const card=el('div',{'data-testid':'attachment-1'});
+ card.appendChild(img('https://example.com/reference.jpg'));form.appendChild(card);
+ form.appendChild(img('data:image/png;base64,AQID'));
+ form.appendChild(el('div',{role:'progressbar'}));document.body.appendChild(form);
+ document.body.appendChild(img('https://example.com/history.jpg'));
+ const sandbox=sandboxOf({document});
+ const result=await sandbox.pageStep('inspect',{});
+ assert.equal(result.attachments,2);assert.equal(result.uploading,true);
+});
+
+test('all reference attachments must settle before filling and upload is never repeated', async()=>{
+ let info={editor:true,attachments:1,uploading:false};
+ const task={id:'abcdef123456',images:[{name:'a.jpg'},{name:'b.jpg'}]};
+ const {sandbox,storage,calls}=worker({state:task,results:op=>op==='inspect'?info:{filled:true}});
+ await wait();
+ storage.current={...task,tabId:1,phase:'attaching',attachSent:true,attachAt:Date.now(),openedAt:Date.now(),sentText:'describe'};
+ await sandbox.tick();assert.equal(storage.current.phase,'attaching');
+ info={...info,attachments:2,uploading:true};
+ await sandbox.tick();assert.equal(storage.current.phase,'attaching');
+ info={...info,uploading:false};await sandbox.tick();assert.equal(storage.current.phase,'filled');
+ assert.equal(opsOf(calls,'attach').length,0);assert.equal(opsOf(calls,'submit').length,1);
+});
+
+for(const phase of ['attaching','waiting'])test(phase+' failure captures an early diagnostic probe',async()=>{
+ const task={id:'abcdef123456',images:[{name:'a.jpg'}]};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{attachments:0,submitted:false},probe:{phase,attachments:0,userNodes:0}}});
+ await wait();
+ storage.current={...task,tabId:1,phase,attachSent:true,attachAt:Date.now()-50000,sentAt:Date.now()-25000};
+ await sandbox.tick();
+ const failure=routeOf(calls,'/failure')[0];assert.ok(failure);assert.equal(failure.body.probe.phase,phase);
+ assert.equal(opsOf(calls,'send').length,0);assert.equal(opsOf(calls,'attach').length,0);
+});
+
+
+test('transient bridge failure retains the task and never reports a page failure', async()=>{
+ const {sandbox,storage,calls}=worker({state:{id:'network',text:'hello'}});
+ await wait();
+ storage.current={id:'network',tabId:1,phase:'waiting',sentAt:Date.now()};
+ sandbox.fetch=async()=>{throw Error('connection reset');};
+ await sandbox.tick();
+ assert.equal(storage.current.id,'network');
+ assert.equal(routeOf(calls,'/failure').length,0);
+ assert.equal(opsOf(calls,'send').length,0);
+ assert.match(storage.status,/等待恢复/);
+});
+
+test('a persisted returning reply retries result I/O without reading or sending again', async()=>{
+ const {sandbox,storage,calls}=worker({state:{id:'return',text:'hello'}});
+ await wait(); calls.length=0;
+ storage.current={id:'return',tabId:1,phase:'returning',reply:{threadId:THREAD,imageCount:0,segments:[{type:'text',text:'answer'}]}};
+ const fetch=sandbox.fetch; let attempts=0;
+ sandbox.fetch=async(url,options)=>{
+  if(url.endsWith('/result') && ++attempts===1)throw Error('connection reset');
+  return fetch(url,options);
+ };
+ await sandbox.tick();
+ assert.equal(storage.current.phase,'returning');
+ assert.equal(routeOf(calls,'/failure').length,0);
+ await sandbox.tick();
+ assert.equal(storage.current,null);
+ assert.equal(attempts,2);
+ assert.equal(opsOf(calls,'read').length,0);
+ assert.equal(opsOf(calls,'send').length,0);
+ assert.equal(routeOf(calls,'/result')[0].body.segments[0].text,'answer');
+});
+
+test('a cancelled unstarted task never creates a browser tab', async()=>{
+ const {storage,calls}=worker({state:{id:'cancelled',cancelled:true}});
+ await wait();
+ assert.equal(storage.current,undefined);
+ assert.equal(routeOf(calls,'/progress').length,0);
+ assert.equal(routeOf(calls,'/failure').length,1);
+});
+
+test('message-author-role is supported when the old role anchors are absent', async()=>{
+ const document=createDocument();
+ const turn=el('div',{'data-testid':'conversation-turn-1'});
+ const assistant=el('div',{'data-message-author-role':'assistant','data-message-id':'new-answer'});
+ assistant.appendChild(el('div',{class:'markdown'},[el('p',{},['fallback reply'])]));
+ turn.appendChild(assistant);document.body.appendChild(turn);
+ const sandbox=sandboxOf({document});
+ const reply=await sandbox.pageStep('read',{});
+ assert.ok(reply.segments.some(s=>s.text==='fallback reply'));
+ const info=await sandbox.pageStep('inspect',{});
+ assert.equal(info.assistants,1);assert.equal(info.assistantId,'new-answer');
+});
+
+
+test('navigation between preparation and sending cannot send into the wrong thread',async()=>{
+ const sandbox=sandboxOf({location:{href:'https://chatgpt.com/',pathname:'/'}});
+ for(const operation of ['attach','prepare','submit','send']){
+  const result=await sandbox.pageStep(operation,{threadId:THREAD,message:'hello'});
+  assert.match(result.error,/会话与任务不一致/);
+ }
 });
