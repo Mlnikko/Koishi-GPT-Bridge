@@ -16,8 +16,8 @@ index.cjs            插件入口，可用全部
 
 | 分层 | 允许依赖 | 模块 |
 | --- | --- | --- |
-| `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs` |
-| `src/core/` | `lib`、同层 | `message.cjs`、`conversations.cjs`、`preferences.cjs`、`queue.cjs` |
+| `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs`、`state.cjs` |
+| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`queue.cjs` |
 | `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs` |
 | `src/index.cjs` | 全部 | 入口 |
 
@@ -39,6 +39,8 @@ index.cjs            插件入口，可用全部
 | `src/lib/image.cjs` | 参考图安全下载（协议白名单、SSRF 防护、体积与超时限制、文件头嗅探）与 PNG 文件头解析。 |
 | `src/lib/reply.cjs` | 回复片段校验、Markdown 围栏还原、按段落拆分、总量截断。**纯函数。** |
 | `src/lib/feedback.cjs` | 面向用户的文案、失败分类、本机路径与凭据脱敏、模型文本转义。 |
+| `src/lib/state.cjs` | 原子发布 JSON 状态；失败保留原记录并清理暂存文件。 |
+| `src/core/config.cjs` | 集中归一化配置并校验用户名单、布尔项、端口、计时器和各输入/输出限制；校验完成后才装配服务。 |
 | `src/core/message.cjs` | QQ 消息元素 → 有序片段（文本/图片），剥掉开头的 @ 机器人。**纯函数。** |
 | `src/core/conversations.cjs` | 网页会话的持久化（名称、归属用户、选中状态、绑定的 ChatGPT 会话编号 `webThreadId`）。 |
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
@@ -163,6 +165,8 @@ scope.middleware((session, next) => next(() => forward(session)));
 
 续聊通过服务器保存的确切 ChatGPT 会话编号进入同一网页会话，不接受用户提交任意会话编号。
 
+会话修改先在副本上进行，落盘成功后才发布到内存。重开会话的“关闭旧会话 + 创建并选中新会话”通过一次提交完成；写入失败时保留原选择、名称、打开状态和网页绑定。发布时保留现有会话对象，正在执行的任务持有的引用仍然有效。
+
 ### 网页会话失效时的自愈
 
 持续会话把「换会话」这件事从用户手里拿走了，所以失效必须能自己恢复，否则一个失效编号会把用户永久卡死。
@@ -231,6 +235,10 @@ scope.middleware((session, next) => next(() => forward(session)));
 
 ### 回复读取
 
+扩展按职责拆成 `background.js`（持久化任务状态机）、`bridge-client.js`（本机 HTTP）与 `page.js`（页面操作）。`pageStep` 会被 Chrome 序列化后注入网页，所以 DOM 辅助函数必须留在 `pageStep` 内；不要让它依赖扩展后台全局变量。测试从真实入口加载两个脚本，保留整个 worker 的状态机验证。
+
+终态故障先保存为 `phase: 'failing'` 与原始诊断，再重试回报。重试期间只重发故障结果，不能回到填写、上传或提交。打开页面后如发现已有未知草稿或附件，直接提示清理，不将它们混入新任务。
+
 `serializeReply()` 在最新 assistant 轮次内做 DOM → 片段序列化。**角色标题不是回复内容**：
 `<h4 data-conversation-role="assistant">` 里的「ChatGPT 说：」是页面框架，`walk()` 会按
 `data-conversation-role` / `data-message-author-role` 属性跳过它 —— 页面不再暴露 markdown 容器时，
@@ -275,6 +283,14 @@ scope.middleware((session, next) => next(() => forward(session)));
 `probeDom()` 里每张图带 `inUser`/`inUserTurn`/`chrome`/`picked`，排查时直接看是哪张被选中、为什么。
 读取回复时这份快照随 `/result` 上报，桥接写入 `data/jobs/<id>/result-probe.json`
 （`dom-probe.json` 仍只在失败时写）。**遇到「回复不对」先看这两个文件，不要靠猜。**
+
+段落中的图片按文本节点与图片节点的实际顺序序列化，直接文本节点也保留。生成状态文字仅从状态控件读取；回复正文中的“正在生成”“Thinking”不作为生成中的证据。
+
+### 只读连接检查
+
+`GET /health` 沿用本机令牌鉴权，返回协议/插件版本、浏览器在线状态与繁忙状态，不返回消息正文、用户编号或令牌，也不刷新心跳。只有扩展轮询 `GET /state` 才更新在线时间；普通错误请求和图片诊断不会把离线浏览器变成在线。
+
+`桥接连接` 与 `npm run doctor` 使用这一状态。在线代表最近 90 秒内有任务轮询，真实网页登录与回复能力仍要通过消息验收。
 
 ### 等待与超时
 

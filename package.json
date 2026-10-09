@@ -1,11 +1,13 @@
 {
   "name": "koishi-plugin-codex-image-local",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "private": true,
   "description": "把 QQ 消息原样送进已登录的 ChatGPT 网页会话，并把网页回复原样送回 QQ；不依赖 API Key，也不调用任何本地 CLI。",
   "main": "src/index.cjs",
   "scripts": {
-    "test": "node --test \"test/**/*.test.cjs\"",
+    "test": "node scripts/test.cjs",
+    "check": "node scripts/check-project.cjs",
+    "doctor": "node scripts/doctor.cjs",
     "setup:bridge": "node scripts/setup-web-bridge.cjs"
   },
   "engines": {

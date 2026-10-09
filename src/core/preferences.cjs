@@ -1,6 +1,6 @@
 'use strict';
 const fs = require('node:fs');
-const path = require('node:path');
+const { writeJson } = require('../lib/state.cjs');
 
 // Notification preferences belong to a user in a chat, not a web conversation.
 class Preferences {
@@ -15,9 +15,7 @@ class Preferences {
   }
   set(owner, chat, enabled) {
     const values = { ...this.values, [JSON.stringify([owner, chat])]: enabled };
-    fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(this.file + '.tmp', JSON.stringify(values, null, 2), { mode: 0o600 });
-    fs.renameSync(this.file + '.tmp', this.file);
+    writeJson(this.file, values);
     this.values = values;
   }
 }

@@ -34,6 +34,7 @@ Koishi 本机 ChatGPT 网页桥接。
 | --- | --- |
 | `/help` / `桥接帮助` | 查看已有命令和使用说明 |
 | `/logs [on\|off]` / `桥接日志 [开启\|关闭]` | 查看或切换接收确认、进度提醒；不带参数查看当前设置 |
+| `桥接连接` | 检查正在运行的插件版本、本机监听和浏览器连接，不创建网页任务 |
 | `桥接状态 [任务编号]` | 查看最近或指定任务的进度 |
 | `桥接取消 [任务编号]` | 停止排队，或请求网页停止正在进行的生成 |
 | `桥接重发 [任务编号]` | 重新发送已取回的回复 |
@@ -125,6 +126,9 @@ Koishi 本机 ChatGPT 网页桥接。
 
 ## 安装与配置
 
+浏览器扩展支持 macOS / Windows 上的 Chrome 120+。Koishi 和 Chrome 须运行在同一台电脑，
+Node 建议使用 22 LTS 或更高版本。macOS 不需要 `sips`、AppleScript 或按键权限；图片处理和网页操作使用 JavaScript 与 Chrome 扩展 API。
+
 只需三步：
 
 1. 把本目录链接到 Koishi 实例的 `node_modules/koishi-plugin-codex-image-local`。
@@ -136,6 +140,18 @@ Koishi 本机 ChatGPT 网页桥接。
 
 3. 在实例 `koishi.yml` 增加 `codex-image-local` 配置（可参考仓库根目录的 `koishi.example.yml`），**重启实例**；
    再在 Chrome 扩展管理页开启开发者模式，加载 `browser-extension` 目录。
+
+`config.js` 内含本机令牌，不随 Git 分发。换到另一台电脑后必须重新运行第 2 步；
+缺少它时扩展弹窗会提示生成配置。若 Koishi 配置了 `dataDir`，请使用相同的绝对路径：
+
+```bash
+node scripts/setup-web-bridge.cjs 5141 "/实际路径/Koishi 数据目录"
+```
+
+Windows 路径同样需要加引号，例如 `node scripts/setup-web-bridge.cjs 5141 "D:\Koishi Data"`。
+生成后重载扩展，弹窗应显示版本 `0.3.4`、正确的本机地址和“已连接本机 Koishi，等待任务”。
+“令牌不匹配”表示配置与运行中 Koishi 的数据目录不一致；连接失败则先确认 Koishi 已启动、端口一致。
+完整跨平台安装与验收步骤见 [运维文档](docs/operations.md#macos--windows-安装与验收)。
 
 插件名与包名沿用 `codex-image-local`（历史命名），与后端无关，重命名需要同步改 `koishi.yml` 的键。
 
@@ -169,17 +185,25 @@ koishi-codex-image-bridge/
 │   ├── lib/                    通用工具层，不依赖项目内其他模块
 │   │   ├── image.cjs           参考图安全下载、格式嗅探、PNG 尺寸解析
 │   │   ├── reply.cjs           回复片段校验、Markdown 围栏还原、按段落拆分
-│   │   └── feedback.cjs        用户可见文案、失败分类、本机路径脱敏
+│   │   ├── feedback.cjs        用户可见文案、失败分类、本机路径脱敏
+│   │   └── state.cjs           原子 JSON 状态发布与暂存清理
 │   ├── core/                   领域层，可用 lib
+│   │   ├── config.cjs          配置归一化；在打开文件和端口前校验
 │   │   ├── message.cjs         QQ 消息元素 → 有序片段
 │   │   ├── conversations.cjs   网页会话持久化
 │   │   ├── preferences.cjs     用户在各聊天中的过程通知设置
 │   │   └── queue.cjs           任务队列持久化与串行执行
 │   └── bridge/                 传输层，可用 core 与 lib
 │       └── web-bridge.cjs      与 Chrome 扩展的本机 HTTP 桥接（127.0.0.1:5141）
-├── browser-extension/          Chrome MV3 扩展：驱动 ChatGPT 页面
+├── browser-extension/          Chrome MV3 扩展
+│   ├── background.js           任务状态机与恢复
+│   ├── bridge-client.js        本机 HTTP 通信与图片字节传输
+│   └── page.js                 可独立注入的页面操作、轮次识别与回复读取
 ├── scripts/
-│   └── setup-web-bridge.cjs    生成扩展的本地配置与桥接令牌
+│   ├── setup-web-bridge.cjs    生成扩展的本地配置与桥接令牌
+│   ├── doctor.cjs             只读连接诊断，不发送消息、不写入在线心跳
+│   ├── check-project.cjs      脚本语法、版本和入口校验
+│   └── test.cjs               显式发现测试文件，兼容 Node 20+ 和 Windows
 ├── test/                       镜像 src/ 的分层
 │   ├── lib/ core/ bridge/      各模块单元测试
 │   ├── helpers/dom.cjs         测试用的最小 DOM 桩（扩展页面脚本只能在沙箱里跑）
@@ -199,14 +223,17 @@ koishi-codex-image-bridge/
 ## 验证
 
 ```bash
-npm test          # 等价于 node --test "test/**/*.test.cjs"
+npm run check     # 检查脚本语法、入口、插件与扩展版本一致
+npm test          # 发现全部嵌套 .test.cjs 文件并运行
+npm run doctor    # 检查运行中的实例；自定义目录：npm run doctor -- "/实际/dataDir"
 ```
 
 覆盖消息片段化与顺序、回复序列化与拆分、去重、串行取消、重启、参考图下载边界、桥接鉴权与协议校验、
 扩展提交顺序与回合识别，以及分层与依赖规则的守卫。
-Node 22 自行展开 glob，Windows 下无需 shell 展开。
+测试启动器显式传入文件路径，不依赖 shell 或 Node 的 glob 展开。
 
 真实网页与真实 QQ 收发需要分别验证，单元测试不替代端到端验收；已完成的验收记录见 [docs/history.md](docs/history.md)。
+本次功能矩阵、修复证据与待完成的现场验收见 [docs/project-audit.md](docs/project-audit.md)。
 
 ## 文档
 

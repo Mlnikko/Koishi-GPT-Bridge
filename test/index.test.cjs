@@ -560,3 +560,53 @@ test('invalid numeric limits fail before a server is started',()=>{
  for(const config of [{maxTextChars:-1},{maxTextChars:1},{replyTimeoutMs:Infinity},{sendTimeoutMs:NaN},{maxInputImages:1.5}])
   assert.throws(()=>apply(config),/必须是/);
 });
+
+test('connection command reports the loaded version without creating a job or browser heartbeat', async()=>{
+ const app=apply();
+ const s=session();
+ const message=await dispatch(app,s,'桥接连接');
+ assert.match(message,new RegExp(require('../package.json').version.replaceAll('.', '\\.')));
+ assert.match(message,/未在线/);
+ assert.deepEqual(jobFiles(app.root),[]);
+ const {port,token}=await bridgeOf(app.root);
+ const health=await(await fetch(`http://127.0.0.1:${port}/health`,{headers:{'x-bridge-token':token}})).json();
+ assert.equal(health.online,false);
+ assert.equal(health.busy,false);
+});
+
+test('session commands route history and selection locally while enforcing ownership', async()=>{
+ const app=apply({notifyProgress:false});const s=session();
+ await dispatch(app,s,'桥接新建会话 first');
+ const first=JSON.parse(fs.readFileSync(path.join(app.root,'conversations.json'))).items[0].id;
+ await dispatch(app,s,'桥接新建会话 second');
+ assert.match(await dispatch(app,s,`桥接重命名会话 ${first} renamed`),/已重命名：renamed/);
+ assert.match(await dispatch(app,s,`桥接切换会话 ${first}`),/已切换：renamed/);
+ assert.match(await dispatch(app,s,'桥接会话列表'),new RegExp(first+' renamed \\[当前\\]'));
+ s.elements=[{type:'text',attrs:{content:'history entry'}}];
+ await dispatch(app,s);const [job]=await settle(app.root);
+ assert.match(await dispatch(app,s,'桥接记录'),/history entry/);
+ assert.match(await dispatch(app,s,`桥接状态 ${job.id}`),/处理失败/);
+ const other=session({userId:'bob',channelId:'alice'});
+ for(const command of [`桥接切换会话 ${first}`,`桥接重命名会话 ${first} wrong`,`桥接关闭会话 ${first}`,`桥接记录 ${first}`])
+  assert.match(await dispatch(app,other,command),/未找到你的会话/);
+ assert.equal(await dispatch(app,other,`桥接状态 ${job.id}`),'未找到你的任务');
+ assert.match(await dispatch(app,s,`桥接关闭会话 ${first}`),/已关闭会话/);
+ assert.match(await dispatch(app,s,`桥接重发 ${job.id}`),/处理失败/);
+ assert.equal(jobFiles(app.root).length,1,'management commands must not reach ChatGPT');
+});
+
+test('status and cancellation commands operate on the owned running job and await browser acknowledgement', async()=>{
+ const app=apply({notifyProgress:false});const {port,token}=await bridgeOf(app.root);
+ const headers={'x-bridge-token':token,'Content-Type':'application/json'};
+ const state=async()=> (await fetch(`http://127.0.0.1:${port}/state`,{headers})).json();
+ await state();const s=session({elements:[{type:'text',attrs:{content:'running'}}]});
+ await dispatch(app,s);await wait();
+ const {job}=await state();
+ assert.match(await dispatch(app,s,'桥接状态'),/网页处理中/);
+ assert.equal(await dispatch(app,session({userId:'bob'}),`桥接取消 ${job.id}`),'未找到你的任务');
+ assert.match(await dispatch(app,s,'桥接取消'),/已请求停止/);
+ assert.equal((await state()).job.cancelled,true);
+ await fetch(`http://127.0.0.1:${port}/failure`,{method:'POST',headers,body:JSON.stringify({id:job.id,message:'任务已取消'})});
+ const [ended]=await settle(app.root);assert.equal(ended.status,'cancelled');
+ assert.match(await dispatch(app,s,'桥接取消'),/已结束/);
+});

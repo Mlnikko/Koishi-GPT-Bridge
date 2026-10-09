@@ -2,6 +2,27 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { validateSegments, splitText, toMessages, replyText, TRUNCATED_NOTICE } = require('../../src/lib/reply.cjs');
 
+test('total truncation keeps surrogate pairs intact and never appends later text', () => {
+  const { messages, truncated } = toMessages([
+    { type: 'text', text: 'a😀z' }, { type: 'image', asset: 0 }, { type: 'text', text: 'later' },
+  ], { maxChars: 100, maxTotal: 2 });
+  assert.equal(truncated, true);
+  assert.equal(messages[0].text, 'a');
+  assert.equal(messages[1].type, 'image');
+  assert.ok(!messages.some(message => message.text === 'later'));
+});
+
+test('structured code containing fences uses a longer outer fence and truncates with closure', () => {
+  const body = 'before\n```\ninside\n```\nafter';
+  const full = replyText([{ type: 'code', language: 'md', text: body }]);
+  assert.equal(full, '````md\n' + body + '\n````');
+  const { messages, truncated } = toMessages([{ type: 'code', language: 'js', text: 'x'.repeat(100) }],
+    { maxChars: 50, maxTotal: 24 });
+  assert.equal(truncated, true);
+  assert.match(messages[0].text, /^```js\n[\s\S]*\n```$/);
+  assert.ok(messages[0].text.length <= 24);
+});
+
 test('long single lines and emoji fit the message limit without lost characters', () => {
   const value = '长'.repeat(99) + '😀'.repeat(80);
   const chunks = splitText(value, 100);
@@ -19,6 +40,16 @@ test('code chunks include fences in their size budget, including oversized lines
     assert.ok(chunks.every(chunk => chunk.startsWith(marker + 'js\n') && chunk.endsWith('\n' + marker)));
     assert.equal(chunks.map(chunk => chunk.slice(marker.length + 3, -marker.length - 1)).join(''), 'x'.repeat(500));
   }
+});
+
+test('small message limits keep code blocks valid when the language or marker cannot fit', () => {
+  const chunks = splitText('```javascript\n' + 'x'.repeat(60) + '\n```', 16);
+  assert.ok(chunks.every(chunk => chunk.length <= 16 && /^```\n[\s\S]*\n```$/.test(chunk)));
+  assert.equal(chunks.map(chunk => chunk.slice(4, -4)).join(''), 'x'.repeat(60));
+  const marker = '`'.repeat(20);
+  const tiny = splitText(marker + '\n' + 'y'.repeat(30) + '\n' + marker, 16);
+  assert.ok(tiny.every(chunk => chunk.length <= 16 && chunk.startsWith('    ')));
+  assert.equal(tiny.map(chunk => chunk.slice(4)).join(''), 'y'.repeat(30));
 });
 
 test('only text, code and image segments are accepted', () => {

@@ -20,9 +20,15 @@ function stubChrome(){
 }
 // 扩展的页面脚本只能注入，没法 require；这里在沙箱里跑整个 service worker，
 // pageStep 与 tick 都是顶层函数，可以直接调用 —— 不再需要按函数名切源码。
-function sandboxOf({document=createDocument(),location={href:'https://chatgpt.com/',pathname:'/'},chrome,fetch:fetchImpl}={}){
+function sandboxOf({document=createDocument(),location={href:'https://chatgpt.com/',pathname:'/'},chrome,fetch:fetchImpl,
+ importScripts:importImpl=()=>{},config={url:'http://127.0.0.1:5141',token:'test'}}={}){
  const sandbox={console,AbortSignal,structuredClone,
-  setInterval:()=>{},importScripts:()=>{},BRIDGE:{url:'http://local',token:'test'},
+  setInterval:()=>{},importScripts:(...files)=>{
+   for(const file of files){
+    if(file==='config.js')importImpl(file);
+    else vm.runInContext(fs.readFileSync(path.join(__dirname,'../browser-extension',file),'utf8'),sandbox,{filename:file});
+   }
+  },BRIDGE:config,
   atob:value=>Buffer.from(value,'base64').toString('binary'),
   btoa:value=>Buffer.from(value,'binary').toString('base64'),
   InputEvent:class{constructor(type,options){this.type=type;Object.assign(this,options);}},
@@ -47,7 +53,7 @@ function worker({state=null,results={},storageSeed={}}={}){
    scripting:{executeScript:async({args:[op,job]})=>{calls.push({op,job:plain(job)});return [{result:op==='prepare'?(results.prepare||{prepared:true}):typeof results==='function'?results(op,job):results[op]}];}},
   },
   fetch:async(url,options)=>{
-   const route=String(url).replace('http://local','').split('?')[0];
+   const route=new URL(url).pathname;
    const body=options?.body;
    calls.push({route,body:body&&typeof body==='string'?JSON.parse(body):null,bytes:body&&typeof body!=='string'?body.length:0});
    return String(url).endsWith('/state')?{ok:true,json:async()=>({job:state})}:{ok:true,json:async()=>({})};
@@ -57,6 +63,139 @@ function worker({state=null,results={},storageSeed={}}={}){
 }
 const opsOf=(calls,op)=>calls.filter(call=>call.op===op);
 const routeOf=(calls,route)=>calls.filter(call=>call.route===route);
+
+for(const existing of [{unknownDrafts:true},{attachments:1},{uploading:true}])test('opening never appends input to existing composer content '+JSON.stringify(existing),async()=>{
+ const task={id:'composer-owned',text:'new task',images:[{index:0}]};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,users:0,assistants:0,...existing},probe:{}}});
+ await wait();
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);
+ assert.equal(opsOf(calls,'attach').length,0);
+ assert.equal(opsOf(calls,'submit').length,0);
+});
+
+test('a technical failure remains terminal while its acknowledgement is retried',async()=>{
+ const task={id:'terminal',text:'hello'};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{login:true},probe:{turns:0}}});
+ await wait();
+ const fetch=sandbox.fetch;let failures=0;
+ sandbox.fetch=async(url,options)=>{
+  if(url.endsWith('/failure')&&++failures===1)throw Error('connection reset');
+  return fetch(url,options);
+ };
+ await sandbox.tick();
+ assert.equal(storage.current.phase,'failing');
+ assert.match(storage.current.failure.message,/需要登录/);
+ calls.length=0;
+ await sandbox.tick();
+ assert.equal(storage.current,null);
+ assert.equal(failures,2);
+ assert.equal(opsOf(calls,'inspect').length,0);
+ assert.equal(opsOf(calls,'send').length,0);
+});
+
+test('answer wording is not interpreted as a generation status',async()=>{
+ const document=createDocument();
+ const turn=el('div',{'data-testid':'conversation-turn-1'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'},['ChatGPT 说：']));
+ turn.appendChild(el('div',{class:'markdown'},[el('p',{},['正在生成 means Generating. Thinking is another word.'])]));
+ document.body.appendChild(turn);
+ const info=await sandboxOf({document}).pageStep('inspect',{});
+ assert.equal(info.busyText,'');
+ assert.ok(info.replyLength>0);
+});
+
+test('paragraph image order and direct text nodes survive reply serialization',async()=>{
+ const document=createDocument();
+ const turn=el('div',{'data-testid':'conversation-turn-1'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'}));
+ turn.appendChild(el('div',{},['direct text',el('p',{},['before',img('blob:generated'),'after'])]));
+ document.body.appendChild(turn);
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[
+  {type:'text',text:'direct text'},{type:'text',text:'before'},
+  {type:'image',asset:0,mime:'image/png'},{type:'text',text:'after'},
+ ]);
+});
+
+test('live CodeSurface headers supply the code language without leaking control labels into prose',async()=>{
+ const document=createDocument();
+ const turn=el('div',{'data-testid':'conversation-turn-1'});
+ turn.appendChild(el('h4',{'data-conversation-role':'assistant'}));
+ const block=el('div',{'data-markdown-copy':'code-block'});
+ block.appendChild(el('div',{'data-markdown-copy':'exclude'},[
+  el('svg'),el('div',{},['JavaScript']),el('div',{},[el('button',{},['Copy'])]),
+ ]));
+ block.appendChild(el('div',{},[el('div',{},[el('pre',{},[el('code',{},['console.log("BRIDGE_OK_1009");'])])])]));
+ turn.appendChild(block);document.body.appendChild(turn);
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[{type:'code',language:'javascript',text:'console.log("BRIDGE_OK_1009");'}]);
+});
+
+test('image-only live user turns are counted alongside text bubbles and bound only to the new reply',async()=>{
+ const document=createDocument();
+ const oldUser=el('div',{'data-chatgpt-search-unit-key':'fallback-turn-0:0:user','data-chatgpt-search-message-ids':'old-user'},[
+  el('div',{'data-user-message-bubble':''},['old prompt']),
+ ]);
+ const oldReply=el('div',{'data-content-search-unit-key':'fallback-turn-0:1:assistant'},[
+  el('h4',{'data-conversation-role':'assistant'}),el('p',{},['old reply']),
+ ]);
+ const photo=img('data:image/png;base64,input',{alt:'用户附件'});
+ const newUser=el('div',{'data-chatgpt-search-unit-key':'fallback-turn-1:0:user','data-chatgpt-search-message-ids':'photo-user'},[photo]);
+ const newReply=el('div',{'data-content-search-unit-key':'fallback-turn-1:1:assistant'},[
+  el('h4',{'data-conversation-role':'assistant'}),el('p',{},['left red, right blue']),
+ ]);
+ for(const node of [oldUser,oldReply,newUser,newReply])document.body.appendChild(node);
+ const sandbox=sandboxOf({document});
+ const info=await sandbox.pageStep('inspect',{userBaseline:1,userId:'old-user',sentText:''});
+ assert.equal(info.users,2);assert.equal(info.userId,'photo-user');assert.equal(info.submitted,true);
+ assert.equal(info.replyBlocks,1);assert.equal(info.images,0);
+ const reply=await sandbox.pageStep('read',{submittedConfirmed:true,submittedUserId:'photo-user'});
+ assert.deepEqual(plain(reply.segments),[{type:'text',text:'left red, right blue'}]);
+ newUser.appendChild(el('div',{'data-user-message-bubble':''},['describe the photo']));
+ const mixed=await sandbox.pageStep('inspect',{});
+ assert.equal(mixed.users,2,'attachment wrapper and its text bubble identify the same user turn');
+ assert.equal(mixed.userText,'describe the photo');
+});
+
+test('missing config keeps the worker registered and reports setup steps without touching a pending task', async()=>{
+ const storage={current:{id:'pending',phase:'sending'}};
+ let listener,requests=0;
+ const chrome=stubChrome();
+ chrome.runtime.onMessage.addListener=callback=>{listener=callback;};
+ chrome.storage.local={get:async()=>storage,set:async values=>Object.assign(storage,plain(values))};
+ const sandbox=sandboxOf({chrome,importScripts:()=>{throw Error('NetworkError');},
+  fetch:async()=>{requests++;throw Error('must not fetch');}});
+ await wait();await sandbox.tick();
+ assert.match(storage.status,/config.js.*setup-web-bridge/);
+ assert.equal(storage.current.id,'pending');
+ assert.equal(requests,0);
+ const status=await new Promise(resolve=>assert.equal(listener({type:'status'},{},resolve),true));
+ assert.match(status.status,/config.js/);
+ assert.equal(status.bridgeUrl,'');
+ assert.equal(JSON.stringify(status).includes('token'),false);
+});
+
+test('invalid extension config produces actionable status and never sends credentials elsewhere', async()=>{
+ for(const config of [null,{url:'https://example.com',token:'test'},{url:'http://127.0.0.1:0',token:'test'},
+  {url:'http://127.0.0.1:65536',token:'test'},{url:'http://127.0.0.1:5141',token:''}]){
+  const storage={};let requests=0;
+  const chrome=stubChrome();chrome.storage.local.set=async values=>Object.assign(storage,plain(values));
+  const sandbox=sandboxOf({chrome,config,fetch:async()=>{requests++;}});
+  await wait();await sandbox.tick();
+  assert.match(storage.status,/本机地址或令牌无效/);
+  assert.equal(requests,0);
+ }
+});
+
+test('bridge authentication failure explains dataDir and preserves the current task', async()=>{
+ const storage={current:{id:'pending',phase:'waiting'}};
+ const chrome=stubChrome();chrome.storage.local.set=async values=>Object.assign(storage,plain(values));
+ const sandbox=sandboxOf({chrome,fetch:async()=>({ok:false,status:401})});
+ await wait();await sandbox.tick();
+ assert.match(storage.status,/401.*令牌不匹配.*dataDir/);
+ assert.equal(storage.current.id,'pending');
+});
 
 // ---------------------------------------------------------------- 回复序列化
 
@@ -90,7 +229,7 @@ test('a reply is serialized into ordered segments that keep its structure', asyn
   {type:'text',text:'1. 步骤一'},
   {type:'text',text:'> 引用内容'},
   {type:'code',language:'js',text:'const a = 1;'},
-  {type:'text',text:'| 列 | 值 |\n| a | 1 |'},
+  {type:'text',text:'| 列 | 值 |\n| --- | --- |\n| a | 1 |'},
   {type:'text',text:'---'},
  ]);
  assert.equal(result.imageCount,0);

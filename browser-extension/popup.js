@@ -3,6 +3,7 @@ async function refresh(){
  try{
   const s=await chrome.runtime.sendMessage({type:'status'});
   document.querySelector('#status').textContent=s.status;
+  document.querySelector('#environment').textContent=`扩展版本：${s.version||'未知'}\n本机地址：${s.bridgeUrl||'尚未配置'}`;
   lastFailure=s.lastFailure;
   const detail=document.querySelector('#failure'),button=document.querySelector('#open-failure');
   detail.hidden=!lastFailure;button.hidden=!lastFailure?.tabId;

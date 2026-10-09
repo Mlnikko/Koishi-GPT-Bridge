@@ -6,36 +6,28 @@ const { WebBridge } = require('./bridge/web-bridge.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
 const { JobQueue } = require('./core/queue.cjs');
+const { normalizeConfig } = require('./core/config.cjs');
 const { toSegments, sessionSegments, submissionText, imagesOf } = require('./core/message.cjs');
 const { toMessages } = require('./lib/reply.cjs');
 const { textMessage, safeReason } = require('./lib/feedback.cjs');
-const { downloadImage, MAX_INPUT_IMAGES } = require('./lib/image.cjs');
+const { downloadImage } = require('./lib/image.cjs');
+const { version } = require('../package.json');
 
 exports.name = 'codex-image-local';
 exports.apply = (ctx, config) => {
-  if (!config?.allowedUsers?.length) throw new Error('必须配置 allowedUsers');
+  config = normalizeConfig(config, path.join(__dirname, '..', 'data'));
   // `dataDir` only exists so tests and relocated installs can point the state
   // somewhere else; production uses the project's own data directory. `src/` is
   // one level down from the project root, hence the `..`.
-  const root = config.dataDir || path.join(__dirname, '..', 'data');
-  const positive = (key, fallback, min = 1) => {
-    const value = config[key] == null ? fallback : Number(config[key]);
-    if (!Number.isSafeInteger(value) || value < min) throw Error(`${key} 必须是至少 ${min} 的整数`);
-    return value;
-  };
-  const maxTextChars = positive('maxTextChars', 1500, 16);
-  const maxReplyChars = positive('maxReplyChars', 6000);
-  const maxInputImages = positive('maxInputImages', MAX_INPUT_IMAGES);
-  const sendTimeoutMs = positive('sendTimeoutMs', 20000);
-  const maxInputBytes = positive('maxInputBytes', 10 * 1024 * 1024);
-  const replyTimeoutMs = positive('replyTimeoutMs', 300000);
+  const { dataDir: root, maxTextChars, maxReplyChars, maxInputImages,
+    sendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
   // There is exactly one backend: the already-signed-in ChatGPT web page driven
   // by the local extension. Nothing here spawns an external CLI or needs API keys.
   const sessions = new Map(), locks = new Set();
   const chats = new Conversations(path.join(root, 'conversations.json'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141,
-    timeoutMs: replyTimeoutMs });
+    timeoutMs: replyTimeoutMs, pluginVersion: version });
   const busy = id => q.jobs.some(j => j.sessionId === id && ['queued', 'running'].includes(j.status));
   const labels = { queued: '排队中', running: 'ChatGPT 网页处理中', ready: '回复已取回', failed: '处理失败', cancelled: '已取消', interrupted: '服务重启，状态待确认' };
   const q = new JobQueue(path.join(root, 'jobs'), (j, signal, onThread) => {
@@ -67,7 +59,7 @@ exports.apply = (ctx, config) => {
       if (message) await send(session, message).catch(() => {});
     }
     else if (j.status === 'failed') {
-      try { await send(session, textMessage(`任务 ${j.id} 失败：${j.error}`)); j.feedbackDelivery = 'sent'; }
+      try { await send(session, textMessage(`任务 ${j.id} 失败：${safeReason(j.error)}`)); j.feedbackDelivery = 'sent'; }
       catch (err) {
         j.feedbackDelivery = 'failed'; j.deliveryError = String(err.message).slice(0, 300);
         try { ctx.logger('codex-image-local').warn(`任务 ${j.id} 的失败反馈未送达，请使用「桥接状态 ${j.id}」查询。`); } catch {}
@@ -141,7 +133,7 @@ exports.apply = (ctx, config) => {
   async function forward(session) {
     let segments;
     try { segments = sessionSegments(session); }
-    catch (err) { return textMessage(err.message); }
+    catch (err) { return textMessage(safeReason(err.message)); }
     if (!segments.length) return;
     const text = submissionText(segments);
     if (text.length > maxTextChars) return `文字最多 ${maxTextChars} 字，请缩短后重新发送。`;
@@ -152,7 +144,7 @@ exports.apply = (ctx, config) => {
     // 会话数达到上限时 ensure 会抛错，必须在这里拦住 —— 它发生在下面那个 try 之外。
     let chat;
     try { chat = chats.ensure(session.userId, conversation(session)); }
-    catch (err) { return textMessage(err.message); }
+    catch (err) { return textMessage(safeReason(err.message)); }
     const duplicate = session.messageId && q.jobs.find(j => j.owner === session.userId && j.conversation === conversation(session) && j.messageId === session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
     if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「桥接取消」停止后再试。';
@@ -175,7 +167,7 @@ exports.apply = (ctx, config) => {
       catch { job.deliveryError = '接收确认未送达'; q.save(job); }
       void q.pump();
     }
-    catch (err) { return textMessage(err.message); }
+    catch (err) { return textMessage(safeReason(err.message)); }
     finally { if (staging) { try { fs.rmSync(staging, { recursive: true, force: true }); } catch {} } }
   }
   const scope = ctx.intersect(authorized);
@@ -208,10 +200,19 @@ exports.apply = (ctx, config) => {
     return next();
   }, true);
   command('桥接帮助', '查看所有桥接命令和使用说明').action(help);
+  command('桥接连接', '检查本机服务和浏览器连接，不提交网页任务').action(async () => {
+    try { await web.ready; }
+    catch { return '本机桥接无法监听，请检查配置端口是否被占用并重启实例。'; }
+    const health = web.health();
+    return `插件版本：${health.pluginVersion}；协议：${health.version}\n`
+      + `本机桥接：已监听 127.0.0.1:${web.port}\n`
+      + `浏览器：${health.online ? '已连接' : '未在线，请打开 Chrome、重载扩展并检查扩展弹窗'}\n`
+      + `任务：${q.jobs.filter(j => ['queued', 'running'].includes(j.status)).length} 个待完成`;
+  });
   command('桥接日志 [mode:string]', '查看或切换过程通知（开启/关闭）').action(({ session }, mode) => logs(session, mode));
   const manage = fn => ({ session }, ...args) => {
     try { return textMessage(fn(session.userId, conversation(session), ...args)); }
-    catch (err) { return textMessage(err.message); }
+    catch (err) { return textMessage(safeReason(err.message)); }
   };
   const currentJob = (session, id) => q.find(id, session.userId, conversation(session),
     chats.current(session.userId, conversation(session))?.id);
@@ -263,9 +264,8 @@ exports.apply = (ctx, config) => {
     const previous = chats.current(owner, chat);
     if (previous) {
       if (busy(previous.id)) throw Error('当前会话仍在处理消息，请等待完成或先取消');
-      chats.close(previous.id, owner, chat);
     }
-    const s = chats.create(owner, chat, name);
+    const s = chats.reopen(owner, chat, name);
     return `已结束旧会话，开启新会话：${s.name}（${s.id}）。\n之后的消息进入全新的网页会话，不再携带旧上下文。`;
   }));
   // 兜底转发：注册在所有命令之后，所以命令优先，其余消息一律送去 ChatGPT。
@@ -273,7 +273,7 @@ exports.apply = (ctx, config) => {
   scope.middleware((session, next) => next(() => forward(session)));
   // Optional retention: reference images and replies are kept forever unless
   // retentionDays is set, because the window is a policy choice, not a technical one.
-  const retentionDays = Number(config.retentionDays) || 0;
+  const { retentionDays } = config;
   if (retentionDays > 0) {
     const log = message => { try { ctx.logger('codex-image-local').info(message); } catch {} };
     const prune = () => { try { const removed = q.prune(retentionDays); if (removed) log(`已清理 ${removed} 个超过 ${retentionDays} 天的任务`); } catch {} };

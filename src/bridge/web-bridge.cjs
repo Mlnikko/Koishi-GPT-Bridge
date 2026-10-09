@@ -7,6 +7,7 @@ const { failureInfo, safeReason } = require('../lib/feedback.cjs');
 const { pngSize } = require('../lib/image.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
 const { submissionText, imagesOf } = require('../core/message.cjs');
+const { writeJson } = require('../lib/state.cjs');
 
 const PROTOCOL_VERSION = 2;
 const JSON_BODY_LIMIT = 2 * 1024 * 1024;
@@ -25,6 +26,14 @@ const PHASES = {
 const validThread = id => /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id || '');
 
 function error(code, message) { return Object.assign(new Error(message), { code }); }
+
+function bindThread(p, id) {
+  if(!validThread(id) || (p.threadId && id!==p.threadId)) throw error('thread_mismatch','ChatGPT 会话不匹配，已停止');
+  if(p.threadId)return;
+  try { p.onThread(id); }
+  catch { throw error('state_write_failed','网页会话绑定保存失败，请检查本机状态目录后重试'); }
+  p.threadId=id;
+}
 
 // 网页侧报上来的原因。只做技术归类：模型的内容拒绝是正常回复，不是失败，
 // 它走 /result 回传给用户，绝不会走到这里。
@@ -75,7 +84,8 @@ function saveProbe(dir, filename, probe) {
 }
 
 class WebBridge {
-  constructor({ root, port = 5141, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  constructor({ root, port = 5141, timeoutMs = DEFAULT_TIMEOUT_MS, pluginVersion = 'development' }) {
+    this.pluginVersion=pluginVersion; this.startedAt=Date.now();
     this.root=root; this.timeoutMs=timeoutMs; this.pending=null; this.lastSeen=0; this.lastResult=null; this.tail=Promise.resolve(); this.queued=0; this.closed=false;
     fs.mkdirSync(root,{recursive:true,mode:0o700});
     const tokenFile=path.join(root,'web-bridge-token');
@@ -91,6 +101,11 @@ class WebBridge {
     });});
     this.ready.catch(()=>{});
   }
+  health() {
+    return { version:PROTOCOL_VERSION,pluginVersion:this.pluginVersion,
+      online:!this.closed&&this.lastSeen>0&&Date.now()-this.lastSeen<=90000,
+      lastSeen:this.lastSeen,busy:!!this.pending,uptimeMs:Date.now()-this.startedAt };
+  }
   requestInfo() {
     const p=this.pending;
     if(!p)return null;
@@ -104,11 +119,11 @@ class WebBridge {
     const send=(status,data)=>{res.writeHead(status,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(data));};
     const token=String(req.headers['x-bridge-token']||'');
     if(Buffer.byteLength(token)!==Buffer.byteLength(this.token) || !timingSafeEqual(Buffer.from(token),Buffer.from(this.token))) return send(401,{error:'unauthorized'});
-    this.lastSeen=Date.now();
     let requestPending;
     try {
-      if(req.method==='GET' && req.url==='/state') return send(200,{job:this.requestInfo(),version:PROTOCOL_VERSION});
-      if(req.method==='GET' && req.url.startsWith('/input')) {
+      if(req.method==='GET' && req.url==='/health') return send(200,this.health());
+      if(req.method==='GET' && req.url==='/state') { this.lastSeen=Date.now();return send(200,{job:this.requestInfo(),version:PROTOCOL_VERSION}); }
+      if(req.method==='GET' && new URL(req.url,'http://127.0.0.1').pathname==='/input') {
         const url=new URL(req.url,'http://127.0.0.1'),p=this.pending;
         if(!p || url.searchParams.get('id')!==p.job.id) return send(409,{error:'job is no longer active'});
         const images=imagesOf(p.job.input);
@@ -154,8 +169,7 @@ class WebBridge {
       requestPending=p;
       if(url.pathname==='/progress') {
         if(body.threadId){
-          if(!validThread(body.threadId) || (p.threadId && body.threadId!==p.threadId)) throw error('thread_mismatch','ChatGPT 会话不匹配，已停止');
-          if(!p.threadId){p.threadId=body.threadId;p.onThread(body.threadId);}
+          bindThread(p,body.threadId);
         }
         if(body.phase==='submitted'&&body.evidence&&!p.submissionSaved){
           saveProbe(p.job.dir,'submission.json',body.evidence);p.submissionSaved=true;
@@ -173,8 +187,7 @@ class WebBridge {
       }
       if(url.pathname==='/result') {
         if(p.cancelled){p.finish(p.cancelled);return send(409,{error:'cancelled'});}
-        if(!validThread(body.threadId) || (p.threadId && body.threadId!==p.threadId)) throw error('thread_mismatch','ChatGPT 返回的会话与任务不一致');
-        if(!p.threadId){p.threadId=body.threadId;p.onThread(body.threadId);}
+        bindThread(p,body.threadId);
         // The extension also snapshots the page when the reply came from a scan
         // rather than the assistant turn, which is how a wrong picture (e.g. the
         // signed-in account avatar) can be handed back. Keep that snapshot beside
@@ -184,8 +197,7 @@ class WebBridge {
         // Commit the structured reply before acknowledging receipt. Queue startup
         // can recover this if the process dies before job.json reaches ready.
         const receipt=path.join(p.job.dir,'result.json');
-        fs.writeFileSync(receipt+'.tmp',JSON.stringify({id:p.job.id,threadId:body.threadId,segments}),{mode:0o600});
-        fs.renameSync(receipt+'.tmp',receipt);
+        writeJson(receipt,{id:p.job.id,threadId:body.threadId,segments});
         // Keep a plain-text copy so a truncated QQ delivery can be replayed and so
         // a bad reply can be inspected without re-reading the web page.
         try { fs.writeFileSync(path.join(p.job.dir,'reply.md'),replyText(segments),{mode:0o600}); } catch {}
@@ -208,11 +220,12 @@ class WebBridge {
   }
   async runActive(job,{threadId,onThread=()=>{},onProgress=()=>{},signal,timeoutMs=this.timeoutMs}={}) {
     try {await this.ready;}catch {throw error('bridge_unavailable','ChatGPT 网页连接器无法监听本机端口，请检查 5141 端口');}
+    if(this.closed)throw error('interrupted','网页连接器已关闭，任务未提交');
     if(this.pending)throw error('bridge_busy','ChatGPT 网页连接器正在处理其他任务');
     if(threadId && !validThread(threadId))throw error('thread_invalid','ChatGPT 会话编号无效');
     if(signal?.aborted)throw error('cancelled','任务已取消');
     if(Date.now()-this.lastSeen>90000)throw error('browser_offline','ChatGPT 网页连接器未在线。请打开 Chrome 并启用扩展，等待连接后重试');
-    if(threadId)onThread(threadId);
+    if(threadId)bindThread({onThread},threadId);
     const report=onProgress;
     onProgress=phase=>{try{report(phase);}catch{}};
     return new Promise((resolve,reject)=>{

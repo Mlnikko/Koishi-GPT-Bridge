@@ -4,6 +4,51 @@ const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
+test('local doctor uses the actual port without changing browser availability or exposing its token', async t=>{
+ const {b,root,call}=await setup(t);
+ const {inspect}=require('../../scripts/doctor.cjs');
+ const before=await inspect({dataDir:root});
+ assert.equal(before.port,b.port);assert.equal(before.online,false);
+ assert.equal(b.lastSeen,0);assert.ok(!JSON.stringify(before).includes(b.token));
+ await call('/state');
+ assert.equal((await inspect({dataDir:root})).online,true);
+});
+test('closing while a task awaits bridge readiness cannot create a pending task afterwards', async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ let release;b.ready=new Promise(resolve=>{release=resolve;});
+ const result=b.run(job).catch(err=>err);await new Promise(setImmediate);
+ b.close();release();await new Promise(setImmediate);
+ if(b.pending)b.pending.finish(Object.assign(Error('late pending task'),{code:'test_cleanup'}));
+ assert.equal((await result).code,'interrupted');
+ assert.equal(b.pending,null);
+});
+
+test('failed thread persistence fails the task immediately instead of losing its binding', async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const result=b.run(job,{onThread:()=>{throw Error('disk full at /private/secret');}}).catch(err=>err);
+ await new Promise(setImmediate);
+ const response=await call('/progress',{id:job.id,threadId:id,phase:'submitted'});
+ assert.equal(response.status,400);
+ if(b.pending)b.pending.finish(Object.assign(Error('binding remained pending'),{code:'test_cleanup'}));
+ const err=await result;
+ assert.equal(err.code,'state_write_failed');
+ assert.ok(!err.message.includes('/private/secret'));
+ assert.equal(b.pending,null);
+});
+test('health and rejected diagnostic routes never advertise a nonexistent browser', async t=>{
+ const {b,job,call}=await setup(t);
+ assert.equal((await call('/health',undefined,'wrong')).status,401);
+ assert.equal((await(await call('/health')).json()).online,false);
+ assert.equal((await call('/input?id=probe')).status,409);
+ assert.equal((await call('/inputs')).status,404);
+ assert.equal(b.lastSeen,0);
+ await assert.rejects(b.run(job),err=>err.code==='browser_offline');
+ await call('/state');
+ const health=await(await call('/health')).json();
+ assert.equal(health.online,true);
+ assert.equal(health.version,PROTOCOL_VERSION);
+ assert.ok(!JSON.stringify(health).includes(b.token));
+});
 test('a late upload from an ended task cannot write assets or fail the next task', async t=>{
  const {b,job,call}=await setup(t);await call('/state');
  const first=b.run(job).catch(e=>e);await new Promise(setImmediate);

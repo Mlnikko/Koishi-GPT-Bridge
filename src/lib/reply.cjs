@@ -21,8 +21,6 @@ const TRUNCATED_NOTICE = '（回复过长，以上为前一部分；完整内容
 
 function replyError(code, message) { return Object.assign(new Error(message), { code }); }
 
-const FENCE = /^\s*(?:```|~~~)/;
-
 // 网页侧只允许这三种片段；其余一律拒收，宁可整条失败也不落盘半截回复。
 function validateSegments(input, { uploaded = 0 } = {}) {
   if (!Array.isArray(input) || !input.length) throw replyError('empty_reply', '网页没有返回可用的回复内容');
@@ -54,10 +52,26 @@ function validateSegments(input, { uploaded = 0 } = {}) {
 }
 
 // 代码块还原成围栏文本；语言名只保留安全字符，避免把模型输出拼成畸形标记。
-function fenceCode(segment) {
+function codeFrame(segment) {
   const language = String(segment.language || '').replace(/[^\w+#.-]/g, '').slice(0, 32);
   const body = String(segment.text ?? '').replace(/\n+$/, '');
-  return `\`\`\`${language}\n${body}\n\`\`\``;
+  const longest = Math.max(0, ...Array.from(body.matchAll(/`+/g), match => match[0].length));
+  const marker = '`'.repeat(Math.max(3, longest + 1));
+  return { body, open: marker + language + '\n', close: '\n' + marker };
+}
+function fenceCode(segment) { const { open, body, close } = codeFrame(segment); return open + body + close; }
+
+function unicodePrefix(text, width) {
+  let end = Math.max(0, Math.floor(width));
+  if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1] || '')) end--;
+  return text.slice(0, end);
+}
+
+function truncateSegment(segment, width) {
+  if (segment.type !== 'code') return unicodePrefix(String(segment.text ?? ''), width);
+  const { open, body, close } = codeFrame(segment);
+  const content = unicodePrefix(body, width - open.length - close.length);
+  return content ? open + content + close : '';
 }
 
 // 完整回复文本（含代码围栏），用于 reply.md 与「桥接重发」。
@@ -94,9 +108,16 @@ function splitText(text, maxChars) {
   let pending = [], fence = null, code = [];
   const flush = () => { chunks.push(...plain(pending.join('\n'), limit)); pending = []; };
   const flushCode = () => {
-    const open = fence.open, close = fence.marker;
-    const width = limit - open.length - close.length - 2;
-    if (width < 2) chunks.push(...plain([open, ...code, close].join('\n'), limit));
+    let open = fence.open;
+    const close = fence.marker;
+    let width = limit - open.length - close.length - 2;
+    // A valid small limit can be shorter than the language label. Keep closed
+    // fences without that label; if even the marker cannot fit, use Markdown's
+    // indented code form rather than splitting an opening/closing fence.
+    if (width < 2) { open = close; width = limit - open.length - close.length - 2; }
+    if (width < 2) {
+      for (const line of code) for (const part of plain(line, Math.max(2, limit - 4))) chunks.push('    ' + part);
+    }
     else for (const part of plain(code.join('\n'), width)) chunks.push(open + '\n' + part + '\n' + close);
     fence = null; code = [];
   };
@@ -135,9 +156,14 @@ function toMessages(segments, { maxChars = 1500, maxTotal = 6000 } = {}) {
     if (segment.type === 'image') { flush(); messages.push({ type: 'image', asset: segment.asset }); continue; }
     const text = segment.type === 'code' ? fenceCode(segment) : String(segment.text ?? '');
     if (!text.trim()) continue;
-    if (budget <= 0) { truncated = true; continue; }
-    if (text.length > budget) { pending.push(text.slice(0, budget)); budget = 0; truncated = true; continue; }
-    budget -= text.length;
+    const separator = pending.length ? 2 : 0;
+    if (budget <= separator) { truncated = true; budget = 0; continue; }
+    if (text.length > budget - separator) {
+      const prefix = truncateSegment(segment, budget - separator);
+      if (prefix) pending.push(prefix);
+      budget = 0; truncated = true; continue;
+    }
+    budget -= text.length + separator;
     pending.push(text);
   }
   flush();

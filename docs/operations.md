@@ -1,6 +1,6 @@
 # 运维
 
-## 部署位置（当前为 Windows）
+## 已有 Windows 部署示例
 
 - 项目位于 `D:\Projects\Koishi\koishi-codex-image-bridge`。
 - Koishi Desktop 主程序 `C:\Program Files\Koishi\Desktop\bin\koishi.exe`；实例目录
@@ -10,7 +10,8 @@
   因此改代码后重启实例即生效，不需要重新链接，也不需要重装。
 - QQ 适配器密钥仍保留在 Koishi 实例的 `.env`，不存放在开发项目内。
 
-本工具目前只保证 Windows 可用。`package.json` 的 `engines` 要求 Node ≥ 20。
+扩展面向 macOS / Windows 的 Chrome 120+，使用同一份代码。建议 Node 22 LTS 或更高版本运行 Koishi 和测试。
+仓库 CI 配置覆盖 macOS / Windows 的 Node 20、22、24；远端 CI 与真实登录页、QQ 回传需分别验收。
 
 ## 重启
 
@@ -18,11 +19,15 @@
 
 Windows 上没有 `koi` 命令（`C:\Program Files\Koishi\Desktop\koi.exe` 是 GUI 启动器，`bin/` 下只有 `koishi.exe`
 和 `yarn.cjs`），重启只能在 Koishi Desktop 的托盘/界面里手动操作实例。
-macOS 上的 `/Applications/Koishi.app/Contents/MacOS/koi restart default` 在这里不适用。
+macOS 同样在 Koishi Desktop 的实例管理界面重启对应实例。不要照搬上述 Windows 盘符或未经确认的应用内部 CLI 路径。
 
 桥接令牌固定保存在 `data/web-bridge-token`，重启会复用同一个值，因此不必重跑 `setup-web-bridge.cjs`。
 
 ## 判断运行中的实例是否加载了新代码
+
+0.3.4 起优先使用 `npm run doctor` 或在 QQ 发送「桥接连接」，直接核对运行中插件版本与扩展心跳。自定义目录使用 `npm run doctor -- "/实际/dataDir"`。这两种检查不会提交网页任务，也不会更新浏览器在线时间；服务返回旧版 404 表示仍需重启实例。
+
+以下 `/input` 探针只用于识别更早版本，不用于 0.3.4 的在线诊断：
 
 用正确令牌请求：
 
@@ -34,7 +39,7 @@ curl -H "x-bridge-token: $(cat data/web-bridge-token)" \
 - 返回 `409 {"error":"job is no longer active"}` → 已加载含 `/input` 的新代码。
 - 返回 `404 {"error":"not found"}` → 仍是旧代码，需重启。
 
-注意：带正确令牌的请求会刷新在线时间戳，使桥接在 90 秒内认为扩展在线。
+旧版中带正确令牌的请求会刷新在线时间戳；0.3.4 只有 `/state` 轮询刷新它。
 
 更直接的办法是看日志，每次加载都会留一行：
 
@@ -48,7 +53,8 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
 ## 连接器的安装与维护
 
 安装：运行 `node scripts/setup-web-bridge.cjs`，在 Chrome 扩展管理页开启开发者模式，加载 `browser-extension` 文件夹。
-扩展只申请 ChatGPT 页面、本机 5141 端口、脚本注入、扩展存储和定时任务权限。
+扩展只申请 ChatGPT 页面、IPv4 本机回环地址、脚本注入、扩展存储和定时任务权限。
+回环 host permission 使用 `http://127.0.0.1/*`；实际端口由 config.js 指定，不访问局域网其他主机。
 `browser-extension/config.js` 与 `data/web-bridge-token` 保存随机本机连接令牌，均需私密保存；
 两者都已 gitignore，不含 QQ 或 ChatGPT 登录凭据。
 
@@ -57,6 +63,34 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
 
 若把 `webBridgePort` 改成非 5141，需要重跑并带上端口：
 `node scripts/setup-web-bridge.cjs <端口>`。
+
+## macOS / Windows 安装与验收
+
+1. 确认 Chrome 120+、Koishi 和本项目在同一台机器上。插件加载路径必须指向这台机器上的项目目录。
+2. 在项目目录运行 `node scripts/setup-web-bridge.cjs`。使用非默认端口或自定义 `dataDir` 时，运行
+   `node scripts/setup-web-bridge.cjs <端口> "<Koishi 实际数据目录的绝对路径>"`。
+   路径含空格或中文时加引号；脚本复用已有令牌，不覆盖它，非法端口直接报错。
+3. 启动或重启 Koishi 实例，在 `chrome://extensions` 加载或重载 browser-extension。
+   打开弹窗确认版本 0.3.4、本机地址及“已连接本机 Koishi，等待任务”；再用“桥接连接”确认插件也是 0.3.4。
+4. 在相同 Chrome 用户配置中登录 ChatGPT 普通聊天，允许扩展访问 ChatGPT 网站。
+   依次验证短文字、参考图片、图文混合和同一会话连续两轮；网页每个任务只新增一轮用户消息，QQ 收到本轮回复。
+5. 等待任务完成后重启 Chrome，再验证连接和一条短文字。电脑睡眠或 Chrome 完全退出时不处理任务，唤醒后检查连接再发送。
+
+macOS 现场已发现的启动故障：扩展管理页显示 `Service worker registration failed. Status code: 15`，
+具体异常为导入 config.js 失败。该文件含令牌，被 Git 忽略，克隆项目不会自动生成。
+0.3.3 将此情况改为弹窗可读的安装提示；生成配置并重载扩展才会建立连接。
+
+排障按实际状态判断：
+
+| 状态 | 操作 |
+| --- | --- |
+| config.js 无法加载或无效 | 用上述安装脚本生成配置，然后重载扩展；不要从另一台机器复制令牌。 |
+| HTTP 401、令牌不匹配 | 核对插件 dataDir 与脚本第 2 个参数；用运行中实例的实际目录生成配置并重载。 |
+| Failed to fetch / 连接超时 | 确认 Koishi 实例已启动、端口一致，检查 VPN/代理是否代理 127.0.0.1、扩展网站访问权限及系统实际显示的网络拦截。 |
+| 已连接，但网页操作失败 | 查看专用标签页、弹窗最近失败及任务目录 dom-probe.json；这属于登录/网页结构问题，不能仅根据操作系统判定原因。 |
+
+已安装的扩展可以直接重载启用本次修改；扩展管理页的旧错误记录可能仍保留，请以重载后的弹窗状态为准。
+代码检查与本机 HTTP 测试不等于两端真实 Chrome / QQ 全链路验收。
 
 ## QQ 适配器版本要求（图片消息不能带空行）
 
@@ -153,7 +187,9 @@ Koishi Desktop 重启实例，于是形成「升级 → 重启 → 再升级」�
 ## 验证命令
 
 ```bash
-npm test          # 等价于 node --test "test/**/*.test.cjs"
+npm run check     # 语法、版本、入口与扩展导入
+npm test          # 显式发现并运行全部嵌套测试
+npm run doctor    # 运行中实例的只读健康检查
 ```
 
 覆盖消息元素 → 片段的顺序与裁剪、回复片段校验与按段落拆分、去重、串行取消、重启、

@@ -5,6 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { MAX_INPUT_IMAGES } = require('../lib/image.cjs');
 const { submissionText, imagesOf, isEmpty } = require('./message.cjs');
 const { validateSegments } = require('../lib/reply.cjs');
+const { writeJson } = require('../lib/state.cjs');
 
 // 任务负载的版本号。生图时代的任务没有这个字段，语义也已不适用，
 // 载入时直接跳过（不删除），把目录留给用户自己处理。
@@ -56,7 +57,7 @@ class JobQueue {
   save(j) {
     j.updatedAt = Date.now();
     const p = path.join(j.dir, 'job.json');
-    fs.writeFileSync(p + '.tmp', JSON.stringify(j, null, 2), { mode: 0o600 }); fs.renameSync(p + '.tmp', p);
+    writeJson(p, j);
   }
   // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
   // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
