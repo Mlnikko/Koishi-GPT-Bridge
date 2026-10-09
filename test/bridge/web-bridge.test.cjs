@@ -4,6 +4,20 @@ const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
+test('explicit reasoning requires a capable extension and is advertised in the task', async t=>{
+ const {b,job,call}=await setup(t);
+ job.reasoningEffort='high';
+ await call('/state');
+ await assert.rejects(b.run(job),err=>err.code==='browser_upgrade');
+ const request={method:'GET',url:'/state',headers:{'x-bridge-token':b.token,'x-bridge-capabilities':'reasoning'}};
+ await b.handle(request,{writeHead:()=>{},end:()=>{}});
+ const result=b.run(job).catch(err=>err);await new Promise(setImmediate);
+ assert.equal(b.requestInfo().reasoningEffort,'high');
+ // An older extension appearing during polling must never receive this job.
+ const old=await(await call('/state')).json();
+ assert.equal(old.job,null);
+ assert.equal((await result).code,'browser_upgrade');
+});
 test('local doctor uses the actual port without changing browser availability or exposing its token', async t=>{
  const {b,root,call}=await setup(t);
  const {inspect}=require('../../scripts/doctor.cjs');

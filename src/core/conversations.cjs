@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const { writeJson } = require('../lib/state.cjs');
+const { normalizeReasoning } = require('./reasoning.cjs');
 // 默认会话的名字。每条消息都自动落到一个持续会话里，所以「没有会话」不是一种
 // 正常状态：`ensure` 会在第一次收到消息时就把这个会话建出来。
 const DEFAULT_NAME = '默认会话';
@@ -54,6 +55,16 @@ class Conversations {
     if (!name?.trim()) throw Error('请输入新名称');
     name = this.name(name);
     return this.commit(data => { data.items.find(item => item.id === id).name = name; return id; });
+  }
+  setReasoning(id, owner, chat, value) {
+    const s = this.get(id, owner, chat); if (!s) throw Error('未找到你的会话');
+    const level = normalizeReasoning(value);
+    return this.commit(data => {
+      const item = data.items.find(item => item.id === id);
+      if (level === 'default') delete item.reasoningEffort;
+      else item.reasoningEffort = level;
+      return id;
+    });
   }
   close(id, owner, chat) {
     const s = this.get(id, owner, chat); if (!s) throw Error('未找到你的会话');

@@ -67,6 +67,7 @@ async function waitForComposer(current,info){
  if(!current.recoveryCount&&!current.sentAt&&!current.attachSent&&info.recoverySafe===true&&!info.unknownDrafts&&!info.attachments&&!info.stopping){
   current.recoveryCount=1;current.openedAt=now;delete current.composerWaitAt;
   delete current.historySeen;delete current.historyStreak;
+  delete current.reasoningApplied;delete current.reasoningAttempts;delete current.reasoningVerify;
   await store(current,'输入框未就绪，正在重新加载原网页会话（仅一次）');
   await chrome.tabs.reload(current.tabId);return;
  }
@@ -95,6 +96,17 @@ async function returnReply(current){
 async function returnFailure(current){
  await api('/failure',{id:current.id,...current.failure});
  await store(null,'任务失败：'+current.failure.message);
+}
+async function applyReasoning(current){
+ current.phase='reasoning';current.reasoningAttempts=(current.reasoningAttempts||0)+1;
+ if(current.reasoningAttempts>12)throw Error('网页推理程度切换超时，无法确认所选程度；本次未提交');
+ await store(current,'正在切换网页推理程度：'+current.reasoningEffort);
+ const reasoning=await page(current.tabId,'reasoning',current);
+ if(reasoning.verify){current.reasoningVerify=true;await store(current,'正在读回菜单关闭后的推理程度');}
+ if(!reasoning.applied)return;
+ if(reasoning.level!==current.reasoningEffort)throw Error('网页推理程度与任务不一致；本次未提交');
+ current.reasoningApplied=reasoning.level;current.phase='opening';
+ await store(current,'网页推理程度已确认：'+reasoning.level);
 }
 async function tick(){
  if(ticking)return;ticking=true;
@@ -130,6 +142,9 @@ async function tick(){
    await api('/failure',{id:task.id,message:'任务已取消'});await store(null,'任务已取消');return;
   }
   if(current.phase==='returning'){await returnReply(current);return;}
+  // A modal model menu may aria-hide the composer. Finish and close our menu
+  // before inspecting the composer again, including after worker suspension.
+  if(current.phase==='reasoning'){await applyReasoning(current);return;}
   const info=await page(current.tabId,'inspect',current);
   if(info.loading){
    if(Date.now()-(current.sentAt||current.openedAt)> (current.sentAt?240000:60000))throw Error('ChatGPT 页面加载超时，请检查专用标签页');
@@ -176,6 +191,7 @@ async function tick(){
     if(current.historyStreak<2)return;
     if(Date.now()-current.openedAt<(info.assistants?8000:15000))return;
    }
+   if(current.reasoningEffort&&current.reasoningApplied!==current.reasoningEffort){await applyReasoning(current);return;}
    current.baseline=info.assistants;
    current.assistantId=info.assistantId;
    // Count the user's turns before submitting: the new turn is what proves the
@@ -231,6 +247,8 @@ async function tick(){
    current.phase='filled';current.filledAt=Date.now();await store(current,'消息已填写，等待输入框完成更新');return;
   }
   if(current.phase==='filled'){
+   if(current.reasoningEffort&&current.reasoningApplied!==current.reasoningEffort)
+    throw Error('网页推理程度未经确认；本次未提交，请重新发送');
    // Wait a separate polling turn for the editor to commit React state.
    // Persist before clicking: crashes in this gap fail closed, never duplicate.
    current.phase='sending';current.sentAt=Date.now();await store(current,'正在提交 ChatGPT');
@@ -277,6 +295,7 @@ async function tick(){
     workerVersion:chrome.runtime.getManifest?.().version||'development',userId:info.userId||'',
     userBaseline:current.userBaseline,users:info.users,assistantBaseline:current.baseline,assistants:info.assistants,
     assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
+    ...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort,reasoningApplied:current.reasoningApplied}:{}),
    },timing:current.timing});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
   }

@@ -71,7 +71,7 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
    `node scripts/setup-web-bridge.cjs <端口> "<Koishi 实际数据目录的绝对路径>"`。
    路径含空格或中文时加引号；脚本复用已有令牌，不覆盖它，非法端口直接报错。
 3. 启动或重启 Koishi 实例，在 `chrome://extensions` 加载或重载 browser-extension。
-   打开弹窗确认版本 0.3.5、本机地址及“已连接本机 Koishi，等待任务”；再用“/status”确认插件也是 0.3.5。
+   打开弹窗确认版本 0.3.6、本机地址及“已连接本机 Koishi，等待任务”；再用“/status”确认插件也是 0.3.6。
 4. 在相同 Chrome 用户配置中登录 ChatGPT 普通聊天，允许扩展访问 ChatGPT 网站。
    依次验证短文字、参考图片、图文混合和同一会话连续两轮；网页每个任务只新增一轮用户消息，QQ 收到本轮回复。
 5. 等待任务完成后重启 Chrome，再验证连接和一条短文字。电脑睡眠或 Chrome 完全退出时不处理任务，唤醒后检查连接再发送。

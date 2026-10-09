@@ -365,10 +365,10 @@ test('the plugin refuses to load without an allowedUsers list', () => {
 
 const slash = (app, text, options = {}) => dispatch(app, session({ ...options, elements: [{ type: 'text', attrs: { content: text } }] }), text);
 
-test('help lists exactly eight short commands and slash commands stay local and authorized', async () => {
+test('help lists all nine short commands and slash commands stay local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
@@ -416,13 +416,58 @@ test('removed Chinese commands only show the migration notice and never create j
 
 test('all short commands remain gated by private authorization and group mentions', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
-  for (const text of ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs off']) {
+  for (const text of ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
     assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
     assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
   }
   assert.deepEqual(jobFiles(app.root), []);
   assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
   assert.equal(fs.existsSync(path.join(app.root, 'preferences.json')), false);
+});
+test('/reasoning stays local, validates input and follows the selected conversation', async () => {
+  const app = apply({ groupChat: true });
+  assert.match(await slash(app, '/reasoning'), /跟随网页/);
+  assert.match(await slash(app, '/reasoning wat'), /用法/);
+  assert.match(await slash(app, '/reasoning high extra'), /用法/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.match(await slash(app, '/REASONING 高'), /已设为：高/);
+  const first = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
+  assert.equal(first.reasoningEffort, 'high');
+  assert.match(await slash(app, '/reasoning', { userId: 'bob' }), /跟随网页/);
+  assert.match(await slash(app, '/reasoning', { isDirect: false, channelId: 'group', stripped: { appel: true } }), /跟随网页/);
+  await slash(app, '/new second');
+  assert.match(await slash(app, '/reasoning'), /跟随网页/);
+  await slash(app, `/chat ${first.id}`);
+  assert.match(await slash(app, '/reasoning'), /当前会话推理程度：高/);
+  assert.match(await slash(app, '/reasoning default'), /跟随网页/);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('/reasoning changes only future jobs and the snapshot reaches the browser bridge', async () => {
+  const app = apply({ notifyProgress: false });
+  const { port, token } = await bridgeOf(app.root);
+  const headers = { 'x-bridge-token': token, 'x-bridge-capabilities': 'reasoning', 'Content-Type': 'application/json' };
+  const state = async () => (await (await fetch(`http://127.0.0.1:${port}/state`, { headers })).json()).job;
+  await state();
+  await slash(app, '/reasoning medium');
+  const s = session({ elements: [{ type: 'text', attrs: { content: 'hello' } }] });
+  await dispatch(app, s); await wait();
+  const first = await state();
+  assert.equal(first.reasoningEffort, 'medium');
+  await slash(app, '/reasoning xhigh');
+  assert.equal((await state()).reasoningEffort, 'medium');
+  assert.match(await slash(app, '/status'), /推理程度：中/);
+  await fetch(`http://127.0.0.1:${port}/failure`, { method: 'POST', headers,
+    body: JSON.stringify({ id: first.id, message: '网页推理程度测试结束' }) });
+  await settle(app.root); await wait();
+  s.messageId = 'm2';
+  await dispatch(app, s); await wait();
+  const second = await state();
+  assert.equal(second.reasoningEffort, 'xhigh');
+  assert.equal(jobFiles(app.root).find(j => j.id === second.id).reasoningEffort, 'xhigh');
+  await fetch(`http://127.0.0.1:${port}/failure`, { method: 'POST', headers,
+    body: JSON.stringify({ id: second.id, message: '网页推理程度测试结束' }) });
+  await settle(app.root);
 });
 
 test('bare words, unknown slash text and command-looking image captions are forwarded as content', async () => {

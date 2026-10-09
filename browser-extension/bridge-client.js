@@ -34,7 +34,7 @@ async function loadInputs(task){
  inputs.set(task.id,list);return list;
 }
 async function api(route,body){
- const response=await bridgeFetch(bridgeConfig.url+route,{method:body?'POST':'GET',headers:{'x-bridge-token':bridgeConfig.token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});
+ const response=await bridgeFetch(bridgeConfig.url+route,{method:body?'POST':'GET',headers:{'x-bridge-token':bridgeConfig.token,'x-bridge-capabilities':'reasoning','Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});
  if(!response.ok)throw new Error('本机连接器返回 '+response.status);
  try{return await response.json();}catch(err){err.retryable=true;throw err;}
 }

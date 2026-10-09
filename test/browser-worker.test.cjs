@@ -1227,6 +1227,73 @@ function openingWorker(info){
  return worker({state:{id:'session-management',threadId:THREAD,text:'hello'},
   results:op=>op==='inspect'?info:op==='submit'?{filled:true}:op==='probe'?{phase:'opening'}:{}});
 }
+for(const hasImages of [false,true])test('reasoning is confirmed before upload or fill and survives a worker restart; images='+hasImages,async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'high'};
+ const info={editor:true,threadId:THREAD,assistants:1,users:1};
+ const {sandbox,storage,calls}=worker({state:task,results:op=>op==='inspect'?info:
+  op==='reasoning'?{pending:true}:op==='submit'?{filled:true}:op==='send'?{clicked:true}:op==='probe'?{}:{}});
+ await wait();storage.current=openingJob({reasoningEffort:'high',hasImages,images:hasImages?[{index:0}]:[]});
+ await sandbox.tick();
+ assert.equal(storage.current.phase,'reasoning');assert.equal(storage.current.reasoningAttempts,1);
+ assert.equal(opsOf(calls,'attach').length,0);assert.equal(opsOf(calls,'submit').length,0);
+ // Recreate the worker with just its durable state, then confirm the selector.
+ const next=worker({state:task,storageSeed:storage,results:op=>op==='inspect'?info:
+  op==='reasoning'?{applied:true,level:'high'}:op==='submit'?{filled:true}:op==='probe'?{}:{}});
+ await wait();
+ assert.equal(next.storage.current.phase,'opening');
+ await next.sandbox.tick();
+ assert.equal(next.storage.current.reasoningApplied,'high');assert.equal(next.storage.current.phase,hasImages?'attaching':'filled');
+ assert.equal(opsOf(next.calls,'submit').length,hasImages?0:1);
+ if(!hasImages){
+  assert.equal(opsOf(next.calls,'submit')[0].job.message,'hello');
+  assert.equal(opsOf(next.calls,'submit')[0].job.reasoningEffort,'high');
+ }
+});
+
+test('closed-menu reasoning verification is durable and cannot fill before readback',async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'high'};
+ const {sandbox,storage,calls}=worker({state:task,results:{reasoning:{pending:true,verify:true}}});
+ await wait();storage.current=openingJob({phase:'reasoning',reasoningEffort:'high'});
+ await sandbox.tick();
+ assert.equal(storage.current.reasoningVerify,true);assert.equal(storage.current.phase,'reasoning');
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
+ const next=worker({state:task,storageSeed:storage,results:(op,job)=>{
+  if(op==='reasoning'){
+   assert.equal(job.reasoningVerify,true);
+   return {error:'网页推理程度在关闭菜单后发生变化；本次未提交'};
+  }
+  return {};
+ }});
+ await wait();
+ assert.equal(routeOf(next.calls,'/failure').length,1);
+ assert.equal(opsOf(next.calls,'submit').length,0);assert.equal(opsOf(next.calls,'send').length,0);
+});
+
+for(const result of [{error:'当前账号不支持推理程度 pro；本次未提交'},{applied:true,level:'medium'}])
+test('unsupported or mismatched reasoning cannot submit a prompt '+JSON.stringify(result),async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'pro'};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,threadId:THREAD,assistants:1,users:1},reasoning:result,probe:{}}});
+ await wait();storage.current=openingJob({reasoningEffort:'pro'});
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,1);
+ assert.match(routeOf(calls,'/failure')[0].body.message,/推理程度/);
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
+});
+
+test('unresponsive reasoning controls time out without filling, sending or refreshing',async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'high'};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,threadId:THREAD,assistants:1,users:1},reasoning:{pending:true},probe:{}}});
+ await wait();storage.current=openingJob({reasoningEffort:'high',reasoningAttempts:12});
+ await sandbox.tick();assert.equal(routeOf(calls,'/failure').length,1);
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);assert.equal(routeOf(calls,'tabs.reload').length,0);
+});
+
+test('an unverified effort in a restored filled task cannot be sent',async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'high'};
+ const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,threadId:THREAD},probe:{}}});
+ await wait();storage.current=openingJob({phase:'filled',reasoningEffort:'high'});
+ await sandbox.tick();assert.equal(routeOf(calls,'/failure').length,1);assert.equal(opsOf(calls,'send').length,0);
+});
 
 test('transient duplicate composers settle without reloading or dropping the task',async()=>{
  const info={editor:false,editorAmbiguous:true,threadId:THREAD,assistants:1,users:1};

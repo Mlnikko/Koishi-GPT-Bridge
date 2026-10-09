@@ -6,6 +6,17 @@ const path = require('node:path');
 const { JobQueue, JOB_VERSION } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, segments: [{ type: 'text', text: 'a cat' }] });
+test('queued reasoning is validated and retained across restarts and duplicate messages', () => {
+  const dir = root(), q = new JobQueue(dir, async () => {});
+  assert.throws(() => q.enqueue({ ...input('invalid'), reasoningEffort: 'unknown' }), /用法/);
+  assert.equal(q.jobs.length, 0); assert.deepEqual(fs.readdirSync(dir), []);
+  const first = q.enqueue({ ...input('m1'), reasoningEffort: '高' }).job;
+  assert.equal(first.reasoningEffort, 'high');
+  const duplicate = q.enqueue({ ...input('m1'), reasoningEffort: 'pro' });
+  assert.equal(duplicate.job.reasoningEffort, 'high'); assert.equal(duplicate.duplicate, true);
+  const recovered = new JobQueue(dir, () => assert.fail('must not resubmit'));
+  assert.equal(recovered.jobs[0].reasoningEffort, 'high');
+});
 
 test('restart recovers an acknowledged structured result without resubmitting', () => {
   const dir = root(), q = new JobQueue(dir, async () => {});

@@ -111,8 +111,68 @@ async function pageStep(operation,job){
  const stop=scopedStops[0]||(!composer&&stopCandidates.length===1?stopCandidates[0]:null);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
- if(['attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)
+ if(['reasoning','attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)
   throw Error('网页会话与任务不一致');
+ if(operation==='reasoning'){
+  const levels=['instant','medium','high','xhigh','pro'];
+  const target=job.reasoningEffort;
+  if(!target||target==='default')return {applied:true};
+  if(!levels.includes(target))throw Error('推理程度参数无效；本次未提交');
+  const behindMenu=node=>node.getAttribute('aria-expanded')==='true'&&!node.closest?.('[hidden], [inert]')
+   &&(typeof node.getClientRects!=='function'||node.getClientRects().length>0)
+   &&(typeof getComputedStyle!=='function'||!['hidden','collapse'].includes(getComputedStyle(node).visibility)&&getComputedStyle(node).display!=='none');
+  const triggers=buttons().filter(b=>(visible(b)||behindMenu(b))&&!b.closest?.(historySelector+', nav, aside')
+   &&(b.getAttribute('data-codex-intelligence-trigger')==='true'
+    ||b.getAttribute('data-composer-navigation-target')==='reasoning'
+    ||['选择 ChatGPT 模型','Select ChatGPT model'].includes(b.getAttribute('aria-label'))));
+  if(triggers.length!==1)throw Error('无法定位网页推理程度菜单，请检查 ChatGPT 模型选择器；本次未提交');
+  const trigger=triggers[0];
+  if(trigger.disabled||trigger.getAttribute('aria-disabled')==='true')throw Error('网页推理程度菜单不可用；本次未提交');
+  if(trigger.getAttribute('aria-expanded')!=='true'){
+   if(!editor||candidates.length>1||stop||unknownDrafts)throw Error('网页尚未就绪，无法切换推理程度；本次未提交');
+   trigger.click();return {pending:true};
+  }
+  // The menu is portaled outside the composer. Associate it with this trigger,
+  // never with a similarly named control in a reply, sidebar or another tool.
+  const triggerId=trigger.getAttribute('id'),menuId=trigger.getAttribute('aria-controls');
+  const menus=Array.from(document.querySelectorAll('[role="menu"]')).filter(n=>visible(n)
+   &&((triggerId&&n.getAttribute('aria-labelledby')===triggerId)
+    ||(menuId&&n.getAttribute('id')===menuId)));
+  if(menus.length!==1)return {pending:true};
+  const controls=Array.from(menus[0].querySelectorAll('[data-reasoning-slider]')).filter(visible);
+  if(controls.length!==1)throw Error('网页未提供可识别的推理程度滑块；本次未提交');
+  const control=controls[0],slider=control.querySelector('[role="slider"]');
+  // The slider thumb is intentionally aria-hidden; its enclosing menuitem is
+  // the keyboard target, and aria-describedby announces the selected level.
+  const descriptions=(control.getAttribute('aria-describedby')||'').split(/\s+/)
+   .map(id=>Array.from(document.querySelectorAll('[id]')).find(n=>n.getAttribute('id')===id)?.textContent||'');
+  const aliases={instant:'instant','即时':'instant','立即':'instant',medium:'medium','中':'medium','中等':'medium',
+   standard:'medium','标准':'medium',high:'high','高':'high',extended:'high','扩展':'high',
+   'extra high':'xhigh',xhigh:'xhigh','超高':'xhigh','极高':'xhigh',heavy:'xhigh',pro:'pro'};
+  const selected=descriptions.map(text=>aliases[text.split(/[,，。]/)[0].trim().toLowerCase()]).find(Boolean);
+  const value=Number(slider?.getAttribute('aria-valuenow')),
+   min=Number(slider?.getAttribute('aria-valuemin')),max=Number(slider?.getAttribute('aria-valuemax'));
+  if(!slider||!selected||!['aria-valuenow','aria-valuemin','aria-valuemax'].every(attr=>/^\d+$/.test(slider.getAttribute(attr)||''))
+   ||![value,min,max].every(Number.isInteger)||min>value||value>max||max-min>8)
+   throw Error('无法确认网页当前推理程度；本次未提交');
+  // Closing the menu can discard a preview or reveal a late account setting.
+  // Reopen and read it back on later worker ticks before allowing a submission.
+  if(job.reasoningVerify&&selected!==target)
+   throw Error('网页推理程度在关闭菜单后发生变化；本次未提交');
+  if(selected===target){
+   trigger.click();
+   return job.reasoningVerify?{applied:true,level:selected}:{pending:true,verify:true};
+  }
+  const direction=levels.indexOf(target)<levels.indexOf(selected)?-1:1;
+  if((direction<0&&value===min)||(direction>0&&value===max))
+   throw Error('当前账号或模型不支持推理程度 '+target+'；请用 /reasoning 选择其他程度；本次未提交');
+  const key=direction<0?'ArrowLeft':'ArrowRight';
+  control.focus();
+  control.dispatchEvent(new KeyboardEvent('keydown',{key,code:key,bubbles:true,cancelable:true}));
+  control.dispatchEvent(new KeyboardEvent('keyup',{key,code:key,bubbles:true}));
+  // Read back on the next polling turn, after React commits the selection.
+  return {pending:true,selected};
+ }
 // ChatGPT has shipped several wrappers for a generated image, so identify one by
 // what it is — a large bitmap — instead of a single data-testid that can be
 // renamed without notice.

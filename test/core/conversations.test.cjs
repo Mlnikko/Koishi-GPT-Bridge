@@ -107,3 +107,22 @@ test('an unusable ChatGPT session is unbound so the next message can start a new
   // 解绑之后可以绑定一个全新的会话编号，否则用户会被永久卡在失效编号上。
   assert.doesNotThrow(() => c.bindWeb(s, '99999999-2222-3333-4444-555555555555'));
 });
+test('reasoning settings persist per owned conversation and failed writes do not publish changes', () => {
+  const c = new Conversations(path.join(temp(), 'sessions.json'));
+  const first = c.create('alice', 'qq:a', 'first');
+  c.setReasoning(first.id, 'alice', 'qq:a', '超高');
+  c.create('alice', 'qq:a', 'second');
+  assert.equal(c.current('alice', 'qq:a').reasoningEffort, undefined);
+  c.select(first.id, 'alice', 'qq:a');
+  assert.equal(new Conversations(c.file).current('alice', 'qq:a').reasoningEffort, 'xhigh');
+  for (const [owner, chat] of [['bob', 'qq:a'], ['alice', 'qq:b']])
+    assert.throws(() => c.setReasoning(first.id, owner, chat, 'high'), /未找到/);
+  assert.throws(() => c.setReasoning(first.id, 'alice', 'qq:a', 'unknown'), /用法/);
+  const save = c.save.bind(c);
+  c.save = () => { throw Error('disk full'); };
+  assert.throws(() => c.setReasoning(first.id, 'alice', 'qq:a', 'medium'), /disk full/);
+  assert.equal(first.reasoningEffort, 'xhigh');
+  c.save = save;
+  c.setReasoning(first.id, 'alice', 'qq:a', 'default');
+  assert.equal(new Conversations(c.file).current('alice', 'qq:a').reasoningEffort, undefined);
+});

@@ -5,6 +5,7 @@ const path = require('node:path');
 const { WebBridge } = require('./bridge/web-bridge.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
+const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('./core/reasoning.cjs');
 const { JobQueue } = require('./core/queue.cjs');
 const { normalizeConfig } = require('./core/config.cjs');
 const { toSegments, sessionSegments, submissionText, imagesOf } = require('./core/message.cjs');
@@ -96,6 +97,7 @@ exports.apply = (ctx, config) => {
   const status = j => `任务 ${j.id}：${labels[j.status] || j.status}，已等待 ${Math.floor((Date.now()-j.createdAt)/1000)} 秒。`
     + (j.progress && j.status === 'running' ? `\n${j.progress}` : '')
     + (j.sessionId ? `\n会话：${j.sessionId}` : '\n独立任务（不绑定网页会话）')
+    + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort)}` : '')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
     + (j.deliveryError ? `\n发送详情：${textMessage(j.deliveryError)}` : '')
@@ -159,7 +161,7 @@ exports.apply = (ctx, config) => {
       }
       if (!chats.get(chat.id, session.userId, conversation(session))) throw Error('会话已关闭，请重新发送消息');
       const { job, duplicate: again } = q.enqueue({ owner: session.userId, conversation: conversation(session),
-        messageId: session.messageId, sessionId: chat.id, segments: prepared });
+        messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.reasoningEffort, segments: prepared });
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
@@ -205,7 +207,7 @@ exports.apply = (ctx, config) => {
     const current = chats.current(owner, chat);
     const list = chats.list(owner, chat);
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}`).join('\n') || '暂无会话');
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.reasoningEffort ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
   }));
   command('/close [id:string]', '关闭当前或指定会话').action(manage((owner, chat, id) => {
     const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
@@ -235,6 +237,17 @@ exports.apply = (ctx, config) => {
     const j = currentJob(session, id); return j ? deliver(j, session) : '未找到你的任务';
   });
   command('/logs [mode:string]', '过程通知 on/off').action(({ session }, mode) => logs(session, mode));
+  command('/reasoning [level:string]', '当前会话推理程度 default/instant/medium/high/xhigh/pro').action(manage((owner, chat, value) => {
+    if (!value) {
+      const s = chats.current(owner, chat);
+      return `当前会话推理程度：${reasoningLabel(s?.reasoningEffort)}。\n${REASONING_USAGE}\n即时 / 中 / 高 / 超高 / Pro；default 跟随网页。`;
+    }
+    const level = normalizeReasoning(value);
+    const s = chats.ensure(owner, chat);
+    chats.setReasoning(s.id, owner, chat, level);
+    return `会话「${s.name}」推理程度已设为：${reasoningLabel(level)}。下一条消息起生效，已排队或运行中的任务保持原设置。`
+      + (level === 'default' ? '' : '\n发送前会应用网页选项；账号不支持时会报错。');
+  }));
   // Route exact slash commands ourselves: Koishi strips a leading slash from
   // command definitions, which would register bare words and collide with help.
   // Keep one authorized registry for routing and help, regardless of ctx prefix.
