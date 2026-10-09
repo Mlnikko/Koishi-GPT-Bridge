@@ -41,7 +41,7 @@ class Conversations {
   // 「接着上一张继续说」的用法不需要任何命令。
   ensure(owner, chat, name) { return this.current(owner, chat) || this.create(owner, chat, name); }
   create(owner, chat, name) {
-    if (this.list(owner, chat).length >= 20) throw Error('最多保留 20 个打开的会话，请先用「桥接关闭会话 <编号>」关闭不需要的会话');
+    if (this.list(owner, chat).length >= 20) throw Error('最多保留 20 个打开的会话，请先用「/close 编号」关闭不需要的会话');
     const s = { id: randomUUID().replaceAll('-', '').slice(0, 8), owner, chat, name: this.name(name), createdAt: Date.now() };
     return this.commit(data => { data.items.push(s); data.current[this.key(owner, chat)] = s.id; return s.id; });
   }

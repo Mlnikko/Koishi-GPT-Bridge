@@ -105,6 +105,61 @@ test('answer wording is not interpreted as a generation status',async()=>{
  assert.ok(info.replyLength>0);
 });
 
+test('hidden and unrelated Stop buttons cannot keep a finished reply generating',async()=>{
+ const document=createDocument();
+ const hidden=el('div',{'aria-hidden':'true'},[el('button',{'aria-label':'Stop generating'})]);
+ const oldTurn=el('div',{'data-testid':'conversation-turn-0'},[el('button',{'aria-label':'停止生成'})]);
+ const sidebar=el('aside',{},[el('button',{'aria-label':'Stop'})]);
+ const composer=el('form',{},[el('div',{id:'prompt-textarea',contenteditable:'true'}),el('button',{'aria-label':'Send'})]);
+ for(const node of [hidden,oldTurn,sidebar,composer])document.body.appendChild(node);
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).stopping,false);
+ assert.equal((await sandbox.pageStep('stop',{})).stopped,false);
+});
+
+test('cancellation clicks only the visible Stop in the current composer',async()=>{
+ const document=createDocument();let clicked=0;
+ const hidden=el('button',{'aria-label':'Stop generating',hidden:''});
+ hidden.click=()=>assert.fail('hidden Stop must never be clicked');
+ const unrelated=el('button',{'aria-label':'Stop'});
+ unrelated.click=()=>assert.fail('another tool must never be stopped');
+ const stop=el('button',{'data-testid':'stop-button'});stop.click=()=>clicked++;
+ const composer=el('div',{'data-testid':'composer'},[el('div',{id:'prompt-textarea',contenteditable:'true'}),stop]);
+ for(const node of [hidden,unrelated,composer])document.body.appendChild(node);
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).stopping,true);
+ assert.equal((await sandbox.pageStep('stop',{})).stopped,true);
+ assert.equal(clicked,1);
+});
+
+test('a nested busy composer is still resolved after Send is replaced by Stop',async()=>{
+ const document=createDocument();let clicked=0;
+ const stop=el('button',{'aria-label':'停止生成'});stop.click=()=>clicked++;
+ document.body.appendChild(el('div',{},[el('div',{},[el('div',{role:'textbox',contenteditable:'true'})]),stop]));
+ const sandbox=sandboxOf({document});
+ assert.equal((await sandbox.pageStep('inspect',{})).stopping,true);
+ assert.equal((await sandbox.pageStep('stop',{})).stopped,true);
+ assert.equal(clicked,1);
+});
+
+test('a ready image is returned promptly when a hidden historical Stop remains in the page',async()=>{
+ const document=createDocument();
+ document.body.appendChild(el('button',{'aria-label':'Stop generating',hidden:''}));
+ document.body.appendChild(el('div',{'data-message-author-role':'user'},['画一个圆']));
+ document.body.appendChild(el('div',{'data-message-author-role':'assistant'},[img('blob:ready')]));
+ document.body.appendChild(el('form',{},[el('div',{id:'prompt-textarea',contenteditable:'true'}),el('button',{'aria-label':'Send'})]));
+ const info=await sandboxOf({document}).pageStep('inspect',{});
+ const {sandbox,storage,calls}=worker({state:{id:'ready-image',text:'画一个圆',images:[]},results:{inspect:info,
+  read:{threadId:THREAD,segments:[{type:'image',asset:0}],imageCount:1},
+  image:{base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')}}});
+ await wait();
+ storage.current={id:'ready-image',tabId:1,phase:'waiting',sentAt:Date.now()-30000,stableAt:Date.now()-5000,
+  baseline:0,userBaseline:0,lastSignature:info.replySignature,submittedConfirmed:true};
+ await sandbox.tick();
+ assert.equal(routeOf(calls,'/result').length,1);
+ assert.equal(routeOf(calls,'/failure').length,0);
+});
+
 test('paragraph image order and direct text nodes survive reply serialization',async()=>{
  const document=createDocument();
  const turn=el('div',{'data-testid':'conversation-turn-1'});
@@ -446,6 +501,55 @@ test('a picture that has not finished loading keeps the worker waiting', async()
  await sandbox.tick();
  assert.equal(routeOf(calls,'/result').length,0);
  assert.equal(calls.filter(call=>call.route==='tabs.remove').length,0);
+});
+
+test('timing snapshots distinguish visible content from generation and persist across ticks',async()=>{
+ const inspected={editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:true,
+  replyLength:5,images:1,imageLoading:false,pendingGallery:true,replySignature:'partial'};
+ const {sandbox,storage,calls}=worker({state:{id:'timing-test',text:'画两张图',images:[]},results:op=>op==='inspect'?inspected:{}});
+ await wait();
+ const previous=Date.now()-30000;
+ storage.current={id:'timing-test',tabId:1,phase:'waiting',sentAt:previous-20000,baseline:0,userBaseline:0,
+  timing:{lastObservedAt:previous,maxPollGapMs:2000}};
+ await sandbox.tick();
+ const first=plain(storage.current.timing);
+ assert.equal(first.waitReason,'generating');
+ assert.ok(first.firstTextAt>=previous);assert.ok(first.firstImageAt>=previous);
+ assert.equal(first.firstIdleAt,undefined);assert.ok(first.maxPollGapMs>=30000);
+ assert.deepEqual(routeOf(calls,'/progress').at(-1).body.timing,first);
+ inspected.stopping=false;
+ await sandbox.tick();
+ assert.equal(storage.current.timing.waitReason,'image-loading');
+ inspected.pendingGallery=false;inspected.replySignature='finished';
+ await sandbox.tick();
+ assert.equal(storage.current.timing.waitReason,'settling');
+ assert.ok(storage.current.timing.firstIdleAt>=first.firstImageAt);
+ assert.equal(storage.current.timing.firstImageAt,first.firstImageAt);
+ assert.equal(routeOf(calls,'/result').length,0,'all pictures and a stable signature are still required');
+});
+
+test('completed reply diagnostics include reading and image encoding/upload times',async()=>{
+ const {sandbox,storage,calls}=worker({state:{id:'upload-timing',text:'画一个圆',images:[]},results:{
+  inspect:{editor:true,assistants:1,users:1,threadId:THREAD,submitted:true,stopping:false,
+   replyLength:0,images:1,imageLoading:false,replySignature:'ready'},
+  read:{threadId:THREAD,segments:[{type:'image',asset:0}],imageCount:1,probe:{readableImages:1}},
+  image:{base64:Buffer.from('89504e470d0a1a0a','hex').toString('base64')},
+ }});
+ await wait();
+ storage.current={id:'upload-timing',tabId:1,phase:'waiting',sentAt:Date.now()-30000,
+  stableAt:Date.now()-5000,lastSignature:'ready',baseline:0,userBaseline:0,
+  timing:{firstImageAt:Date.now()-5000}};
+ await sandbox.tick();
+ const probe=routeOf(calls,'/result')[0].body.probe,timing=probe.timing;
+ assert.equal(probe.readableImages,1);
+ assert.ok(timing.readStartedAt>=timing.firstImageAt);
+ assert.ok(timing.readFinishedAt>=timing.readStartedAt);
+ assert.ok(timing.returnStartedAt>=timing.readFinishedAt);
+ assert.equal(timing.uploads.length,1);
+ assert.ok(timing.uploads[0].encodedAt>=timing.uploads[0].startedAt);
+ assert.ok(timing.uploads[0].uploadedAt>=timing.uploads[0].encodedAt);
+ assert.ok(timing.resultPostedAt>=timing.uploads[0].uploadedAt);
+ assert.equal(storage.current,null);
 });
 
 test('a turn that never produces anything fails at the hard cap instead of hanging', async()=>{

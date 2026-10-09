@@ -25,7 +25,7 @@ const apps = [];
 
 // A minimal stand-in for the parts of the Koishi context this plugin uses. It
 // models the two behaviours the wiring actually depends on: registration order
-// (management commands first, then the catch-all forwarder) and Koishi's
+// (slash-command router first, then the catch-all forwarder) and Koishi's
 // `next(fallback)` semantics, where the remaining stages run first and the
 // fallback only fires when nothing downstream produced a result.
 function harness() {
@@ -47,6 +47,8 @@ function session({ userId = 'alice', isDirect = true, channelId = 'alice', messa
     send: async content => { sent.push(content); return ['msg-id']; } };
 }
 async function dispatch({ stages }, s, text) {
+  const previous = s.stripped;
+  if (text !== undefined) s.stripped = { ...previous, content: text };
   const run = async index => {
     if (index >= stages.length) return { handled: false };
     const stage = stages[index];
@@ -63,8 +65,10 @@ async function dispatch({ stages }, s, text) {
     const raw = await stage.callback(s, next);
     return raw && typeof raw === 'object' && 'handled' in raw ? raw : { handled: true, value: raw };
   };
-  const outcome = await run(0);
-  return outcome.handled ? outcome.value : undefined;
+  try {
+    const outcome = await run(0);
+    return outcome.handled ? outcome.value : undefined;
+  } finally { s.stripped = previous; }
 }
 const apply = (config = {}) => {
   const root = temp();
@@ -86,7 +90,11 @@ const settle = async (root, timeout = 4000) => {
   const started = Date.now();
   for (;;) {
     const jobs = jobFiles(root);
-    if (jobs.length && jobs.every(j => !['queued', 'running'].includes(j.status))) return jobs;
+    // A terminal job is saved before its async QQ delivery hook completes.
+    // Wait for the receipt too, rather than relying on router microtask count.
+    if (jobs.length && jobs.every(j => !['queued', 'running'].includes(j.status)
+      && (j.status !== 'failed' || j.feedbackDelivery)
+      && (j.status !== 'ready' || ['sent', 'failed'].includes(j.delivery)))) return jobs;
     if (Date.now() - started > timeout) throw new Error('任务未在预期时间内结束');
     await new Promise(resolve => setTimeout(resolve, 20));
   }
@@ -150,10 +158,10 @@ test('a picture that cannot be downloaded is reported and never enqueued', async
 test('management commands are answered locally and never forwarded', async () => {
   const app = apply();
   const s = session();
-  const created = await dispatch(app, s, '桥接新建会话 月夜');
-  assert.match(created, /已新建并切换：月夜/);
-  assert.match(await dispatch(app, s, '桥接会话列表'), /月夜/);
-  assert.equal(await dispatch(app, s, '桥接状态'), '未找到你的任务');
+  const created = await dispatch(app, s, '/new 月夜');
+  assert.match(created, /已开启：月夜/);
+  assert.match(await dispatch(app, s, '/chat'), /月夜/);
+  assert.match(await dispatch(app, s, '/status'), /当前会话暂无任务/);
   assert.deepEqual(jobFiles(app.root), [], '命令不该变成发给 ChatGPT 的消息');
 });
 
@@ -171,31 +179,32 @@ test('every message from one user stays in the same persistent conversation', as
   assert.equal(jobs.length, 2);
   assert.ok(jobs[0].sessionId, '任务必须绑定会话，否则续聊无从谈起');
   assert.equal(jobs[0].sessionId, jobs[1].sessionId, '两条消息必须落在同一个会话里');
-  const list = await dispatch(app, s, '桥接会话列表');
+  const list = await dispatch(app, s, '/chat');
   assert.match(list, /当前：默认会话（\S{8}）/);
   assert.match(list, /默认会话 \[当前\]/);
   // 另一个用户不共享这个会话。
   const other = session({ userId: 'bob', channelId: 'bob', elements: [{ type: 'text', attrs: { content: '你好' } }] });
-  assert.match(await dispatch(app, other, '桥接会话列表'), /当前：暂无/);
+  assert.match(await dispatch(app, other, '/chat'), /当前：暂无/);
 });
 
-test('「桥接重开会话」ends the old conversation and starts a fresh one', async () => {
+test('/new starts a fresh context and preserves the previous conversation for switching', async () => {
   const app = apply();
   const s = session({ elements: [{ type: 'text', attrs: { content: '第一句' } }] });
   await dispatch(app, s, undefined);
   await settle(app.root);
   const [first] = jobFiles(app.root);
-  assert.match(await dispatch(app, s, '桥接重开会话 新话题'), /已结束旧会话，开启新会话：新话题/);
+  assert.match(await dispatch(app, s, '/new 新话题'), /已开启：新话题/);
   s.messageId = 'm2';
   s.elements = [{ type: 'text', attrs: { content: '第二句' } }];
   await dispatch(app, s, undefined);
   await settle(app.root);
   const second = jobFiles(app.root).find(job => job.id !== first.id);
   assert.notEqual(second.sessionId, first.sessionId, '重开会话之后必须换一个网页会话');
-  const list = await dispatch(app, s, '桥接会话列表');
+  const list = await dispatch(app, s, '/chat');
   assert.match(list, /当前：新话题（\S{8}）/);
   assert.match(list, /新话题 \[当前\]/);
-  assert.doesNotMatch(list, /默认会话/, '旧会话必须已经关闭，不再留在列表里');
+  assert.match(list, /默认会话/, '旧会话保留，仍可切回');
+  assert.match(await dispatch(app, s, `/chat ${first.sessionId}`), /已切换：默认会话/);
 });
 
 test('a deleted ChatGPT thread is unbound, so the next message starts a new one', async () => {
@@ -356,11 +365,12 @@ test('the plugin refuses to load without an allowedUsers list', () => {
 
 const slash = (app, text, options = {}) => dispatch(app, session({ ...options, elements: [{ type: 'text', attrs: { content: text } }] }), text);
 
-test('help lists every registered command and slash commands stay local and authorized', async () => {
+test('help lists exactly eight short commands and slash commands stay local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  for (const stage of app.stages.filter(s => s.kind === 'command')) assert.ok(help.includes(stage.name));
-  assert.equal(await dispatch(app, session(), '桥接帮助'), help);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs']);
+  assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
+  assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
   assert.equal(await slash(app, '/help', { isDirect: false }), undefined);
   assert.equal(await slash(app, '/help', { isDirect: false, stripped: { appel: true, content: '/help' } }), help);
@@ -377,8 +387,59 @@ test('notification preferences persist and remain isolated by user and chat', as
   assert.match(await slash(app, '/logs', { isDirect: false, channelId: 'group', stripped: { appel: true, content: '/logs' } }), /已开启/);
   const { Preferences } = require('../src/core/preferences.cjs');
   assert.equal(new Preferences(path.join(app.root, 'preferences.json')).enabled('alice', 'qq:alice'), false);
-  assert.match(await dispatch(app, session(), '桥接日志 开启'), /已开启/);
+  assert.match(await dispatch(app, session(), '/logs on'), /已开启/);
   assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('slash routing preserves full names, accepts case and whitespace, and rejects extra arguments locally', async () => {
+  const app = apply();
+  assert.match(await slash(app, '  /NEW\t新 话题  '), /已开启：新 话题/);
+  assert.match(await slash(app, '/chat'), /新 话题/);
+  assert.match(await slash(app, '/help extra'), /用法：\/help/);
+  assert.match(await slash(app, '/status one two'), /用法：\/status/);
+  assert.match(await slash(app, '/close one two'), /用法：\/close/);
+  assert.match(await slash(app, '/logs off extra'), /用法：\/logs/);
+  assert.match(await slash(app, '/logs'), /已开启/);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('removed Chinese commands only show the migration notice and never create jobs or preferences', async () => {
+  const app = apply();
+  for (const text of ['桥接帮助', '桥接连接', '桥接日志 关闭', '桥接状态', '桥接取消', '桥接重发',
+    '桥接新建会话 旧名称', '桥接重开会话', '桥接会话列表', '桥接切换会话 other',
+    '桥接关闭会话', '桥接重命名会话 other 新名称', '桥接记录'])
+    assert.match(await slash(app, text), /命令已精简.*\/help/);
+  assert.deepEqual(jobFiles(app.root), []);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.equal(fs.existsSync(path.join(app.root, 'preferences.json')), false);
+});
+
+test('all short commands remain gated by private authorization and group mentions', async () => {
+  const app = apply({ allowedUsers: ['alice'], groupChat: true });
+  for (const text of ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs off']) {
+    assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
+    assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
+  }
+  assert.deepEqual(jobFiles(app.root), []);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.equal(fs.existsSync(path.join(app.root, 'preferences.json')), false);
+});
+
+test('bare words, unknown slash text and command-looking image captions are forwarded as content', async () => {
+  const app = apply({ notifyProgress: false });
+  for (const text of ['new', 'stop', 'status', '/stopping', '桥接状态正常吗？']) {
+    await slash(app, text, { messageId: text });
+    await settle(app.root);
+  }
+  const s = session({ messageId: 'caption', elements: [
+    { type: 'text', attrs: { content: '/stop' } }, { type: 'img', attrs: { src: png() } },
+  ] });
+  await dispatch(app, s, '/stop');
+  await settle(app.root);
+  const jobs = jobFiles(app.root);
+  assert.equal(jobs.length, 6);
+  assert.deepEqual(jobs.find(j => j.messageId === 'caption').input.map(s => s.type), ['text', 'image']);
+  assert.equal(jobs.find(j => j.messageId === 'caption').input[0].text, '/stop');
 });
 
 test('silent mode suppresses receipts and progress but delivers results; live toggles take effect', async () => {
@@ -402,7 +463,7 @@ test('silent mode suppresses receipts and progress but delivers results; live to
     const tick = app.timers.find(t => t.ms === 10000).fn;
     await tick();
     assert.deepEqual(s.sent, []);
-    assert.match(await dispatch(app, s, '桥接状态'), /任务/);
+    assert.match(await dispatch(app, s, '/status'), /任务/);
     await slash(app, '/logs on');
     await tick();
     await tick();
@@ -430,10 +491,10 @@ test('silent mode still reports terminal failures', async () => {
   assert.match(s.sent[0], /失败/);
 });
 
-test('invalid replacement name leaves the original conversation open', async () => {
+test('invalid new name leaves the current conversation unchanged', async () => {
   const app = apply();
-  await dispatch(app, session(), '桥接新建会话 原会话');
-  assert.match(await dispatch(app, session(), `桥接重开会话 ${'长'.repeat(41)}`), /最多 40 字/);
+  await dispatch(app, session(), '/new 原会话');
+  assert.match(await dispatch(app, session(), `/new ${'长'.repeat(41)}`), /最多 40 字/);
   const data = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'), 'utf8'));
   assert.equal(data.items.length, 1);
   assert.equal(data.items[0].closed, undefined);
@@ -531,11 +592,11 @@ test('partial QQ delivery resumes at the first unconfirmed segment across repeat
  const [failed]=jobFiles(app.root);
  assert.equal(failed.delivery,'failed');assert.equal(failed.deliveryCursor,1);
  const retry=session({messageId:'retry'});
- await dispatch(app,retry,`桥接重发 ${job.id}`);
+ await dispatch(app,retry,`/retry ${job.id}`);
  assert.deepEqual(retry.sent,['b'.repeat(20),'c'.repeat(20)]);
  assert.equal(jobFiles(app.root)[0].delivery,'sent');
  const replay=session({messageId:'replay'});
- await dispatch(app,replay,`桥接重发 ${job.id}`);
+ await dispatch(app,replay,`/retry ${job.id}`);
  assert.deepEqual(replay.sent,['a'.repeat(20),'b'.repeat(20),'c'.repeat(20)]);
 });
 
@@ -561,12 +622,12 @@ test('invalid numeric limits fail before a server is started',()=>{
   assert.throws(()=>apply(config),/必须是/);
 });
 
-test('connection command reports the loaded version without creating a job or browser heartbeat', async()=>{
+test('/status reports the loaded version without creating a job or browser heartbeat', async()=>{
  const app=apply();
  const s=session();
- const message=await dispatch(app,s,'桥接连接');
+ const message=await dispatch(app,s,'/status');
  assert.match(message,new RegExp(require('../package.json').version.replaceAll('.', '\\.')));
- assert.match(message,/未在线/);
+ assert.match(message,/浏览器未连接/);
  assert.deepEqual(jobFiles(app.root),[]);
  const {port,token}=await bridgeOf(app.root);
  const health=await(await fetch(`http://127.0.0.1:${port}/health`,{headers:{'x-bridge-token':token}})).json();
@@ -574,25 +635,25 @@ test('connection command reports the loaded version without creating a job or br
  assert.equal(health.busy,false);
 });
 
-test('session commands route history and selection locally while enforcing ownership', async()=>{
- const app=apply({notifyProgress:false});const s=session();
- await dispatch(app,s,'桥接新建会话 first');
- const first=JSON.parse(fs.readFileSync(path.join(app.root,'conversations.json'))).items[0].id;
- await dispatch(app,s,'桥接新建会话 second');
- assert.match(await dispatch(app,s,`桥接重命名会话 ${first} renamed`),/已重命名：renamed/);
- assert.match(await dispatch(app,s,`桥接切换会话 ${first}`),/已切换：renamed/);
- assert.match(await dispatch(app,s,'桥接会话列表'),new RegExp(first+' renamed \\[当前\\]'));
- s.elements=[{type:'text',attrs:{content:'history entry'}}];
- await dispatch(app,s);const [job]=await settle(app.root);
- assert.match(await dispatch(app,s,'桥接记录'),/history entry/);
- assert.match(await dispatch(app,s,`桥接状态 ${job.id}`),/处理失败/);
- const other=session({userId:'bob',channelId:'alice'});
- for(const command of [`桥接切换会话 ${first}`,`桥接重命名会话 ${first} wrong`,`桥接关闭会话 ${first}`,`桥接记录 ${first}`])
-  assert.match(await dispatch(app,other,command),/未找到你的会话/);
- assert.equal(await dispatch(app,other,`桥接状态 ${job.id}`),'未找到你的任务');
- assert.match(await dispatch(app,s,`桥接关闭会话 ${first}`),/已关闭会话/);
- assert.match(await dispatch(app,s,`桥接重发 ${job.id}`),/处理失败/);
- assert.equal(jobFiles(app.root).length,1,'management commands must not reach ChatGPT');
+test('session list, selection and closure stay local and enforce ownership', async () => {
+  const app = apply({ notifyProgress: false });
+  const s = session();
+  await dispatch(app, s, '/new first');
+  const first = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0].id;
+  await dispatch(app, s, '/new second');
+  assert.match(await dispatch(app, s, `/chat ${first}`), /已切换：first/);
+  assert.match(await dispatch(app, s, '/chat'), new RegExp(first + ' first \\[当前\\]'));
+  s.elements = [{ type: 'text', attrs: { content: 'history entry' } }];
+  await dispatch(app, s);
+  const [job] = await settle(app.root);
+  assert.match(await dispatch(app, s, `/status ${job.id}`), /处理失败/);
+  const other = session({ userId: 'bob', channelId: 'alice' });
+  for (const command of [`/chat ${first}`, `/close ${first}`])
+    assert.match(await dispatch(app, other, command), /未找到你的会话/);
+  assert.equal(await dispatch(app, other, `/status ${job.id}`), '未找到你的任务');
+  assert.match(await dispatch(app, s, `/close ${first}`), /已关闭：first/);
+  assert.match(await dispatch(app, s, `/retry ${job.id}`), /处理失败/);
+  assert.equal(jobFiles(app.root).length, 1, 'management commands must not reach ChatGPT');
 });
 
 test('status and cancellation commands operate on the owned running job and await browser acknowledgement', async()=>{
@@ -602,11 +663,12 @@ test('status and cancellation commands operate on the owned running job and awai
  await state();const s=session({elements:[{type:'text',attrs:{content:'running'}}]});
  await dispatch(app,s);await wait();
  const {job}=await state();
- assert.match(await dispatch(app,s,'桥接状态'),/网页处理中/);
- assert.equal(await dispatch(app,session({userId:'bob'}),`桥接取消 ${job.id}`),'未找到你的任务');
- assert.match(await dispatch(app,s,'桥接取消'),/已请求停止/);
+ assert.match(await dispatch(app,s,'/status'),/网页处理中/);
+ assert.match(await dispatch(app,s,'/close'),/仍在处理消息/);
+ assert.equal(await dispatch(app,session({userId:'bob'}),`/stop ${job.id}`),'未找到你的任务');
+ assert.match(await dispatch(app,s,'/stop'),/已请求停止/);
  assert.equal((await state()).job.cancelled,true);
  await fetch(`http://127.0.0.1:${port}/failure`,{method:'POST',headers,body:JSON.stringify({id:job.id,message:'任务已取消'})});
  const [ended]=await settle(app.root);assert.equal(ended.status,'cancelled');
- assert.match(await dispatch(app,s,'桥接取消'),/已结束/);
+ assert.match(await dispatch(app,s,'/stop'),/已结束/);
 });

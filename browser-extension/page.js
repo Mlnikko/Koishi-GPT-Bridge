@@ -66,13 +66,16 @@ async function pageStep(operation,job){
  const editors=allEditors.filter(node=>!exclusion(node));
  const sendLabels=['发送','Send','发送提示','Send prompt'];
  const isSend=button=>visible(button)&&(sendLabels.includes(button.getAttribute('aria-label')||'')||sendLabels.includes(button.innerText.trim())||button.getAttribute('data-testid')==='send-button');
+ const stopLabels=['停止','Stop','停止生成','Stop generating'];
+ const isStop=button=>visible(button)&&(stopLabels.includes(button.getAttribute('aria-label')||'')||stopLabels.includes(button.innerText.trim())||button.getAttribute('data-testid')==='stop-button');
+ const isControl=button=>isSend(button)||isStop(button);
  const composerSelector='[data-testid*="composer" i], [id="composer-background"], [data-type="unified-composer"]';
  const scopeOf=node=>{
   const form=node.closest?.('form');
   if(form&&!form.querySelector?.(historySelector)&&editors.filter(candidate=>form.contains(candidate)).length===1
-   &&Array.from(form.querySelectorAll?.('button')||[]).some(isSend))return form;
+   &&Array.from(form.querySelectorAll?.('button')||[]).some(isControl))return form;
   const explicit=node.closest?.(composerSelector);
-  if(explicit&&Array.from(explicit.querySelectorAll?.('button')||[]).some(isSend))return explicit;
+  if(explicit&&Array.from(explicit.querySelectorAll?.('button')||[]).some(isControl))return explicit;
   let parent=node.parentElement;
   for(let depth=0;parent&&depth<8;depth++,parent=parent.parentElement){
    if(['BODY','MAIN','HTML'].includes(parent.tagName))break;
@@ -80,14 +83,14 @@ async function pageStep(operation,job){
    // editor or message history; that recreates the original global-selector bug.
    if(parent.querySelector?.(historySelector))break;
    if(editors.filter(candidate=>parent.contains(candidate)).length!==1)break;
-   if(Array.from(parent.querySelectorAll?.('button')||[]).some(isSend))return parent;
+   if(Array.from(parent.querySelectorAll?.('button')||[]).some(isControl))return parent;
   }
   const fallback=explicit||form||node.parentElement;
   return fallback&&!['BODY','MAIN','HTML'].includes(fallback.tagName)?fallback:null;
  };
  const score=node=>node.getAttribute('id')==='prompt-textarea'?3:
   node.closest?.(composerSelector)?2:
-  Array.from(scopeOf(node)?.querySelectorAll?.('button')||[]).some(isSend)?1:0;
+  Array.from(scopeOf(node)?.querySelectorAll?.('button')||[]).some(isControl)?1:0;
  const eligible=editors.filter(node=>node.getAttribute('id')==='prompt-textarea'||node.getAttribute('role')==='textbox');
  const best=eligible.length?Math.max(...eligible.map(score)):-1;
  const candidates=eligible.filter(node=>score(node)===best);
@@ -100,7 +103,12 @@ async function pageStep(operation,job){
  const unknownDrafts=eligible.some(node=>normalized(node.innerText)&&!['询问 ChatGPT','Ask ChatGPT'].includes(normalized(node.innerText))&&!ownedDraft(node));
  const attachmentSelector='img[src^="blob:"], img[src^="data:image/"], img[src^="https://"], [data-testid*="attachment" i], [data-testid*="composer-file" i]';
  const recoverySafe=!unknownDrafts&&!eligible.some(node=>scopeOf(node)?.querySelector?.(attachmentSelector+', [role="progressbar"], [aria-busy="true"]'));
- const stop=byLabel(['停止','Stop','停止生成','Stop generating']);
+ // A hidden historical button (or another tool's Stop) is not evidence that
+ // this reply is streaming. Use the same composer boundary as Send/cancel.
+ const stopCandidates=buttons().filter(button=>isStop(button)
+  &&!button.closest?.(historySelector+', nav, aside, header, [role="dialog"]'));
+ const scopedStops=stopCandidates.filter(button=>composer?composer.contains(button):button.closest?.('form, '+composerSelector));
+ const stop=scopedStops[0]||(!composer&&stopCandidates.length===1?stopCandidates[0]:null);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
  if(['attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)

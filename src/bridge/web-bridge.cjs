@@ -174,6 +174,9 @@ class WebBridge {
         if(body.phase==='submitted'&&body.evidence&&!p.submissionSaved){
           saveProbe(p.job.dir,'submission.json',body.evidence);p.submissionSaved=true;
         }
+        // Overwrite a bounded timing snapshot, rather than appending one log
+        // line per poll. It remains useful if the browser disappears or times out.
+        saveProbe(p.job.dir,'timing.json',body.timing);
         const phase=PHASES[body.phase];
         if(phase)p.onProgress(phase);
         return send(200,{ok:true,cancelled:!!p.cancelled});

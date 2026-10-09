@@ -62,7 +62,7 @@ exports.apply = (ctx, config) => {
       try { await send(session, textMessage(`任务 ${j.id} 失败：${safeReason(j.error)}`)); j.feedbackDelivery = 'sent'; }
       catch (err) {
         j.feedbackDelivery = 'failed'; j.deliveryError = String(err.message).slice(0, 300);
-        try { ctx.logger('codex-image-local').warn(`任务 ${j.id} 的失败反馈未送达，请使用「桥接状态 ${j.id}」查询。`); } catch {}
+        try { ctx.logger('codex-image-local').warn(`任务 ${j.id} 的失败反馈未送达，请使用「/status ${j.id}」查询。`); } catch {}
       }
       q.save(j);
     }
@@ -97,7 +97,7 @@ exports.apply = (ctx, config) => {
     + (j.progress && j.status === 'running' ? `\n${j.progress}` : '')
     + (j.sessionId ? `\n会话：${j.sessionId}` : '\n独立任务（不绑定网页会话）')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
-    + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「桥接重发 ${j.id}」。` : '')
+    + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
     + (j.deliveryError ? `\n发送详情：${textMessage(j.deliveryError)}` : '')
     + (j.error ? `\n${textMessage(j.error)}` : '');
   // 回复按片段顺序发出：文本批次与图片交替，图片在回复里的位置不会丢。
@@ -112,7 +112,7 @@ exports.apply = (ctx, config) => {
       if (j.delivery === 'sent') j.deliveryCursor = 0;
       j.deliveryPlan = messages; j.delivery = 'sending'; q.save(j);
       for (let index = j.deliveryCursor || 0; index < messages.length; index++) {
-        if (!fresh(s)) throw Error('QQ 回复窗口已过期，请用「桥接重发」建立新的回复窗口');
+        if (!fresh(s)) throw Error('QQ 回复窗口已过期，请用「/retry」取回回复');
         const item = messages[index];
         // Image bytes are uploaded by the QQ adapter; local paths never leave the machine.
         if (item.type === 'image') {
@@ -126,7 +126,7 @@ exports.apply = (ctx, config) => {
       j.delivery = 'sent'; j.deliveredAt = Date.now(); delete j.deliveryError; q.save(j);
     } catch (err) {
       j.delivery = 'failed'; j.deliveryError = safeReason(err.message).slice(0, 300); q.save(j);
-      return `任务 ${j.id} 的回复已取回，但 QQ 发送失败：${textMessage(j.deliveryError)}\n已确认 ${j.deliveryCursor || 0} 段；可发送「桥接重发 ${j.id}」继续，未确认的一段可能重复。`;
+      return `任务 ${j.id} 的回复已取回，但 QQ 发送失败：${textMessage(j.deliveryError)}\n已确认 ${j.deliveryCursor || 0} 段；可发送「/retry ${j.id}」继续，未确认的一段可能重复。`;
     } finally { locks.delete(j.id); }
   }
   // 普通消息按原顺序转发；引用回复先附上有明确边界的引用内容，图片依次作为附件。
@@ -147,7 +147,7 @@ exports.apply = (ctx, config) => {
     catch (err) { return textMessage(safeReason(err.message)); }
     const duplicate = session.messageId && q.jobs.find(j => j.owner === session.userId && j.conversation === conversation(session) && j.messageId === session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
-    if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「桥接取消」停止后再试。';
+    if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。';
     let staging;
     try {
       staging = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-input-'));
@@ -163,7 +163,7 @@ exports.apply = (ctx, config) => {
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
-      try { if (notifications(session)) await send(session, textMessage(`已接收 ${job.id}${reference}，正在送往 ChatGPT。\n会话：${chat.name}（${job.sessionId}）\n发送「桥接状态」查看进度，「桥接取消」停止。`)); }
+      try { if (notifications(session)) await send(session, textMessage(`已接收 ${job.id}${reference}，正在送往 ChatGPT。\n会话：${chat.name}（${job.sessionId}）\n/status 查看进度，/stop 停止。`)); }
       catch { job.deliveryError = '接收确认未送达'; q.save(job); }
       void q.pump();
     }
@@ -173,101 +173,85 @@ exports.apply = (ctx, config) => {
   const scope = ctx.intersect(authorized);
   const commands = [];
   const command = (definition, description) => ({ action(handler) {
-    commands.push({ definition, description });
-    return scope.command(definition, description).action(handler);
+    commands.push({ definition, description, handler, name: definition.split(' ')[0] });
   } });
-  const help = () => textMessage('直接发送文字或图片即可对话；群聊需 @ 机器人。引用回复时会一并读取被引用的文字和图片。\n'
-    + '/help：查看帮助；/logs [on|off]：查看或切换过程通知。\n'
+  const help = () => textMessage('直接发文字、图片或引用即可对话；群聊需 @ 机器人。\n'
     + commands.map(c => `${c.definition.replace(/:string|:text/g, '')}：${c.description}`).join('\n')
-    + '\n关闭过程通知后，只自动发送最终回复或失败原因；仍可主动查询状态。');
+    + '\n方括号参数可省略；任务默认选当前会话最近一条。');
   const logs = (session, value) => {
     const option = value?.trim().toLowerCase();
     if (option) {
-      if (!['on', 'off', '开启', '关闭', '开', '关'].includes(option)) return '用法：/logs on|off，或「桥接日志 开启|关闭」。不带参数查看当前设置。';
+      if (!['on', 'off', '开启', '关闭', '开', '关'].includes(option)) return '用法：/logs [on|off]';
       try { preferences.set(session.userId, conversation(session), ['on', '开启', '开'].includes(option)); }
       catch { return '通知设置保存失败，请稍后重试。'; }
     }
-    return `过程通知已${notifications(session) ? '开启：发送接收确认和进度提醒' : '关闭：只自动发送最终回复或失败原因'}。设置仅影响你在当前聊天中的消息，重启后保留。`;
+    return `过程通知已${notifications(session) ? '开启' : '关闭，仅接收最终回复或失败原因'}。`;
   };
-  // Exact slash commands also work when Koishi uses a different command prefix.
-  scope.middleware((session, next) => {
-    const segments = toSegments(session.elements);
-    if (segments.some(s => s.type === 'image')) return next();
-    const text = (session.stripped?.content ?? submissionText(segments)).trim();
-    if (/^\/help$/i.test(text)) return help();
-    const match = /^\/logs(?:\s+([\s\S]*))?$/i.exec(text);
-    if (match) return logs(session, match[1]);
-    return next();
-  }, true);
-  command('桥接帮助', '查看所有桥接命令和使用说明').action(help);
-  command('桥接连接', '检查本机服务和浏览器连接，不提交网页任务').action(async () => {
-    try { await web.ready; }
-    catch { return '本机桥接无法监听，请检查配置端口是否被占用并重启实例。'; }
-    const health = web.health();
-    return `插件版本：${health.pluginVersion}；协议：${health.version}\n`
-      + `本机桥接：已监听 127.0.0.1:${web.port}\n`
-      + `浏览器：${health.online ? '已连接' : '未在线，请打开 Chrome、重载扩展并检查扩展弹窗'}\n`
-      + `任务：${q.jobs.filter(j => ['queued', 'running'].includes(j.status)).length} 个待完成`;
-  });
-  command('桥接日志 [mode:string]', '查看或切换过程通知（开启/关闭）').action(({ session }, mode) => logs(session, mode));
   const manage = fn => ({ session }, ...args) => {
     try { return textMessage(fn(session.userId, conversation(session), ...args)); }
     catch (err) { return textMessage(safeReason(err.message)); }
   };
   const currentJob = (session, id) => q.find(id, session.userId, conversation(session),
     chats.current(session.userId, conversation(session))?.id);
-  command('桥接状态 [id:string]', '查看最近或指定任务的进度').action(({ session }, id) => {
-    const j = currentJob(session, id); return j ? status(j) : '未找到你的任务';
+  command('/help', '帮助').action(help);
+  command('/new [name:text]', '开启新对话').action(manage((owner, chat, name) => {
+    const s = chats.create(owner, chat, name);
+    return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`;
+  }));
+  command('/chat [id:string]', '会话列表；带编号切换').action(manage((owner, chat, id) => {
+    if (id) {
+      const s = chats.select(id, owner, chat); return `已切换：${s.name}（${s.id}）`;
+    }
+    const current = chats.current(owner, chat);
+    const list = chats.list(owner, chat);
+    return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}`).join('\n') || '暂无会话');
+  }));
+  command('/close [id:string]', '关闭当前或指定会话').action(manage((owner, chat, id) => {
+    const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
+    if (!s) throw Error('未找到你的会话');
+    if (busy(s.id)) throw Error('该会话仍在处理消息，请等待完成或先用 /stop 取消');
+    chats.close(s.id, owner, chat); return `已关闭：${s.name}（${s.id}）。历史回复可用 /retry 任务编号取回。`;
+  }));
+  command('/status [id:string]', '连接与任务状态').action(async ({ session }, id) => {
+    const j = currentJob(session, id);
+    if (id) return j ? status(j) : '未找到你的任务';
+    let connection;
+    try {
+      await web.ready;
+      const health = web.health();
+      connection = `桥接 ${health.pluginVersion}；浏览器${health.online ? '已连接' : '未连接，请检查 Chrome 扩展'}`;
+    } catch { connection = '本机桥接未启动，请检查端口并重启实例'; }
+    return connection + '\n' + (j ? status(j) : '当前会话暂无任务');
   });
-  command('桥接取消 [id:string]', '停止最近或指定任务').action(({ session }, id) => {
+  command('/stop [id:string]', '停止任务').action(({ session }, id) => {
     const j = currentJob(session, id);
     if (!j) return '未找到你的任务';
     const result = q.cancel(j);
     if (j.status === 'cancelled') sessions.delete(j.id);
     return result;
   });
-  command('桥接重发 [id:string]', '重新发送最近或指定任务的回复').action(({ session }, id) => {
+  command('/retry [id:string]', '重发已取回的回复').action(({ session }, id) => {
     const j = currentJob(session, id); return j ? deliver(j, session) : '未找到你的任务';
   });
-  command('桥接新建会话 [name:text]', '新建另一个网页会话并切换过去，与当前会话并存').action(manage((owner, chat, name) => {
-    const s = chats.create(owner, chat, name);
-    return `已新建并切换：${s.name}（${s.id}）。\n之后的消息会进入这个新会话，上下文与原来的会话互相独立。`;
-  }));
-  command('桥接会话列表', '列出自己的会话及当前选择').action(manage((owner, chat) => {
-    const current = chats.current(owner, chat);
-    const list = chats.list(owner, chat);
-    return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（下一条消息会自动建立「默认会话」）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}`).join('\n') || '暂无会话');
-  }));
-  command('桥接切换会话 <id:string>', '切换到自己的指定会话').action(manage((owner, chat, id) => {
-    const s = chats.select(id, owner, chat); return `已切换：${s.name}（${s.id}）`;
-  }));
-  command('桥接重命名会话 <id:string> <name:text>', '修改会话名称').action(manage((owner, chat, id, name) => {
-    const s = chats.rename(id, owner, chat, name); return `已重命名：${s.name}（${s.id}）`;
-  }));
-  command('桥接关闭会话 [id:string]', '关闭指定或当前会话，保留历史记录').action(manage((owner, chat, id) => {
-    const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
-    if (!s) throw Error('未找到你的会话');
-    if (busy(s.id)) throw Error('该会话仍在处理消息，请等待完成或先取消');
-    chats.close(s.id, owner, chat); return `已关闭会话 ${s.id}，历史记录仍可通过「桥接重发 任务编号」取回。`;
-  }));
-  command('桥接记录 [id:string]', '查看指定或当前会话最近十条任务').action(manage((owner, chat, id) => {
-    const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
-    if (!s) throw Error('未找到你的会话');
-    const jobs = q.jobs.filter(j => j.owner === owner && j.conversation === chat && j.sessionId === s.id).slice(-10).reverse();
-    return `${s.name}（${s.id}）\n` + (jobs.map(j => `${j.id} ${labels[j.status]} ${imagesIn(j).length ? `[图片 ${imagesIn(j).length} 张] ` : ''}${submissionText(j.input).slice(0, 60) || '（纯图片）'}`).join('\n') || '暂无任务');
-  }));
-  // 默认就是持续会话，所以不再有「退出会话」这种状态。真正需要的是「把这个会话
-  // 结束掉，重新开始」——旧会话上下文太长、话题已经跑偏，或者网页那边的会话被删了。
-  command('桥接重开会话 [name:text]', '结束当前会话，之后的消息开启一个全新的网页会话').action(manage((owner, chat, name) => {
-    name = chats.name(name);
-    const previous = chats.current(owner, chat);
-    if (previous) {
-      if (busy(previous.id)) throw Error('当前会话仍在处理消息，请等待完成或先取消');
-    }
-    const s = chats.reopen(owner, chat, name);
-    return `已结束旧会话，开启新会话：${s.name}（${s.id}）。\n之后的消息进入全新的网页会话，不再携带旧上下文。`;
-  }));
+  command('/logs [mode:string]', '过程通知 on/off').action(({ session }, mode) => logs(session, mode));
+  // Route exact slash commands ourselves: Koishi strips a leading slash from
+  // command definitions, which would register bare words and collide with help.
+  // Keep one authorized registry for routing and help, regardless of ctx prefix.
+  scope.middleware((session, next) => {
+    const segments = toSegments(session.elements);
+    if (segments.some(s => s.type === 'image')) return next();
+    const text = (session.stripped?.content ?? submissionText(segments)).trim();
+    if (/^桥接(?:帮助|连接|日志|状态|取消|重发|新建会话|会话列表|切换会话|重命名会话|关闭会话|记录|重开会话)(?:\s|$)/.test(text))
+      return '命令已精简，请发送 /help 查看。';
+    const match = /^(\/[a-z]+)(?:\s+([\s\S]*))?$/i.exec(text);
+    const selected = match && commands.find(c => c.name === match[1].toLowerCase());
+    if (!selected) return next();
+    const value = match[2]?.trim();
+    if (value && (!selected.definition.includes('[') || (selected.definition.includes(':string') && /\s/.test(value))))
+      return `用法：${selected.definition.replace(/:string|:text/g, '')}`;
+    return selected.handler({ session }, value);
+  }, true);
   // 兜底转发：注册在所有命令之后，所以命令优先，其余消息一律送去 ChatGPT。
   // 这就是「桥接」的全部：没有意图识别，也没有自然语言分类。
   scope.middleware((session, next) => next(() => forward(session)));
@@ -284,7 +268,7 @@ exports.apply = (ctx, config) => {
     const j = q.active?.job, s = j && sessions.get(j.id);
     if (!j || j.status !== 'running' || !s || j.progressNotified || !notifications(s) || Date.now()-j.startedAt < 60000 || !fresh(s)) return;
     j.progressNotified = true;
-    await send(s, `任务 ${j.id} 仍在 ChatGPT 网页处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n若稍后没有收到回复，请发送「桥接重发」。`).catch(() => {});
+    await send(s, `任务 ${j.id} 仍在 ChatGPT 网页处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n/status 查看进度，/retry 取回回复。`).catch(() => {});
   }, 10000);
   ctx.on('dispose', () => { q.close(); web?.close(); });
 };

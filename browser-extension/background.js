@@ -33,6 +33,24 @@ async function page(tabId,op,job){
  return results[0].result;
 }
 async function store(current,status){if(!current)inputs.clear();await chrome.storage.local.set({current,status});}
+function timings(current){
+ return current.timing||(current.timing={openedAt:current.openedAt,sentAt:current.sentAt});
+}
+// Keep one bounded snapshot, including across worker restarts. These timestamps
+// distinguish a visible-but-still-streaming answer from polling/upload delays.
+function observeReply(current,info,{ownsReply,busy,empty,pendingImage,waited}){
+ const now=Date.now(),timing=timings(current);
+ timing.sentAt=current.sentAt;timing.submittedAt=timing.submittedAt||now;
+ timing.maxPollGapMs=Math.max(timing.maxPollGapMs||0,timing.lastObservedAt?now-timing.lastObservedAt:0);
+ timing.lastObservedAt=now;
+ if(ownsReply&&info.replyLength)timing.firstTextAt=timing.firstTextAt||now;
+ if(ownsReply&&info.images&&!info.imageLoading)timing.firstImageAt=timing.firstImageAt||now;
+ timing.waitReason=info.stopping?'generating':!ownsReply?'reply-missing':pendingImage?'image-loading':
+  empty?'content-empty':busy&&waited<=240000?'busy-status':'settling';
+ timing.state={stopping:!!info.stopping,busyStatus:busy,replyLength:info.replyLength||0,images:info.images||0,
+  imageLoading:!!info.imageLoading,pendingGallery:!!info.pendingGallery};
+ if(timing.waitReason==='settling')timing.firstIdleAt=timing.firstIdleAt||now;
+}
 // The draft record is what replaces the old in-prompt marker: it lets the worker
 // recognise its own leftover text without putting anything into the user's prompt.
 async function saveDraft(text){await chrome.storage.local.set({draft:text||null});}
@@ -56,13 +74,21 @@ async function waitForComposer(current,info){
   'ChatGPT 页面加载超时，无法定位消息输入框；本次未提交，请检查专用标签页');
 }
 async function returnReply(current){
- const reply=current.reply;
+ const reply=current.reply,timing=timings(current);
+ timing.returnStartedAt=timing.returnStartedAt||Date.now();
  for(let index=current.uploaded||0;index<reply.imageCount;index++){
+  const upload=(timing.uploads||(timing.uploads=[]))[index]||{index,startedAt:Date.now()};
+  timing.uploads[index]=upload;timing.waitReason='image-upload';
+  await store(current,'正在读取并回传回复图片');
   const image=await page(current.tabId,'image',{...current,imageIndex:index});
+  upload.encodedAt=Date.now();
   await uploadAsset(current.id,index,image.base64);
+  upload.uploadedAt=Date.now();
   current.uploaded=index+1;await store(current,'正在回传回复图片');
  }
- await api('/result',{id:current.id,threadId:reply.threadId,segments:reply.segments,probe:reply.probe});
+ timing.resultPostedAt=Date.now();timing.waitReason='result-post';
+ await store(current,'正在将完整回复交给 Koishi');
+ await api('/result',{id:current.id,threadId:reply.threadId,segments:reply.segments,probe:{...reply.probe,timing}});
  await store(null,'回复已交给 Koishi 回传 QQ');
  await chrome.tabs.remove(current.tabId).catch(()=>{});
 }
@@ -236,17 +262,24 @@ async function tick(){
    current.submittedConfirmed=true;current.submittedUserId=info.userId||'';current.submittedUserText=info.userText;
    await store(current,'本轮消息已确认，正在等待回复');
   }
+  const waited=Date.now()-current.sentAt;
+  const newAssistant=current.assistantId && info.assistantId && current.assistantId!==info.assistantId;
+  const boundedReply=current.submittedConfirmed&&info.replyBounded&&info.replyBlocks>0;
+  const ownsReply=!!(boundedReply||((info.assistants>current.baseline||newAssistant)
+   &&!(current.assistantId&&info.assistantId===current.assistantId)));
+  const busy=!!info.stopping||/正在生成|生成中|正在创建|正在思考|正在调用|Generating|Thinking|Creating image/i.test(info.busyText);
+  const empty=!info.replyLength && !info.images;
+  const pendingImage=info.imageLoading || info.pendingGallery || (info.gallery && !info.images);
+  observeReply(current,info,{ownsReply,busy,empty,pendingImage,waited});
+  await store(current,info.stopping||busy||empty||pendingImage?'ChatGPT 正在生成回复':'正在等待网页回复结束');
   if(info.threadId){
    await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted',evidence:{
     workerVersion:chrome.runtime.getManifest?.().version||'development',userId:info.userId||'',
     userBaseline:current.userBaseline,users:info.users,assistantBaseline:current.baseline,assistants:info.assistants,
     assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
-   }});
+   },timing:current.timing});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
   }
-  const waited=Date.now()-current.sentAt;
-  const newAssistant=current.assistantId && info.assistantId && current.assistantId!==info.assistantId;
-  const boundedReply=current.submittedConfirmed&&info.replyBounded&&info.replyBlocks>0;
   if((info.assistants<=current.baseline && !newAssistant&&!boundedReply) || info.stopping){
    if(waited>240000)throw Object.assign(Error('等待网页回复超时，生成未结束或尚未出现本轮回复'),{probe:info.probe});
    return;
@@ -262,12 +295,9 @@ async function tick(){
   // text answer can stream for minutes. Silence is not a finished answer: only a
   // stable reply on a page that is no longer busy counts as done.
   if(waited<1500)return;
-  const busy=info.stopping||/正在生成|生成中|正在创建|正在思考|正在调用|Generating|Thinking|Creating image/i.test(info.busyText);
   // 「没有任何可读内容」和「图还在画」都算没完成。ChatGPT 会先渲染一个空的
   // assistant 轮次（只有无障碍标题），图片要几十秒后才出现；在这里提前收工，
   // 后面的 chrome.tabs.remove 会把还在生成的图片一起关掉。
-  const empty=!info.replyLength && !info.images;
-  const pendingImage=info.imageLoading || info.pendingGallery || (info.gallery && !info.images);
   // The hard cap rejects only a reply that still has no usable content. A complete
   // image or text can become visible on the boundary tick; throwing before this
   // check discarded that valid result (job d4a2a235d1c0). At the cap, stale busy
@@ -278,8 +308,11 @@ async function tick(){
   if((busy&&waited<=240000)||empty||pendingImage){current.stableAt=Date.now();await store(current,'ChatGPT 正在生成回复');return;}
   if(current.lastSignature!==info.replySignature){current.lastSignature=info.replySignature;current.stableAt=Date.now();await store(current,'正在等待网页回复结束');return;}
   if(Date.now()-current.stableAt<3000)return;
-  await api('/progress',{id:task.id,threadId:info.threadId,phase:'reading'});
+  current.timing.waitReason='reading';current.timing.readStartedAt=Date.now();
+  await store(current,'正在读取网页完整回复');
+  await api('/progress',{id:task.id,threadId:info.threadId,phase:'reading',timing:current.timing});
   const reply=await page(current.tabId,'read',current);
+  current.timing.readFinishedAt=Date.now();
   if(!reply.segments||!reply.segments.length)throw Object.assign(Error('网页已结束回答，但没有读取到可回传的内容'),{probe:reply.probe});
   current.phase='returning';current.reply={...reply,threadId:reply.threadId||info.threadId};
   await store(current,'回复已读取，正在回传');
@@ -296,7 +329,7 @@ async function tick(){
     if(!current.failure){
      if(!err.probe)err.probe=await page(current.tabId,'probe',current).catch(()=>undefined);
      const phase=current.phase;
-     current.failure={message,probe:err.probe};current.phase='failing';
+     current.failure={message,probe:{...err.probe,timing:timings(current)}};current.phase='failing';
      await chrome.storage.local.set({current,lastFailure:{id:current.id,tabId:current.tabId,threadId:current.threadId||'',phase,
       recoveryCount:current.recoveryCount||0,message,at:Date.now()}});
     }

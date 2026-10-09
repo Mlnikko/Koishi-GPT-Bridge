@@ -74,7 +74,7 @@ function truncateSegment(segment, width) {
   return content ? open + content + close : '';
 }
 
-// 完整回复文本（含代码围栏），用于 reply.md 与「桥接重发」。
+// 完整回复文本（含代码围栏），用于 reply.md 与「/retry」。
 function replyText(segments) {
   return (segments || [])
     .map(segment => segment.type === 'image' ? '' : segment.type === 'code' ? fenceCode(segment) : String(segment.text ?? ''))

@@ -21,7 +21,7 @@ plugins:
     # groupChat: true
 
     # 是否默认发送接收确认和进度提醒。默认 true；false 表示只发最终回复或失败原因。
-    # 用户可用 /logs on|off 或「桥接日志 开启|关闭」覆盖，按用户和聊天位置保存。
+    # 用户可用 /logs on|off 覆盖，按用户和聊天位置保存。
     # notifyProgress: false
 
     # 本机桥接端口，需与 browser-extension/config.js 中的地址保持一致。

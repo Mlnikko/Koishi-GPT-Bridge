@@ -279,3 +279,21 @@ test('bound conversation ID and first submission evidence remain available for d
  assert.equal(saved.users,3);assert.equal(saved.userId,'user-message');
  await call('/result',{id:job.id,threadId:id,segments:[{type:'text',text:'done'}]});await result;
 });
+
+test('progress timing snapshots overwrite bounded state without breaking failure reports',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const result=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const timing={sentAt:100,firstImageAt:200,waitReason:'generating'};
+ await call('/progress',{id:job.id,phase:'submitted',timing});
+ const updated={...timing,firstIdleAt:300,waitReason:'reading'};
+ await call('/progress',{id:job.id,phase:'reading',timing:updated});
+ const file=path.join(job.dir,'timing.json'),saved=JSON.parse(fs.readFileSync(file));
+ assert.equal(saved.firstImageAt,200);assert.equal(saved.firstIdleAt,300);assert.equal(saved.waitReason,'reading');
+ assert.ok(saved.at>0);
+ assert.equal((await call('/progress',{id:'another-task',phase:'reading',timing:{sentAt:999}})).status,409);
+ await call('/progress',{id:job.id,phase:'reading',timing:{oversize:'x'.repeat(20000)}});
+ assert.deepEqual(JSON.parse(fs.readFileSync(file)),saved);
+ await call('/failure',{id:job.id,message:'ChatGPT 页面加载超时',probe:{timing:updated}});
+ assert.equal((await result).code,'browser_interaction');
+ assert.deepEqual(JSON.parse(fs.readFileSync(path.join(job.dir,'dom-probe.json'))).timing,updated);
+});

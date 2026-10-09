@@ -25,7 +25,7 @@ macOS 同样在 Koishi Desktop 的实例管理界面重启对应实例。不要�
 
 ## 判断运行中的实例是否加载了新代码
 
-0.3.4 起优先使用 `npm run doctor` 或在 QQ 发送「桥接连接」，直接核对运行中插件版本与扩展心跳。自定义目录使用 `npm run doctor -- "/实际/dataDir"`。这两种检查不会提交网页任务，也不会更新浏览器在线时间；服务返回旧版 404 表示仍需重启实例。
+0.3.4 起优先使用 `npm run doctor` 或在 QQ 发送「/status」，直接核对运行中插件版本与扩展心跳。自定义目录使用 `npm run doctor -- "/实际/dataDir"`。0.3.4 初版的连接命令为“桥接连接”，精简后统一使用 `/status`。这两种检查不会提交网页任务，也不会更新浏览器在线时间；服务返回旧版 404 表示仍需重启实例。
 
 以下 `/input` 探针只用于识别更早版本，不用于 0.3.4 的在线诊断：
 
@@ -71,7 +71,7 @@ grep -n "loader apply plugin codex-image-local" "%APPDATA%\Koishi\Desktop\data\l
    `node scripts/setup-web-bridge.cjs <端口> "<Koishi 实际数据目录的绝对路径>"`。
    路径含空格或中文时加引号；脚本复用已有令牌，不覆盖它，非法端口直接报错。
 3. 启动或重启 Koishi 实例，在 `chrome://extensions` 加载或重载 browser-extension。
-   打开弹窗确认版本 0.3.4、本机地址及“已连接本机 Koishi，等待任务”；再用“桥接连接”确认插件也是 0.3.4。
+   打开弹窗确认版本 0.3.5、本机地址及“已连接本机 Koishi，等待任务”；再用“/status”确认插件也是 0.3.5。
 4. 在相同 Chrome 用户配置中登录 ChatGPT 普通聊天，允许扩展访问 ChatGPT 网站。
    依次验证短文字、参考图片、图文混合和同一会话连续两轮；网页每个任务只新增一轮用户消息，QQ 收到本轮回复。
 5. 等待任务完成后重启 Chrome，再验证连接和一条短文字。电脑睡眠或 Chrome 完全退出时不处理任务，唤醒后检查连接再发送。
@@ -163,7 +163,7 @@ Koishi Desktop 重启实例，于是形成「升级 → 重启 → 再升级」�
 最终回复和失败原因不受 `/logs off` 影响。QQ 适配器的被动回复窗口约 298 秒，插件按原消息
 时间计算剩余等待预算（包含下载和排队），最迟约 270 秒请求停止网页，再预留最多 15 秒等待停止确认。
 最终反馈不会因为旧的 255 秒判断被静默跳过；发送失败会保存 `feedbackDelivery: failed` 和
-`deliveryError`，可用「桥接状态 任务编号」查询，已取回的回复可用「桥接重发 任务编号」获取。
+`deliveryError`，可用「/status 任务编号」查询，已取回的回复可用「/retry 任务编号」获取。
 扩展的加载、生成中、新轮次未出现和旧轮次未更新分支也执行超时检查。
 
 | 现象 | 排查方向 |
@@ -178,6 +178,7 @@ Koishi Desktop 重启实例，于是形成「升级 → 重启 → 再升级」�
 | 网页已经结束回答，任务却报「没有读取到可回传的内容」 | 先看 `data/jobs/<id>/dom-probe.json`（扩展在失败时附带的页面结构快照：轮次数、角色节点、每张图的来源/尺寸/是否在用户气泡内/是否属于页面框架/是否被选中、最新轮次截断 HTML）。据此判断是回复还没渲染完、Markdown 容器选择器失配，还是 `h4[data-conversation-role="assistant"]` 已经改名。 |
 | 回复里少了图片，或者图片不对 | 只在最新 assistant 轮次内找图，所以先确认图确实渲染在该轮次里。任务目录的 `result-probe.json` 记录了每张图的 `picked`/`chrome`/`chromeReason`/`inReplyTurn`/`alt`：`chromeReason` 直接说明是**哪条规则**把哪张图判掉的（`ancestor:header` 是页面框架，`outside-main` 是会话不在 `<main>` 内），`alt` 含 `用户附件` 说明是**你自己发出去的参考图**。`turns` 为 `0` 说明 `[data-testid^="conversation-turn"]` 已失效，`assistantAnchor`、`userNodes`、`main` 能进一步说明选择器是否还认得出来。改完扩展必须在 `chrome://extensions` 手动重载。 |
 | 任务卡在「ChatGPT 已接收，正在生成回复」，最后报「未检测到本轮图片」 | 图片识别没找到图，扩展会一直等到 240 秒硬上限（这是刻意的：宁可等也不返回错图）。看 `dom-probe.json` 的 `images`：如果里面有一张尺寸正常的 `blob:` 图但 `picked:false`，问题在筛选规则，看同一行的 `chromeReason` 即可定位。 |
+| 网页已有文字或图片，但 QQ 很晚才收到 | 0.3.5 起查看任务目录 `timing.json` 的 `waitReason`：`generating` 为当前输入区仍显示停止生成；`image-loading` 为图片或另一张画廊未就绪；`busy-status` 为当前回复仍有生成状态；`settling` 为等待完整内容稳定。`firstTextAt`/`firstImageAt` 只记录首次检测到本轮可读内容，不等于整条回复已经结束；`firstIdleAt` 为首次满足结束候选条件。`maxPollGapMs` 记录提交确认后的最大检测间隔，供排查浏览器暂停或注入阻塞。最终 `result-probe.json.timing` 的 `readStartedAt`/`readFinishedAt`、`uploads[].startedAt`/`encodedAt`/`uploadedAt`、`resultPostedAt` 区分读取、图片编码/上传和回传；与该文件 `at`、`job.json` 的 `finishedAt`/`deliveredAt` 比较可定位桥接接收及 QQ 发送耗时。失败时查看 `dom-probe.json.timing`。时间单位为毫秒，记录按轮询采样，不是网页精确渲染时间。 |
 | 纯图片消息发不出去 | 空正文提交后如果发送按钮一直不解锁，扩展会在 5 秒后补**一个空格**再试一次。仍失败说明页面结构变了。 |
 | 输入框里留着上一次的草稿 | 只有与扩展自己记录的 `draft` 完全一致的草稿才会被自动清掉，其余内容一律不动并提示你手动清空。 |
 | 实例反复重启 | `market` 插件在逐个升级依赖，每次升级都会重启实例。等日志静默即可，不要在此期间手动改 `node_modules`。 |
@@ -206,7 +207,7 @@ npm run doctor    # 运行中实例的只读健康检查
 1. 没有 job.json：检查授权、群聊 @、输入校验、下载错误和 Koishi 日志。
 2. queued/running：查看 progress、扩展弹窗和专用标签页；关闭/刷新该页可能使提交状态不可判定。
 3. failed：查看 errorCode、failure.json、dom-probe.json；不要仅凭画面有旧回复就认定本轮成功。
-4. 存在 result.json：结构化结果已持久化。进程中断后重启会把对应未完成任务恢复为 ready；用“桥接重发 任务编号”从当前 QQ 消息建立新的回复窗口。
+4. 存在 result.json：结构化结果已持久化。进程中断后重启会把对应未完成任务恢复为 ready；用“/retry 任务编号”从当前 QQ 消息建立新的回复窗口。
 5. ready 且 delivery=failed/sending/pending：查看 deliveryCursor、deliveryError 和 deliveryPlan。显式重发从未确认片段继续；sent 任务显式重发会从头发。
 6. QQ 收到截断提示：读取本机 reply.md；重发不会绕过长度上限。
 
@@ -219,7 +220,7 @@ sendTimeoutMs 默认 20000；它限制等待确认，不会取消适配器已经
 
 安装新代码后在 Chrome 扩展管理页重新加载扩展，确认版本 0.3.1。此次会话修复在扩展侧；插件运行时代码未变。不要在仍在生成的任务中途重载扩展。
 
-遇到“多个输入框”，扩展先排除回复内的写作块等编辑区域，再等待页面稳定；符合安全条件时最多刷新原专用标签页一次。这个过程保持原会话上下文。无需因输入框问题反复“桥接重开会话”。
+遇到“多个输入框”，扩展先排除回复内的写作块等编辑区域，再等待页面稳定；符合安全条件时最多刷新原专用标签页一次。这个过程保持原会话上下文。无需因输入框问题反复“/new”。
 
 如果仍失败，点击扩展弹窗中的“查看最近故障网页”，或查看任务目录 dom-probe.json 的 editorCandidates（excluded、selected、score、ancestors）、sendCandidates、expectedThreadId、recoveryCount。新探针不保存输入框正文，仅记录长度与结构属性。不要将完整探针作为公开日志分享，其他回复探针字段仍可能含对话内容。
 
@@ -232,4 +233,4 @@ sendTimeoutMs 默认 20000；它限制等待确认，不会取消适配器已经
 
 本次已确认的漏图原因是末尾 assistant 块为空、生成画廊在其外侧，且可见历史数量会回落。新版本按本轮用户消息边界收集多个回复块；检查新探针中的 replyRoots、readableImages、baselineUsers、baselineAssistants、assistantId 和 workerVersion，可验证识别结果。
 
-真实验收应在同一会话连续发两条不同的短消息，再验证一次图像回复。确认每轮网页新增正确的用户消息、只提取本轮画廊，并检查 job.json 的 ready、delivery=sent 与 QQ 实际收到的消息。历史失败任务没有落盘 result.json/result-*.png 时，“桥接重发”不会重新读取网页，也不会再次生成；所需旧图片需从保留的网页会话中获取。
+真实验收应在同一会话连续发两条不同的短消息，再验证一次图像回复。确认每轮网页新增正确的用户消息、只提取本轮画廊，并检查 job.json 的 ready、delivery=sent 与 QQ 实际收到的消息。历史失败任务没有落盘 result.json/result-*.png 时，“/retry”不会重新读取网页，也不会再次生成；所需旧图片需从保留的网页会话中获取。

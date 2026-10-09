@@ -66,7 +66,7 @@ class JobQueue {
     if (duplicate) return { job: duplicate, duplicate: true };
     if (this.closed) throw new Error('桥接服务正在关闭');
     if (sessionId && this.jobs.some(j => j.sessionId === sessionId && j.owner === owner && j.conversation === conversation && ['queued', 'running'].includes(j.status))) {
-      throw new Error('当前会话仍在处理上一条消息，请等待完成，或发送「桥接取消」停止后再试。');
+      throw new Error('当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。');
     }
     const list = Array.isArray(segments) ? segments : [];
     const text = submissionText(list);
