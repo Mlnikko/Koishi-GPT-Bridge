@@ -3,7 +3,11 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const http = require('node:http');
 const plugin = require('../src/index.cjs');
+const { request: desktopRequest } = require('../scripts/desktop-transport.cjs');
+const { workOne: desktopWorkOne } = require('../scripts/desktop-worker.cjs');
+const { visionPng } = require('../scripts/vision-fixture.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-test-'));
 const wait = () => new Promise(resolve => setImmediate(resolve));
@@ -111,6 +115,49 @@ const bridgeOf = async root => {
   }
   throw new Error('桥接端口未就绪');
 };
+
+test('desktop opt-in delivers through the plugin queue and switches back to the unchanged web bridge', async () => {
+  const app = apply({ desktopThreadId: THREAD, desktopOwnerId: 'alice', desktopBridgePort: 0, notifyProgress: false });
+  await bridgeOf(app.root);
+  const api = (endpoint, body) => desktopRequest({ root: app.root, endpoint, body });
+  await api('/state');
+  assert.match(await dispatch(app, session({ userId: 'bob' }), '/desktop on'), /未为你的私聊/);
+  const s = session({ messageId: 'desktop-1', elements: [{ type: 'text', attrs: { content: 'hello client' } }] });
+  assert.match(await dispatch(app, s, '/desktop on'), /已绑定/);
+  await dispatch(app, s);
+  const baseline = 'aaaaaaaa-2222-3333-4444-555555555555', user = 'bbbbbbbb-2222-3333-4444-555555555555', agent = 'cccccccc-2222-3333-4444-555555555555';
+  let submitted = false;
+  await wait();
+  const result = await desktopWorkOne({ api, sleep: async () => {}, sendMessage: async ({ prompt, threadId }) => {
+    assert.equal(prompt, 'hello client'); assert.equal(threadId, THREAD); submitted = true; return { content: [{ type: 'text', text: JSON.stringify({ threadId }) }] };
+  }, readThread: async () => ({ thread: { id: THREAD, kind: 'chatgpt', status: { type: 'idle' } }, turns: [
+    ...(submitted ? [{ id: user, status: 'completed', items: [{ type: 'userMessage', id: user, content: [{ type: 'text', text: 'hello client' }] }, { type: 'agentMessage', id: agent, text: 'client reply' }] }] : []),
+    { id: baseline, status: 'completed', items: [] },
+  ] }) });
+  assert.equal(result.text, 'client reply');
+  const [clientJob] = await settle(app.root);
+  assert.equal(clientJob.backend, 'desktop'); assert.equal(clientJob.delivery, 'sent');
+  assert.equal(s.sent.at(-1), 'client reply');
+  assert.match(await dispatch(app, s, '/desktop off'), /切回网页/);
+  const { port, token } = await bridgeOf(app.root), headers = { 'x-bridge-token': token, 'Content-Type': 'application/json' };
+  const state = async () => (await (await fetch(`http://127.0.0.1:${port}/state`, { headers })).json()).job;
+  await state();
+  const webSession = session({ messageId: 'web-after-desktop', elements: [{ type: 'text', attrs: { content: 'hello web' } }] });
+  await dispatch(app, webSession); await wait();
+  const webJob = await state(); assert.equal(webJob.text, 'hello web');
+  await fetch(`http://127.0.0.1:${port}/result`, { method: 'POST', headers, body: JSON.stringify({ id: webJob.id, threadId: THREAD, segments: [{ type: 'text', text: 'web reply' }] }) });
+  await settle(app.root); assert.equal(webSession.sent.at(-1), 'web reply');
+});
+
+test('desktop single-chat ownership persists; another local conversation and images cannot reuse it', async () => {
+  const app = apply({ desktopThreadId: THREAD, desktopOwnerId: 'alice', desktopBridgePort: 0 });
+  const s = session(); await dispatch(app, s, '/desktop on');
+  const imageSession = session({ elements: [{ type: 'img', attrs: { src: png() } }] });
+  assert.match(await dispatch(app, imageSession), /仅支持文字/); assert.equal(jobFiles(app.root).length, 0);
+  await dispatch(app, s, '/new other');
+  assert.match(await dispatch(app, s, '/desktop on'), /只绑定一个本地会话/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items.filter(c => c.backend === 'desktop').length, 1);
+});
 
 test('a private message is forwarded as-is and persisted as a job', async () => {
   const app = apply();
@@ -365,10 +412,10 @@ test('the plugin refuses to load without an allowedUsers list', () => {
 
 const slash = (app, text, options = {}) => dispatch(app, session({ ...options, elements: [{ type: 'text', attrs: { content: text } }] }), text);
 
-test('help lists all nine short commands and slash commands stay local and authorized', async () => {
+test('help lists short commands including backend selection and stays local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
@@ -416,7 +463,7 @@ test('removed Chinese commands only show the migration notice and never create j
 
 test('all short commands remain gated by private authorization and group mentions', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
-  for (const text of ['/help', '/new', '/chat', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
+  for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
     assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
     assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
   }
@@ -716,4 +763,122 @@ test('status and cancellation commands operate on the owned running job and awai
  await fetch(`http://127.0.0.1:${port}/failure`,{method:'POST',headers,body:JSON.stringify({id:job.id,message:'任务已取消'})});
  const [ended]=await settle(app.root);assert.equal(ended.status,'cancelled');
  assert.match(await dispatch(app,s,'/stop'),/已结束/);
+});
+
+async function localServer(t, onChat) {
+  const requests = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks = []; for await (const part of req) chunks.push(part);
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/models') return res.end('{"data":[{"id":"local-chat"},{"id":"text-embedding-nomic"}]}');
+    if (req.url === '/api/v1/models') return res.end('{"models":[{"key":"local-chat","capabilities":{"vision":true}}]}');
+    const body = JSON.parse(Buffer.concat(chunks).toString()); requests.push(body);
+    if (onChat) return onChat(body, res);
+    const content = body.messages.at(-1).content;
+    res.end(JSON.stringify({ choices: [{ message: { content: Array.isArray(content) ? '本地图片回答' : '本地回答 ' + content }, finish_reason: 'stop' }] }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return { url: `http://127.0.0.1:${server.address().port}/v1`, requests };
+}
+
+test('LM Studio commands drive continuous chat, isolate users and inherit the local backend on /new', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const s = session({ elements: [{ type: 'text', attrs: { content: '暗号 8427' } }] });
+  await dispatch(app, s, '/reasoning high');
+  assert.match(await dispatch(app, s, '/backend lmstudio'), /已切换到 LM Studio：local-chat/);
+  assert.equal(jobFiles(app.root).length, 0);
+  assert.match(await dispatch(app, s, '/reasoning medium'), /使用本地模型设置/);
+  assert.match(await dispatch(app, s, '/status'), /LM Studio 已连接/);
+  await dispatch(app, s); await settle(app.root);
+  assert.equal(s.sent.at(-1), '本地回答 暗号 8427');
+  assert.equal(s.sent.length, 1, '/logs off behavior applies to local inference');
+  const first = jobFiles(app.root)[0]; assert.equal(first.backend, 'lmstudio'); assert.equal(first.reasoningEffort, undefined);
+  assert.match(await dispatch(app, s, '/chat'), /\[LM Studio：local-chat\]/);
+  s.messageId = 'local-2'; s.elements = [{ type: 'text', attrs: { content: '暗号是什么？' } }];
+  await dispatch(app, s); await settle(app.root);
+  assert.deepEqual(provider.requests[1].messages.map(m => m.content), ['暗号 8427', '本地回答 暗号 8427', '暗号是什么？']);
+  const beforeRetry = provider.requests.length;
+  assert.equal(await dispatch(app, s, '/retry'), undefined);
+  assert.equal(provider.requests.length, beforeRetry, '/retry must deliver stored output without inference');
+  const other = session({ userId: 'bob', channelId: 'bob', messageId: 'other-1', elements: [{ type: 'text', attrs: { content: '你好' } }] });
+  await dispatch(app, other, '/backend lmstudio'); await dispatch(app, other); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages.length, 1);
+  assert.match(await dispatch(app, s, '/new 新话题'), /已开启/);
+  assert.match(await dispatch(app, s, '/backend'), /当前后端：LM Studio/);
+  s.messageId = 'local-new'; await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages.length, 1);
+  await dispatch(app, s, `/chat ${first.sessionId}`);
+  assert.match(await dispatch(app, s, '/backend web'), /切回 ChatGPT 网页/);
+  assert.match(await dispatch(app, s, '/reasoning'), /推理程度：高/);
+  await dispatch(app, s, '/backend lmstudio');
+  s.messageId = 'local-return'; await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages.length, 5, 'returning to local restores its prior context');
+});
+
+test('QQ image/text messages reach local vision inference and text follow-ups retain the original images', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const bytes = visionPng({ width: 64, height: 40 }), src = 'data:image/png;base64,' + bytes.toString('base64');
+  const s = session({ messageId: 'vision-qq-1', elements: [
+    { type: 'text', attrs: { content: '看左图' } }, { type: 'img', attrs: { src } },
+    { type: 'text', attrs: { content: '再看右图' } }, { type: 'img', attrs: { src } },
+  ] });
+  assert.match(await dispatch(app, session(), '/backend lmstudio'), /已切换到 LM Studio/); await dispatch(app, s);
+  const [first] = await settle(app.root);
+  assert.equal(first.status, 'ready'); assert.equal(s.sent.at(-1), '本地图片回答');
+  const content = provider.requests[0].messages[0].content;
+  assert.deepEqual(content.map(p => p.type), ['text', 'image_url', 'text', 'image_url']);
+  assert.equal(content[1].image_url.url, src);
+  s.messageId = 'vision-qq-2'; s.elements = [{ type: 'text', attrs: { content: '左边是什么颜色？' } }];
+  await dispatch(app, s); await settle(app.root);
+  assert.deepEqual(provider.requests[1].messages[0].content, content);
+  assert.equal(provider.requests[1].messages.at(-1).content, '左边是什么颜色？');
+  const before = provider.requests.length; await dispatch(app, s, '/retry');
+  assert.equal(provider.requests.length, before);
+});
+
+test('QQ image-only and quoted images keep their labels and pixels on the local backend', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const src = 'data:image/png;base64,' + visionPng({ width: 64, height: 40 }).toString('base64');
+  const s = session({ messageId: 'only-qq-image', elements: [{ type: 'img', attrs: { src } }] });
+  assert.match(await dispatch(app, session(), '/backend lmstudio'), /已切换到 LM Studio/); await dispatch(app, s); await settle(app.root);
+  assert.deepEqual(provider.requests[0].messages[0].content.map(p => p.type), ['image_url']);
+  s.messageId = 'quoted-qq-image'; s.elements = [{ type: 'text', attrs: { content: '这是什么？' } }];
+  s.quote = { elements: [{ type: 'img', attrs: { src } }] };
+  await dispatch(app, s); await settle(app.root);
+  const last = provider.requests[1].messages.at(-1).content;
+  assert.match(last.filter(p => p.type === 'text').map(p => p.text).join('\n'), /引用消息[\s\S]*本次消息[\s\S]*这是什么/);
+  assert.equal(last.find(p => p.type === 'image_url').image_url.url, src);
+});
+
+test('local cancellation aborts HTTP, prevents backend changes while busy and leaves history untouched', async t => {
+  let reached; const started = new Promise(resolve => { reached = resolve; });
+  const provider = await localServer(t, () => reached());
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const s = session({ elements: [{ type: 'text', attrs: { content: '慢请求' } }] });
+  await dispatch(app, s, '/backend lmstudio'); await dispatch(app, s); await started;
+  assert.match(await dispatch(app, s, '/status'), /LM Studio处理中/);
+  assert.match(await dispatch(app, s, '/backend web'), /正在处理任务/);
+  assert.match(await dispatch(app, s, '/stop'), /停止本地模型/);
+  const [cancelled] = await settle(app.root); assert.equal(cancelled.status, 'cancelled');
+  assert.equal(fs.existsSync(path.join(app.root, 'lmstudio')), false);
+  assert.match(await dispatch(app, s, '/backend web'), /切回 ChatGPT 网页/);
+  assert.equal(provider.requests.length, 1);
+});
+
+test('a failed or racing model lookup never changes backend or submits a task', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url });
+  const s = session();
+  assert.match(await dispatch(app, s, '/backend lmstudio missing'), /未提供聊天模型/);
+  assert.match(await dispatch(app, s, '/backend'), /当前后端：ChatGPT 网页/);
+  assert.match(await dispatch(app, s, '/backend invalid'), /用法/);
+  assert.equal(jobFiles(app.root).length, 0);
+  const changing = dispatch(app, s, '/backend lmstudio');
+  await dispatch(app, s, '/new other');
+  assert.match(await changing, /状态已变化/);
+  assert.match(await dispatch(app, s, '/backend'), /当前后端：ChatGPT 网页/);
 });

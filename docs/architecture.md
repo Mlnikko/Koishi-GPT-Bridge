@@ -7,7 +7,7 @@
 ```
 index.cjs            插件入口，可用全部
    │
-   ├── bridge/       传输层：与 Chrome 扩展的本机 HTTP 桥接
+   ├── bridge/       传输层：网页、本机模型、客户端文字原型
    │      │
    ├── core/         领域层：消息片段、会话、队列
    │      │
@@ -18,7 +18,7 @@ index.cjs            插件入口，可用全部
 | --- | --- | --- |
 | `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs`、`state.cjs` |
 | `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`queue.cjs` |
-| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs` |
+| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`desktop-bridge.cjs`、`lmstudio-bridge.cjs` |
 | `src/index.cjs` | 全部 | 入口 |
 
 `test/architecture.test.cjs` 会把这张表变成可执行约束，检查四件事：
@@ -28,7 +28,7 @@ index.cjs            插件入口，可用全部
 3. 没有从入口不可达的孤立模块（防重构后留下死代码）。
 4. 运行时模块不含 `child_process`、`execFile`、`codexPath`、`CODEX_HOME`、`runner.cjs`。
 
-第 4 条是防止本地 CLI 调用路径回归的哨兵。所有收发都经由浏览器内的在线页面完成，一旦有人重新引入
+第 4 条是防止本地 CLI 调用路径回归的哨兵。网页后端收发经由浏览器内的在线页面完成，一旦有人重新引入
 本地子进程，就必须同时重新处理「不继承 Koishi 密钥」与「Windows 无进程组信号」两件事。
 
 ## 模块职责
@@ -46,6 +46,12 @@ index.cjs            插件入口，可用全部
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
 | `src/core/queue.cjs` | 任务队列的持久化与串行执行；参考图从暂存目录移入任务目录；终态任务的保留期清理。 |
 | `src/bridge/web-bridge.cjs` | 本机 HTTP 桥接服务（默认 127.0.0.1:5141）。管理当前网页任务、令牌校验、进度与结果回传、参考图字节按需下发、回复图片二进制上传。 |
+| `src/bridge/desktop-bridge.cjs` | 可选客户端文字桥接（默认 127.0.0.1:5142）。限定一个普通 ChatGPT 聊天和一个私聊用户，持久化提交阶段与回复凭据，复用队列的结果和回传流程。 |
+
+客户端原型由 `scripts/desktop-worker.cjs` 接收注入的 `read_thread` / `send_message_to_thread`，
+在获得授权的 Codex 工作聊天中执行。`scripts/desktop-transport.cjs` 只负责令牌认证的本机 HTTP 传输，
+不连接客户端受保护的原生管道。网页扩展继续使用原端口。运行方法、验收范围与限制见
+[客户端文字原型](desktop-text-prototype.md)。
 
 ## 数据模型
 
@@ -199,6 +205,29 @@ scope.middleware((session, next) => next(() => forward(session)));
 
 取消只是请求网页停止生成，是否真正停下取决于浏览器状态，也不保证远端计算立即停止或返还额度。
 服务重启后进行中的任务标记 interrupted，不自动重复生成。
+
+## LM Studio 本地连接器
+
+`src/bridge/lmstudio-bridge.cjs` 直接请求本机 OpenAI 兼容的 `/v1/models` 和 `/v1/chat/completions`，
+不使用浏览器或子进程。`/backend lmstudio [模型编号]` 先检查模型列表，再原子保存当前会话的后端和模型；
+模型查询期间会话变更或出现新任务时不应用切换。入队时冻结后端与模型，处理中禁止切换后端。
+
+本地历史以服务地址、用户、聊天位置、会话编号、模型编号共同生成 SHA-256 文件名，保存到
+`data/lmstudio/`；每轮包含任务编号、原始用户文字、有序输入片段及助手正文。兼容没有输入片段的旧版文字历史。
+图片按内容 SHA-256 保存到该会话的 `*-images/` 目录，记录中只保存文件名、类型和体积；
+输入及历史图片均检查文件类型、大小，历史文件还核对哈希，拒绝路径穿越和符号链接。
+图片成功推理后先原子保存原图副本，再原子提交会话历史，
+再保存 `reply.md` 和 `result.json`，复用队列的结果恢复和 QQ 发送游标。已提交的同编号轮次不再次推理。
+重启中断的任务不自动重放；未生成有效正文、取消或超时的请求不写入会话历史。
+
+上下文按完整问答对限制轮数、字符数、图片数和图片总字节数；本次输入先占用预算，旧问答超限时整体移除。
+提交新历史后清理不再引用的原图；任务 `retentionDays` 清理独立于会话图片副本。
+`/new` 沿用本地后端及模型，创建独立上下文；网页与各本地模型的历史分别保存。
+仅传递正文回复，模型单独的 reasoning 字段不发回 QQ；达到生成上限时附明确提示。
+图片轮次及携带图片历史的文字续聊先通过原生 `/api/v1/models` 校验 `capabilities.vision`（包含已加载实例别名）；
+向兼容 API 发送有序 `text` / `image_url` 内容，图片使用经校验的原图 data URL。
+支持纯图片、多图片、文字图片交错和引用图片。取消通过 AbortSignal 中止 HTTP 等待，
+不承诺服务端计算立即停止。
 
 ## ChatGPT 网页连接器
 

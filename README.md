@@ -1,13 +1,56 @@
 # Koishi-GPT-Bridge
 
-Koishi 本机 ChatGPT 网页桥接。
+Koishi 本机 ChatGPT / LM Studio 对话桥接。
 
-把 QQ 消息原样送进 Chrome 里**已登录的 ChatGPT 普通聊天页面**，再把网页的回复原样送回 QQ。
-不调用 OpenAI 接口，不需要 API Key，也不调用任何本地 CLI。请保持 Chrome、扩展和 Koishi 运行；
+默认把 QQ 消息原样送进 Chrome 里**已登录的 ChatGPT 普通聊天页面**，再把网页的回复原样送回 QQ。
+网页模式不调用 OpenAI 接口，不需要 API Key，也不调用任何本地 CLI。请保持 Chrome、扩展和 Koishi 运行；
 网页额度以账号实际限制为准。
 
-**只有一个后端：ChatGPT 网页。** 插件本身不启动任何外部进程，全部收发都通过本机 5141 端口的桥接
-交给浏览器里的在线页面完成。
+默认后端为 ChatGPT 网页，也可用 `/backend lmstudio` 切换到本机模型。插件本身不启动任何外部进程；
+网页后端通过本机 5141 端口连接 Chrome 扩展，本地后端直接请求 LM Studio 的 HTTP API。
+
+可选的 [客户端 ChatGPT 单聊天文字原型](docs/desktop-text-prototype.md) 已验证连续对话和回复回传。
+用 `/desktop on` 启用、`/desktop off` 切回网页；需要 Codex 工作聊天中的执行器保持运行，尚不能作为独立后台服务使用。
+
+### 本机 LM Studio（0.3.8）
+
+在 LM Studio 的 Developer 页面启动 API 服务，并准备一个聊天模型。默认连接
+`http://127.0.0.1:1234/v1`，只允许本机回环地址；无需 Chrome 或 ChatGPT 登录。
+重启 Koishi 实例加载本次更新后，在 QQ 私聊发送（群聊需 @ 机器人）：
+
+```text
+/backend lmstudio
+你好
+接着刚才的话题继续聊
+```
+
+- `/backend` 查看当前后端；`/backend web` 切回 ChatGPT 网页。
+- 只有一个聊天模型时自动选择；有多个时发送 `/backend lmstudio 模型编号`，例如
+  `/backend lmstudio google/gemma-4-31b`。嵌入模型用于向量计算，不用于聊天。
+- 每个用户在每个私聊/群聊的会话拥有独立上下文；历史保存在 `data/lmstudio/`，重启后继续。
+  `/new [名称]` 沿用本地后端和模型，开启空白上下文；`/chat` 可切回旧话题。
+- 网页与本地的上下文分别保留，切换后端不会复制另一边的历史。更换本地模型也使用独立上下文。
+- 本地接入支持文字、图片加文字、纯图片和引用消息中的图片。图片需视觉模型（如本机 Gemma 4 31B），
+  插件先检查 LM Studio 报告的视觉能力；文字与图片按原顺序提交，图片随会话保存，后续文字提问仍带原图。
+  本地模型返回文字，不能通过此接入生成图片。`/reasoning` 操作网页设置，本地模型使用 LM Studio 的设置。
+- `/logs`、`/status`、`/stop`、`/retry` 沿用现有命令。`/stop` 中止 HTTP 请求并停止等待，服务端是否立即停止计算取决于 LM Studio；
+  `/retry` 只重发已保存的结果，不再次调用模型。连接失败、超时或服务重启时不自动重新提交消息。
+- 上下文默认最多保留最近 20 轮、合计 12000 字符；超出时按完整问答对移除最早历史。
+- 历史图片默认最多 4 张、总计 20 MB（每次输入仍最多 2 张、每张 10 MB）；超出任一上下文上限时
+  移除最早问答及其不再使用的图片。原图另存于会话目录，清理旧任务不会影响保留中的图片上下文。
+  模型自己的 token 上限仍可能更小；遇到上下文超限可 `/new` 或调低 `lmStudioHistoryChars`。
+  任务保留策略 `retentionDays` 不删除会话上下文。
+
+可选配置：`lmStudioBaseUrl`、`lmStudioModel`、`lmStudioApiKey`（启用服务认证时）、
+`lmStudioMaxTokens`（默认 2048）、`lmStudioHistoryTurns`（默认 20）、`lmStudioHistoryChars`（默认 12000）、
+`lmStudioHistoryImages`（默认 4）、`lmStudioHistoryImageBytes`（默认 20 MB）。历史图片上限需容纳一次允许的最大输入；
+提高 `maxInputImages` 或 `maxInputBytes` 时，未指定的历史图片默认上限会相应提高。
+设置 `lmStudioModel` 可指定首次切换时的默认模型。完整示例见 `koishi.example.yml`。
+
+运行 `npm run validate:lmstudio` 可通过真实本地模型验证插件消息流、两轮续聊和重启后上下文；
+测试使用临时数据及模拟 QQ 发送，不向真实 QQ 用户发消息，也不改现有聊天。
+`npm run validate:lmstudio -- --vision` 验证真实视觉模型：图片与文字输入、重启并清理任务后看原图续聊、
+`/new` 图片上下文隔离。测试图和结果保存在打印出的临时目录中。
 
 ## 怎么用
 
@@ -26,7 +69,7 @@ Koishi 本机 ChatGPT 网页桥接。
 
 ### 管理命令
 
-发送 `/help` 查看下面这 9 个命令。命令以 `/` 开头；普通的「取消」「stop」等文字仍作为聊天内容发送。
+发送 `/help` 查看下面这些命令。命令以 `/` 开头；普通的「取消」「stop」等文字仍作为聊天内容发送。
 方括号中的参数可省略；任务默认选择当前会话最近一条，也可填写任务编号查询或取回历史回复。
 
 | 命令 | 作用 |
@@ -34,6 +77,7 @@ Koishi 本机 ChatGPT 网页桥接。
 | `/help` | 帮助 |
 | `/new [名称]` | 开启新对话，旧会话保留 |
 | `/chat [会话编号]` | 列出会话；带编号切换 |
+| `/backend [web\|lmstudio] [模型编号]` | 查看或切换对话后端；本地可指定模型 |
 | `/close [会话编号]` | 关闭当前或指定会话，保留历史记录 |
 | `/status [任务编号]` | 查看连接与任务状态；带编号查询指定任务 |
 | `/stop [任务编号]` | 取消排队，或请求停止生成 |
@@ -176,7 +220,7 @@ node scripts/setup-web-bridge.cjs 5141 "/实际路径/Koishi 数据目录"
 ```
 
 Windows 路径同样需要加引号，例如 `node scripts/setup-web-bridge.cjs 5141 "D:\Koishi Data"`。
-生成后重载扩展，弹窗应显示版本 `0.3.6`、正确的本机地址和“已连接本机 Koishi，等待任务”。
+生成后重载扩展，弹窗应显示版本 `0.3.7`、正确的本机地址和“已连接本机 Koishi，等待任务”。
 “令牌不匹配”表示配置与运行中 Koishi 的数据目录不一致；连接失败则先确认 Koishi 已启动、端口一致。
 完整跨平台安装与验收步骤见 [运维文档](docs/operations.md#macos--windows-安装与验收)。
 
@@ -221,7 +265,8 @@ koishi-codex-image-bridge/
 │   │   ├── preferences.cjs     用户在各聊天中的过程通知设置
 │   │   └── queue.cjs           任务队列持久化与串行执行
 │   └── bridge/                 传输层，可用 core 与 lib
-│       └── web-bridge.cjs      与 Chrome 扩展的本机 HTTP 桥接（127.0.0.1:5141）
+│       ├── web-bridge.cjs      与 Chrome 扩展的本机 HTTP 桥接（127.0.0.1:5141）
+│       └── lmstudio-bridge.cjs 本机模型 API、独立上下文与回复保存
 ├── browser-extension/          Chrome MV3 扩展
 │   ├── background.js           任务状态机与恢复
 │   ├── bridge-client.js        本机 HTTP 通信与图片字节传输

@@ -24,9 +24,32 @@ plugins:
     # 用户可用 /logs on|off 覆盖，按用户和聊天位置保存。
     # notifyProgress: false
 
+    # 本机 LM Studio。重启后在 QQ 发 /backend lmstudio 启用，/backend web 切回。
+    # 默认地址如下，仅接受本机回环地址。一个聊天模型时可不指定模型编号。
+    # lmStudioBaseUrl: http://127.0.0.1:1234/v1
+    # lmStudioModel: google/gemma-4-31b
+    # 服务启用认证时配置；建议通过 Koishi 的环境变量引用提供令牌。
+    # lmStudioApiKey: ${{ env.LM_STUDIO_API_KEY }}
+    # 每次最大生成 token 数；与模型自身上下文窗口共同约束请求。
+    # lmStudioMaxTokens: 2048
+    # 保存最近多少轮和总字符数，超出时按完整问答对移除最早历史。
+    # lmStudioHistoryTurns: 20
+    # lmStudioHistoryChars: 12000
+    # 视觉模型的会话图片上限；超限时移除最早完整问答和不再引用的原图。
+    # 原图随会话独立保存，清理任务后仍可续聊。上限须容纳一次允许的最大输入。
+    # lmStudioHistoryImages: 4
+    # lmStudioHistoryImageBytes: 20971520
+
     # 本机桥接端口，需与 browser-extension/config.js 中的地址保持一致。
     # 默认 5141。改动后需重跑：node scripts/setup-web-bridge.cjs <端口>
     # webBridgePort: 5141
+
+    # 客户端 ChatGPT 单聊天文字原型（默认不开启）。详见 docs/desktop-text-prototype.md。
+    # 使用原始聊天 UUID，不能填分享链接中的 UUID；仅绑定一个明确授权的私聊用户。
+    # 执行器须在具有客户端聊天工具的 Codex 工作聊天中运行。
+    # desktopThreadId: '6ac9ff70-0c00-83ec-997b-b61ed3668413'
+    # desktopOwnerId: '你的 QQ openid'
+    # desktopBridgePort: 5142
 
     # 单条消息的文字上限，同时也是单条回复的拆分长度。默认 1500 字。
     # maxTextChars: 1500

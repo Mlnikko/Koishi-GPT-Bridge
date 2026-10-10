@@ -41,9 +41,10 @@ class Conversations {
   // 会话里」的落点。第一次收到消息时按需建出来，之后一直复用，所以改图这类
   // 「接着上一张继续说」的用法不需要任何命令。
   ensure(owner, chat, name) { return this.current(owner, chat) || this.create(owner, chat, name); }
-  create(owner, chat, name) {
+  create(owner, chat, name, { backend, model } = {}) {
     if (this.list(owner, chat).length >= 20) throw Error('最多保留 20 个打开的会话，请先用「/close 编号」关闭不需要的会话');
-    const s = { id: randomUUID().replaceAll('-', '').slice(0, 8), owner, chat, name: this.name(name), createdAt: Date.now() };
+    const s = { id: randomUUID().replaceAll('-', '').slice(0, 8), owner, chat, name: this.name(name), createdAt: Date.now(),
+      ...(backend === 'lmstudio' && model ? { backend, lmStudioModel: model } : {}) };
     return this.commit(data => { data.items.push(s); data.current[this.key(owner, chat)] = s.id; return s.id; });
   }
   select(id, owner, chat) {
@@ -91,6 +92,26 @@ class Conversations {
     if (s.webThreadId && s.webThreadId !== threadId) throw Error('ChatGPT 会话编号发生变化');
     if (s.webThreadId === threadId) return s;
     return this.commit(data => { data.items.find(item => item.id === s.id).webThreadId = threadId; return s.id; });
+  }
+  setDesktop(s, threadId) {
+    if (threadId && this.data.items.some(item => item.id !== s.id && item.desktopThreadId === threadId))
+      throw Error('客户端原型只绑定一个本地会话，请切回已绑定的会话');
+    return this.commit(data => {
+      const item = data.items.find(item => item.id === s.id);
+      if (threadId) { item.backend = 'desktop'; item.desktopThreadId = threadId; }
+      else delete item.backend;
+      return s.id;
+    });
+  }
+  setBackend(s, backend, model) {
+    if (!['web', 'lmstudio'].includes(backend)) throw Error('无效的对话后端');
+    if (backend === 'lmstudio' && (typeof model !== 'string' || !model.trim())) throw Error('请选择本地聊天模型');
+    return this.commit(data => {
+      const item = data.items.find(item => item.id === s.id);
+      if (backend === 'lmstudio') { item.backend = backend; item.lmStudioModel = model; }
+      else delete item.backend;
+      return s.id;
+    });
   }
   // 网页侧的会话被删除或链接失效时解绑。持续会话意味着用户不会自己去换会话，
   // 所以这里必须能自愈，否则一个失效编号会把这个用户永久卡死。

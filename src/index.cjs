@@ -3,6 +3,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WebBridge } = require('./bridge/web-bridge.cjs');
+const { DesktopBridge } = require('./bridge/desktop-bridge.cjs');
+const { LMStudioBridge } = require('./bridge/lmstudio-bridge.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
 const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('./core/reasoning.cjs');
@@ -22,18 +24,42 @@ exports.apply = (ctx, config) => {
   // one level down from the project root, hence the `..`.
   const { dataDir: root, maxTextChars, maxReplyChars, maxInputImages,
     sendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
-  // There is exactly one backend: the already-signed-in ChatGPT web page driven
-  // by the local extension. Nothing here spawns an external CLI or needs API keys.
+  // The web backend remains the default. The opt-in text prototype is serviced
+  // by an authorized desktop task; neither backend spawns a local CLI.
   const sessions = new Map(), locks = new Set();
   const chats = new Conversations(path.join(root, 'conversations.json'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141,
     timeoutMs: replyTimeoutMs, pluginVersion: version });
+  const desktop = config.desktopThreadId ? new DesktopBridge({ root, port: config.desktopBridgePort,
+    threadId: config.desktopThreadId, timeoutMs: replyTimeoutMs }) : null;
+  const local = new LMStudioBridge({ root, baseUrl: config.lmStudioBaseUrl, apiKey: config.lmStudioApiKey,
+    model: config.lmStudioModel, maxTokens: config.lmStudioMaxTokens, historyTurns: config.lmStudioHistoryTurns,
+    historyChars: config.lmStudioHistoryChars, historyImages: config.lmStudioHistoryImages,
+    historyImageBytes: config.lmStudioHistoryImageBytes, maxImageBytes: maxInputBytes, timeoutMs: replyTimeoutMs });
+  const backendLabel = backend => backend === 'lmstudio' ? 'LM Studio' : backend === 'desktop' ? 'ChatGPT 客户端' : 'ChatGPT 网页';
   const busy = id => q.jobs.some(j => j.sessionId === id && ['queued', 'running'].includes(j.status));
   const labels = { queued: '排队中', running: 'ChatGPT 网页处理中', ready: '回复已取回', failed: '处理失败', cancelled: '已取消', interrupted: '服务重启，状态待确认' };
   const q = new JobQueue(path.join(root, 'jobs'), (j, signal, onThread) => {
     const chat = j.sessionId && chats.get(j.sessionId, j.owner, j.conversation);
     if (j.sessionId && !chat) throw Error('会话已关闭或不存在');
+    if (j.backend === 'lmstudio') {
+      if (chat?.backend !== 'lmstudio' || chat.lmStudioModel !== j.model) throw Error('本地会话配置已变化，任务未提交');
+      const session = sessions.get(j.id);
+      const remaining = session ? session.timestamp + 270000 - Date.now() : replyTimeoutMs;
+      if (remaining <= 0) throw Error('消息等待过久，本地模型任务未提交，请重新发送');
+      return local.run(j, { signal, timeoutMs: Math.min(replyTimeoutMs, remaining),
+        onProgress: phase => { if (j.progress !== phase) { j.progress = phase; q.save(j); } } });
+    }
+    if (j.backend === 'desktop') {
+      if (!desktop || j.owner !== config.desktopOwnerId || j.backendThreadId !== config.desktopThreadId
+        || chat?.desktopThreadId !== j.backendThreadId) throw Error('客户端原型绑定已变化，任务未提交');
+      const session = sessions.get(j.id);
+      const remaining = session ? session.timestamp + 270000 - Date.now() : replyTimeoutMs;
+      if (remaining <= 0) throw Error('消息等待过久，客户端任务未提交，请重新发送');
+      return desktop.run(j, { signal, onThread, timeoutMs: Math.min(replyTimeoutMs, remaining),
+        onProgress: phase => { if (j.progress !== phase) { j.progress = phase; q.save(j); } } });
+    }
     // The QQ adapter keeps passive reply IDs for 298 seconds. Include queue and
     // download time, and reserve 15 seconds to stop the page plus time to reply.
     const session = sessions.get(j.id);
@@ -94,9 +120,10 @@ exports.apply = (ctx, config) => {
   const conversation = s => `${s.platform}:${s.channelId}`;
   const notifications = s => preferences.enabled(s.userId, conversation(s));
   const imagesIn = j => imagesOf(j.input);
-  const status = j => `任务 ${j.id}：${labels[j.status] || j.status}，已等待 ${Math.floor((Date.now()-j.createdAt)/1000)} 秒。`
+  const status = j => `任务 ${j.id}：${j.status === 'running' ? backendLabel(j.backend) + '处理中' : labels[j.status] || j.status}，已等待 ${Math.floor((Date.now()-j.createdAt)/1000)} 秒。`
     + (j.progress && j.status === 'running' ? `\n${j.progress}` : '')
     + (j.sessionId ? `\n会话：${j.sessionId}` : '\n独立任务（不绑定网页会话）')
+    + (j.backend === 'lmstudio' ? `\n本地模型：${j.model}` : '')
     + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort)}` : '')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
@@ -147,6 +174,11 @@ exports.apply = (ctx, config) => {
     let chat;
     try { chat = chats.ensure(session.userId, conversation(session)); }
     catch (err) { return textMessage(safeReason(err.message)); }
+    if (chat.backend === 'desktop') {
+      if (!desktop || !session.isDirect || session.userId !== config.desktopOwnerId) return '客户端原型只允许已配置的私聊用户使用';
+      if (sources.length) return '客户端原型仅支持文字；请发送 /desktop off 使用网页图片功能';
+      if (chat.reasoningEffort) return '客户端原型沿用客户端选项，请先发送 /reasoning default';
+    }
     const duplicate = session.messageId && q.jobs.find(j => j.owner === session.userId && j.conversation === conversation(session) && j.messageId === session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
     if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。';
@@ -161,11 +193,12 @@ exports.apply = (ctx, config) => {
       }
       if (!chats.get(chat.id, session.userId, conversation(session))) throw Error('会话已关闭，请重新发送消息');
       const { job, duplicate: again } = q.enqueue({ owner: session.userId, conversation: conversation(session),
-        messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.reasoningEffort, segments: prepared });
+        messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.backend === 'lmstudio' ? undefined : chat.reasoningEffort,
+        backend: chat.backend, backendThreadId: chat.desktopThreadId, model: chat.lmStudioModel, segments: prepared });
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
-      try { if (notifications(session)) await send(session, textMessage(`已接收 ${job.id}${reference}，正在送往 ChatGPT。\n会话：${chat.name}（${job.sessionId}）\n/status 查看进度，/stop 停止。`)); }
+      try { if (notifications(session)) await send(session, textMessage(`已接收 ${job.id}${reference}，正在送往 ${backendLabel(job.backend)}。\n会话：${chat.name}（${job.sessionId}）\n/status 查看进度，/stop 停止。`)); }
       catch { job.deliveryError = '接收确认未送达'; q.save(job); }
       void q.pump();
     }
@@ -197,7 +230,8 @@ exports.apply = (ctx, config) => {
     chats.current(session.userId, conversation(session))?.id);
   command('/help', '帮助').action(help);
   command('/new [name:text]', '开启新对话').action(manage((owner, chat, name) => {
-    const s = chats.create(owner, chat, name);
+    const previous = chats.current(owner, chat);
+    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel });
     return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`;
   }));
   command('/chat [id:string]', '会话列表；带编号切换').action(manage((owner, chat, id) => {
@@ -207,22 +241,63 @@ exports.apply = (ctx, config) => {
     const current = chats.current(owner, chat);
     const list = chats.list(owner, chat);
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.reasoningEffort ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'desktop' ? ' [客户端文字]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
   }));
+  command('/backend [target:text]', '查看或切换 web/lmstudio；可附模型编号').action(async ({ session }, target) => {
+    try {
+      const chat = chats.ensure(session.userId, conversation(session));
+      if (!target) return textMessage(`当前后端：${backendLabel(chat.backend)}${chat.backend === 'lmstudio' ? '（' + chat.lmStudioModel + '）' : ''}。\n/backend lmstudio [模型编号] 切换本地；/backend web 切回网页。两边的上下文分别保留。`);
+      const [backend, ...args] = target.trim().split(/\s+/);
+      if (!['web', 'lmstudio'].includes(backend) || args.length > 1 || (backend === 'web' && args.length))
+        return '用法：/backend web 或 /backend lmstudio [模型编号]';
+      if (busy(chat.id)) return '当前会话正在处理任务，请等待完成或用 /stop 停止后再切换';
+      const model = backend === 'lmstudio' ? await local.resolveModel(args[0] || chat.lmStudioModel || config.lmStudioModel) : undefined;
+      // The model lookup is asynchronous: another message or command may have
+      // changed the current conversation while it was in flight.
+      if (chats.current(session.userId, conversation(session))?.id !== chat.id || busy(chat.id))
+        return '当前会话或任务状态已变化，请重试切换后端';
+      chats.setBackend(chat, backend, model);
+      return textMessage(backend === 'lmstudio' ? `已切换到 LM Studio：${model}。直接发文字或图片即可连续对话；图片需视觉模型，/new 开启新话题。`
+        : '当前会话已切回 ChatGPT 网页；本地模型的历史仍保留。');
+    } catch (err) { return textMessage(safeReason(err.message)); }
+  });
   command('/close [id:string]', '关闭当前或指定会话').action(manage((owner, chat, id) => {
     const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
     if (!s) throw Error('未找到你的会话');
     if (busy(s.id)) throw Error('该会话仍在处理消息，请等待完成或先用 /stop 取消');
     chats.close(s.id, owner, chat); return `已关闭：${s.name}（${s.id}）。历史回复可用 /retry 任务编号取回。`;
   }));
+  if (desktop) command('/desktop [mode:string]', '客户端单聊天文字原型 on/off').action(({ session }, mode) => {
+    if (!desktop || !session.isDirect || session.userId !== config.desktopOwnerId) return '未为你的私聊配置客户端文字原型';
+    try {
+      if (mode && !['on', 'off'].includes(mode)) return '用法：/desktop on 或 /desktop off';
+      const chat = chats.ensure(session.userId, conversation(session));
+      if (!mode) return `当前后端：${backendLabel(chat.backend)}；/desktop on 或 /desktop off`;
+      if (busy(chat.id)) return '当前会话正在处理任务，请等待完成后切换';
+      chats.setDesktop(chat, mode === 'on' ? config.desktopThreadId : null);
+      return mode === 'on' ? '已绑定客户端单聊天文字原型。仅支持文字；客户端执行器须保持运行。' : '当前会话已切回网页接入。';
+    } catch (err) { return textMessage(safeReason(err.message)); }
+  });
   command('/status [id:string]', '连接与任务状态').action(async ({ session }, id) => {
     const j = currentJob(session, id);
     if (id) return j ? status(j) : '未找到你的任务';
     let connection;
+    const chat = chats.current(session.userId, conversation(session));
+    if (chat?.backend === 'lmstudio') {
+      try {
+        await local.resolveModel(chat.lmStudioModel);
+        connection = `桥接 ${version}；LM Studio 已连接；当前模型：${chat.lmStudioModel}`;
+      } catch (err) { connection = `桥接 ${version}；LM Studio：${textMessage(safeReason(err.message))}`; }
+      return connection + '\n' + (j ? status(j) : '当前会话暂无任务');
+    }
     try {
       await web.ready;
       const health = web.health();
       connection = `桥接 ${health.pluginVersion}；浏览器${health.online ? '已连接' : '未连接，请检查 Chrome 扩展'}`;
+      if (desktop) {
+        await desktop.ready;
+        connection += `\n客户端文字执行器${desktop.health().online ? '已连接' : '未连接'}；当前后端：${chats.current(session.userId, conversation(session))?.backend === 'desktop' ? '客户端文字' : '网页'}`;
+      }
     } catch { connection = '本机桥接未启动，请检查端口并重启实例'; }
     return connection + '\n' + (j ? status(j) : '当前会话暂无任务');
   });
@@ -238,6 +313,7 @@ exports.apply = (ctx, config) => {
   });
   command('/logs [mode:string]', '过程通知 on/off').action(({ session }, mode) => logs(session, mode));
   command('/reasoning [level:string]', '当前会话推理程度 default/instant/medium/high/xhigh/pro').action(manage((owner, chat, value) => {
+    if (chats.current(owner, chat)?.backend === 'lmstudio') return 'LM Studio 使用本地模型设置；/reasoning 适用于 ChatGPT 网页。';
     if (!value) {
       const s = chats.current(owner, chat);
       return `当前会话推理程度：${reasoningLabel(s?.reasoningEffort)}。\n${REASONING_USAGE}\n即时 / 中 / 高 / 超高 / Pro；default 跟随网页。`;
@@ -281,7 +357,7 @@ exports.apply = (ctx, config) => {
     const j = q.active?.job, s = j && sessions.get(j.id);
     if (!j || j.status !== 'running' || !s || j.progressNotified || !notifications(s) || Date.now()-j.startedAt < 60000 || !fresh(s)) return;
     j.progressNotified = true;
-    await send(s, `任务 ${j.id} 仍在 ChatGPT 网页处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n/status 查看进度，/retry 取回回复。`).catch(() => {});
+    await send(s, `任务 ${j.id} 仍在 ${backendLabel(j.backend)}处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n/status 查看进度，/retry 取回回复。`).catch(() => {});
   }, 10000);
-  ctx.on('dispose', () => { q.close(); web?.close(); });
+  ctx.on('dispose', () => { q.close(); web?.close(); desktop?.close(); });
 };

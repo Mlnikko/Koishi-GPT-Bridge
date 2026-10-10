@@ -21,7 +21,40 @@ Windows 上没有 `koi` 命令（`C:\Program Files\Koishi\Desktop\koi.exe` 是 G
 和 `yarn.cjs`），重启只能在 Koishi Desktop 的托盘/界面里手动操作实例。
 macOS 同样在 Koishi Desktop 的实例管理界面重启对应实例。不要照搬上述 Windows 盘符或未经确认的应用内部 CLI 路径。
 
+2026-10-10 本机另已核对 macOS Koishi Desktop v1.1.4 的 `koi --help` 与 `koi ps`：支持实例重启命令。
+可先运行 `/Applications/Koishi.app/Contents/MacOS/koi ps` 确认实例名称；本机实际使用
+`/Applications/Koishi.app/Contents/MacOS/koi restart default` 重启成功。其他安装和 Windows 仍需先核对对应入口。
+
+也可在运行中的 Koishi 控制台进入「插件配置」，右键「全局设置」→「重载配置」重启整个实例。
+右键单个插件的「重载配置」只重建插件，仍可能沿用旧的模块缓存，不能用于确认源码更新已生效。
+本次 0.3.8 图片更新已在本机通过全局重载加载，`npm run doctor` 应报告运行中插件版本 0.3.8。
+
 桥接令牌固定保存在 `data/web-bridge-token`，重启会复用同一个值，因此不必重跑 `setup-web-bridge.cjs`。
+
+## LM Studio 本地聊天
+
+LM Studio API 服务默认监听 `127.0.0.1:1234`。在 QQ 发 `/backend lmstudio` 后直接发文字或图片即可续聊；
+`/status` 检查本地模型连接，`/backend web` 切回网页。无需改现有 QQ 适配器或 Chrome 扩展配置。
+模型列表可包含尚未加载的模型，第一次生成可能需要加载时间；本机服务、模型和电脑需保持运行。
+如果本地服务启用了认证，在插件配置中提供 `lmStudioApiKey`，不要把令牌发送到 QQ。
+图片需加载视觉模型及对应视觉投影文件，且 LM Studio 原生 `/api/v1/models` 返回 `capabilities.vision: true`。
+本机 Gemma 4 31B 已报告视觉能力。纯图片、图片加文字和引用图片都可输入；回复为文字。
+续聊重发保留中的原图，历史最多默认 4 张、20 MB，清理任务不删除会话原图。
+
+`npm run validate:lmstudio` 使用真实本地模型和临时会话，验证消息输入、回复保存、模拟 QQ 回传、
+重启后续聊及新话题隔离；不会向真实 QQ 发消息。可用 `LM_STUDIO_BASE_URL`、`LM_STUDIO_MODEL`、
+`LM_STUDIO_API_KEY` 环境变量指定测试连接。QQ 平台的真实送达需要在机器人私聊中验证。
+图片验证使用 `npm run validate:lmstudio -- --vision`：第一轮只问图形数量，删除该任务并重启临时插件后
+再问左边图形颜色，确认图片上下文来自保存的原图；最后用 `/new` 检查图片上下文隔离。
+
+本机 0.3.7 验证使用 `google/gemma-4-31b`：第一轮回复「已记住」，重启测试实例后第二轮回复「青松8427」，
+`/new` 后第三轮回复「不知道」。各轮约 18–29 秒。模型此次以 8192 token 上下文、并行 1 加载；
+性能和上下文容量会随模型加载设置及电脑负载改变。
+
+本机 0.3.8 视觉验证使用同一模型和加载配置，测试图左侧红色正方形、右侧蓝色圆形。
+首轮只问数量，回复「2」（约 37 秒）；删除首轮任务并重启测试插件，第二轮只发文字问左侧颜色，
+回复「红色」（约 28 秒）；`/new` 后再次询问之前图片，回复「不知道」（约 34 秒）。
+另核对会话原图副本与输入逐字节相同。此为真实 Gemma 推理与模拟 QQ 传输验证，未向真实 QQ 发送测试消息。
 
 ## 判断运行中的实例是否加载了新代码
 

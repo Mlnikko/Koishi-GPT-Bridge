@@ -19,3 +19,29 @@ test('malformed access, timing, port and retention settings fail immediately', (
     assert.throws(() => normalizeConfig({ allowedUsers: ['*'], ...bad }, '/tmp/bridge'));
   }
 });
+
+test('desktop prototype requires one authorized owner, original chat ID and a separate port', () => {
+  const good = { allowedUsers: ['alice'], desktopOwnerId: 'alice', desktopThreadId: '11111111-2222-3333-4444-555555555555' };
+  assert.equal(normalizeConfig(good, '/tmp/bridge').desktopBridgePort, 5142);
+  for (const bad of [{ desktopOwnerId: '*' }, { desktopOwnerId: 'bob' }, { desktopOwnerId: undefined },
+    { desktopThreadId: 'https://chatgpt.com/share/uuid' }, { desktopBridgePort: 5141 }])
+    assert.throws(() => normalizeConfig({ ...good, ...bad }, '/tmp/bridge'));
+});
+
+test('LM Studio settings validate local endpoints, credentials and context limits', () => {
+  const defaults = normalizeConfig({ allowedUsers: ['*'] }, '/tmp/bridge');
+  assert.equal(defaults.lmStudioBaseUrl, 'http://127.0.0.1:1234/v1');
+  assert.equal(defaults.lmStudioMaxTokens, 2048);
+  assert.equal(defaults.lmStudioHistoryImages, 4);
+  assert.equal(defaults.lmStudioHistoryImageBytes, 20 * 1024 * 1024);
+  const large = normalizeConfig({ allowedUsers: ['*'], maxInputImages: 6 }, '/tmp/bridge');
+  assert.equal(large.lmStudioHistoryImages, 6);
+  assert.equal(large.lmStudioHistoryImageBytes, 60 * 1024 * 1024);
+  assert.equal(normalizeConfig({ allowedUsers: ['*'], lmStudioBaseUrl: 'http://localhost:5678/v1/' }, '/tmp/bridge').lmStudioBaseUrl, 'http://localhost:5678/v1');
+  for (const bad of [{ lmStudioBaseUrl: 'http://example.com/v1' }, { lmStudioBaseUrl: 'http://127.0.0.1:1234' },
+    { lmStudioBaseUrl: 'http://user:secret@localhost:1234/v1' }, { lmStudioBaseUrl: 'http://localhost:1234/v1?key=secret' },
+    { lmStudioApiKey: 'secret\nheader' }, { lmStudioModel: {} }, { lmStudioMaxTokens: 0 },
+    { lmStudioHistoryTurns: 101 }, { lmStudioHistoryChars: -1 }, { lmStudioHistoryImages: 1 },
+    { lmStudioHistoryImages: 101 }, { lmStudioHistoryImageBytes: 1 }])
+    assert.throws(() => normalizeConfig({ allowedUsers: ['*'], ...bad }, '/tmp/bridge'));
+});
