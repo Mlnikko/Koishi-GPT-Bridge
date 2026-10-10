@@ -9,9 +9,6 @@ Koishi 本机 ChatGPT / LM Studio 对话桥接。
 默认后端为 ChatGPT 网页，也可用 `/backend lmstudio` 切换到本机模型。插件本身不启动任何外部进程；
 网页后端通过本机 5141 端口连接 Chrome 扩展，本地后端直接请求 LM Studio 的 HTTP API。
 
-可选的 [客户端 ChatGPT 单聊天文字原型](docs/desktop-text-prototype.md) 已验证连续对话和回复回传。
-用 `/desktop on` 启用、`/desktop off` 切回网页；需要 Codex 工作聊天中的执行器保持运行，尚不能作为独立后台服务使用。
-
 ### 本机 LM Studio（0.3.8）
 
 在 LM Studio 的 Developer 页面启动 API 服务，并准备一个聊天模型。默认连接

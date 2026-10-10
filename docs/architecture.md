@@ -7,7 +7,7 @@
 ```
 index.cjs            插件入口，可用全部
    │
-   ├── bridge/       传输层：网页、本机模型、客户端文字原型
+   ├── bridge/       传输层：网页、本机模型
    │      │
    ├── core/         领域层：消息片段、会话、队列
    │      │
@@ -18,7 +18,7 @@ index.cjs            插件入口，可用全部
 | --- | --- | --- |
 | `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs`、`state.cjs` |
 | `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`queue.cjs` |
-| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`desktop-bridge.cjs`、`lmstudio-bridge.cjs` |
+| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`lmstudio-bridge.cjs` |
 | `src/index.cjs` | 全部 | 入口 |
 
 `test/architecture.test.cjs` 会把这张表变成可执行约束，检查四件事：
@@ -46,12 +46,6 @@ index.cjs            插件入口，可用全部
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
 | `src/core/queue.cjs` | 任务队列的持久化与串行执行；参考图从暂存目录移入任务目录；终态任务的保留期清理。 |
 | `src/bridge/web-bridge.cjs` | 本机 HTTP 桥接服务（默认 127.0.0.1:5141）。管理当前网页任务、令牌校验、进度与结果回传、参考图字节按需下发、回复图片二进制上传。 |
-| `src/bridge/desktop-bridge.cjs` | 可选客户端文字桥接（默认 127.0.0.1:5142）。限定一个普通 ChatGPT 聊天和一个私聊用户，持久化提交阶段与回复凭据，复用队列的结果和回传流程。 |
-
-客户端原型由 `scripts/desktop-worker.cjs` 接收注入的 `read_thread` / `send_message_to_thread`，
-在获得授权的 Codex 工作聊天中执行。`scripts/desktop-transport.cjs` 只负责令牌认证的本机 HTTP 传输，
-不连接客户端受保护的原生管道。网页扩展继续使用原端口。运行方法、验收范围与限制见
-[客户端文字原型](desktop-text-prototype.md)。
 
 ## 数据模型
 

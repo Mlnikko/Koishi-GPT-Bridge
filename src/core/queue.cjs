@@ -62,7 +62,7 @@ class JobQueue {
   }
   // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
   // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
-  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, backendThreadId, model, segments = [] }) {
+  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, segments = [] }) {
     const duplicate = messageId && this.jobs.find(j => j.owner === owner && j.conversation === conversation && j.messageId === messageId);
     if (duplicate) return { job: duplicate, duplicate: true };
     if (this.closed) throw new Error('桥接服务正在关闭');
@@ -91,7 +91,6 @@ class JobQueue {
       }
     } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
     const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input,
-      ...(backend === 'desktop' ? { backend, backendThreadId } : {}),
       ...(backend === 'lmstudio' ? { backend, model } : {}),
       ...(reasoningEffort && reasoningEffort !== 'default' ? { reasoningEffort } : {}),
       status: 'queued', delivery: 'pending', createdAt: Date.now(), dir };
@@ -130,7 +129,6 @@ class JobQueue {
     if (j.status === 'queued') { j.status = 'cancelled'; j.finishedAt = Date.now(); this.save(j); return '已取消排队任务'; }
     if (j.status === 'running' && this.active?.job.id === j.id) {
       this.active.controller.abort();
-      if (j.backend === 'desktop') return '已停止等待客户端回复；已提交的消息请在客户端确认，不会自动重发';
       return j.backend === 'lmstudio' ? '已请求停止本地模型任务' : '已请求停止生成，等待网页确认';
     }
     return '任务已结束，无需取消';

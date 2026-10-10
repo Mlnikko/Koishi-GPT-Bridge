@@ -3,7 +3,6 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WebBridge } = require('./bridge/web-bridge.cjs');
-const { DesktopBridge } = require('./bridge/desktop-bridge.cjs');
 const { LMStudioBridge } = require('./bridge/lmstudio-bridge.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
@@ -24,20 +23,17 @@ exports.apply = (ctx, config) => {
   // one level down from the project root, hence the `..`.
   const { dataDir: root, maxTextChars, maxReplyChars, maxInputImages,
     sendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
-  // The web backend remains the default. The opt-in text prototype is serviced
-  // by an authorized desktop task; neither backend spawns a local CLI.
+  // The web backend remains the default; neither backend spawns a local CLI.
   const sessions = new Map(), locks = new Set();
   const chats = new Conversations(path.join(root, 'conversations.json'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141,
     timeoutMs: replyTimeoutMs, pluginVersion: version });
-  const desktop = config.desktopThreadId ? new DesktopBridge({ root, port: config.desktopBridgePort,
-    threadId: config.desktopThreadId, timeoutMs: replyTimeoutMs }) : null;
   const local = new LMStudioBridge({ root, baseUrl: config.lmStudioBaseUrl, apiKey: config.lmStudioApiKey,
     model: config.lmStudioModel, maxTokens: config.lmStudioMaxTokens, historyTurns: config.lmStudioHistoryTurns,
     historyChars: config.lmStudioHistoryChars, historyImages: config.lmStudioHistoryImages,
     historyImageBytes: config.lmStudioHistoryImageBytes, maxImageBytes: maxInputBytes, timeoutMs: replyTimeoutMs });
-  const backendLabel = backend => backend === 'lmstudio' ? 'LM Studio' : backend === 'desktop' ? 'ChatGPT 客户端' : 'ChatGPT 网页';
+  const backendLabel = backend => backend === 'lmstudio' ? 'LM Studio' : 'ChatGPT 网页';
   const busy = id => q.jobs.some(j => j.sessionId === id && ['queued', 'running'].includes(j.status));
   const labels = { queued: '排队中', running: 'ChatGPT 网页处理中', ready: '回复已取回', failed: '处理失败', cancelled: '已取消', interrupted: '服务重启，状态待确认' };
   const q = new JobQueue(path.join(root, 'jobs'), (j, signal, onThread) => {
@@ -49,15 +45,6 @@ exports.apply = (ctx, config) => {
       const remaining = session ? session.timestamp + 270000 - Date.now() : replyTimeoutMs;
       if (remaining <= 0) throw Error('消息等待过久，本地模型任务未提交，请重新发送');
       return local.run(j, { signal, timeoutMs: Math.min(replyTimeoutMs, remaining),
-        onProgress: phase => { if (j.progress !== phase) { j.progress = phase; q.save(j); } } });
-    }
-    if (j.backend === 'desktop') {
-      if (!desktop || j.owner !== config.desktopOwnerId || j.backendThreadId !== config.desktopThreadId
-        || chat?.desktopThreadId !== j.backendThreadId) throw Error('客户端原型绑定已变化，任务未提交');
-      const session = sessions.get(j.id);
-      const remaining = session ? session.timestamp + 270000 - Date.now() : replyTimeoutMs;
-      if (remaining <= 0) throw Error('消息等待过久，客户端任务未提交，请重新发送');
-      return desktop.run(j, { signal, onThread, timeoutMs: Math.min(replyTimeoutMs, remaining),
         onProgress: phase => { if (j.progress !== phase) { j.progress = phase; q.save(j); } } });
     }
     // The QQ adapter keeps passive reply IDs for 298 seconds. Include queue and
@@ -174,11 +161,6 @@ exports.apply = (ctx, config) => {
     let chat;
     try { chat = chats.ensure(session.userId, conversation(session)); }
     catch (err) { return textMessage(safeReason(err.message)); }
-    if (chat.backend === 'desktop') {
-      if (!desktop || !session.isDirect || session.userId !== config.desktopOwnerId) return '客户端原型只允许已配置的私聊用户使用';
-      if (sources.length) return '客户端原型仅支持文字；请发送 /desktop off 使用网页图片功能';
-      if (chat.reasoningEffort) return '客户端原型沿用客户端选项，请先发送 /reasoning default';
-    }
     const duplicate = session.messageId && q.jobs.find(j => j.owner === session.userId && j.conversation === conversation(session) && j.messageId === session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
     if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。';
@@ -194,7 +176,7 @@ exports.apply = (ctx, config) => {
       if (!chats.get(chat.id, session.userId, conversation(session))) throw Error('会话已关闭，请重新发送消息');
       const { job, duplicate: again } = q.enqueue({ owner: session.userId, conversation: conversation(session),
         messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.backend === 'lmstudio' ? undefined : chat.reasoningEffort,
-        backend: chat.backend, backendThreadId: chat.desktopThreadId, model: chat.lmStudioModel, segments: prepared });
+        backend: chat.backend, model: chat.lmStudioModel, segments: prepared });
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
@@ -241,7 +223,7 @@ exports.apply = (ctx, config) => {
     const current = chats.current(owner, chat);
     const list = chats.list(owner, chat);
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'desktop' ? ' [客户端文字]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
   }));
   command('/backend [target:text]', '查看或切换 web/lmstudio；可附模型编号').action(async ({ session }, target) => {
     try {
@@ -267,17 +249,6 @@ exports.apply = (ctx, config) => {
     if (busy(s.id)) throw Error('该会话仍在处理消息，请等待完成或先用 /stop 取消');
     chats.close(s.id, owner, chat); return `已关闭：${s.name}（${s.id}）。历史回复可用 /retry 任务编号取回。`;
   }));
-  if (desktop) command('/desktop [mode:string]', '客户端单聊天文字原型 on/off').action(({ session }, mode) => {
-    if (!desktop || !session.isDirect || session.userId !== config.desktopOwnerId) return '未为你的私聊配置客户端文字原型';
-    try {
-      if (mode && !['on', 'off'].includes(mode)) return '用法：/desktop on 或 /desktop off';
-      const chat = chats.ensure(session.userId, conversation(session));
-      if (!mode) return `当前后端：${backendLabel(chat.backend)}；/desktop on 或 /desktop off`;
-      if (busy(chat.id)) return '当前会话正在处理任务，请等待完成后切换';
-      chats.setDesktop(chat, mode === 'on' ? config.desktopThreadId : null);
-      return mode === 'on' ? '已绑定客户端单聊天文字原型。仅支持文字；客户端执行器须保持运行。' : '当前会话已切回网页接入。';
-    } catch (err) { return textMessage(safeReason(err.message)); }
-  });
   command('/status [id:string]', '连接与任务状态').action(async ({ session }, id) => {
     const j = currentJob(session, id);
     if (id) return j ? status(j) : '未找到你的任务';
@@ -294,10 +265,6 @@ exports.apply = (ctx, config) => {
       await web.ready;
       const health = web.health();
       connection = `桥接 ${health.pluginVersion}；浏览器${health.online ? '已连接' : '未连接，请检查 Chrome 扩展'}`;
-      if (desktop) {
-        await desktop.ready;
-        connection += `\n客户端文字执行器${desktop.health().online ? '已连接' : '未连接'}；当前后端：${chats.current(session.userId, conversation(session))?.backend === 'desktop' ? '客户端文字' : '网页'}`;
-      }
     } catch { connection = '本机桥接未启动，请检查端口并重启实例'; }
     return connection + '\n' + (j ? status(j) : '当前会话暂无任务');
   });
@@ -359,5 +326,5 @@ exports.apply = (ctx, config) => {
     j.progressNotified = true;
     await send(s, `任务 ${j.id} 仍在 ${backendLabel(j.backend)}处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n/status 查看进度，/retry 取回回复。`).catch(() => {});
   }, 10000);
-  ctx.on('dispose', () => { q.close(); web?.close(); desktop?.close(); });
+  ctx.on('dispose', () => { q.close(); web?.close(); });
 };

@@ -93,16 +93,6 @@ class Conversations {
     if (s.webThreadId === threadId) return s;
     return this.commit(data => { data.items.find(item => item.id === s.id).webThreadId = threadId; return s.id; });
   }
-  setDesktop(s, threadId) {
-    if (threadId && this.data.items.some(item => item.id !== s.id && item.desktopThreadId === threadId))
-      throw Error('客户端原型只绑定一个本地会话，请切回已绑定的会话');
-    return this.commit(data => {
-      const item = data.items.find(item => item.id === s.id);
-      if (threadId) { item.backend = 'desktop'; item.desktopThreadId = threadId; }
-      else delete item.backend;
-      return s.id;
-    });
-  }
   setBackend(s, backend, model) {
     if (!['web', 'lmstudio'].includes(backend)) throw Error('无效的对话后端');
     if (backend === 'lmstudio' && (typeof model !== 'string' || !model.trim())) throw Error('请选择本地聊天模型');

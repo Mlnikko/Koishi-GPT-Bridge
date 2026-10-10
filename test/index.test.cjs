@@ -5,8 +5,6 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const plugin = require('../src/index.cjs');
-const { request: desktopRequest } = require('../scripts/desktop-transport.cjs');
-const { workOne: desktopWorkOne } = require('../scripts/desktop-worker.cjs');
 const { visionPng } = require('../scripts/vision-fixture.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-test-'));
@@ -115,49 +113,6 @@ const bridgeOf = async root => {
   }
   throw new Error('桥接端口未就绪');
 };
-
-test('desktop opt-in delivers through the plugin queue and switches back to the unchanged web bridge', async () => {
-  const app = apply({ desktopThreadId: THREAD, desktopOwnerId: 'alice', desktopBridgePort: 0, notifyProgress: false });
-  await bridgeOf(app.root);
-  const api = (endpoint, body) => desktopRequest({ root: app.root, endpoint, body });
-  await api('/state');
-  assert.match(await dispatch(app, session({ userId: 'bob' }), '/desktop on'), /未为你的私聊/);
-  const s = session({ messageId: 'desktop-1', elements: [{ type: 'text', attrs: { content: 'hello client' } }] });
-  assert.match(await dispatch(app, s, '/desktop on'), /已绑定/);
-  await dispatch(app, s);
-  const baseline = 'aaaaaaaa-2222-3333-4444-555555555555', user = 'bbbbbbbb-2222-3333-4444-555555555555', agent = 'cccccccc-2222-3333-4444-555555555555';
-  let submitted = false;
-  await wait();
-  const result = await desktopWorkOne({ api, sleep: async () => {}, sendMessage: async ({ prompt, threadId }) => {
-    assert.equal(prompt, 'hello client'); assert.equal(threadId, THREAD); submitted = true; return { content: [{ type: 'text', text: JSON.stringify({ threadId }) }] };
-  }, readThread: async () => ({ thread: { id: THREAD, kind: 'chatgpt', status: { type: 'idle' } }, turns: [
-    ...(submitted ? [{ id: user, status: 'completed', items: [{ type: 'userMessage', id: user, content: [{ type: 'text', text: 'hello client' }] }, { type: 'agentMessage', id: agent, text: 'client reply' }] }] : []),
-    { id: baseline, status: 'completed', items: [] },
-  ] }) });
-  assert.equal(result.text, 'client reply');
-  const [clientJob] = await settle(app.root);
-  assert.equal(clientJob.backend, 'desktop'); assert.equal(clientJob.delivery, 'sent');
-  assert.equal(s.sent.at(-1), 'client reply');
-  assert.match(await dispatch(app, s, '/desktop off'), /切回网页/);
-  const { port, token } = await bridgeOf(app.root), headers = { 'x-bridge-token': token, 'Content-Type': 'application/json' };
-  const state = async () => (await (await fetch(`http://127.0.0.1:${port}/state`, { headers })).json()).job;
-  await state();
-  const webSession = session({ messageId: 'web-after-desktop', elements: [{ type: 'text', attrs: { content: 'hello web' } }] });
-  await dispatch(app, webSession); await wait();
-  const webJob = await state(); assert.equal(webJob.text, 'hello web');
-  await fetch(`http://127.0.0.1:${port}/result`, { method: 'POST', headers, body: JSON.stringify({ id: webJob.id, threadId: THREAD, segments: [{ type: 'text', text: 'web reply' }] }) });
-  await settle(app.root); assert.equal(webSession.sent.at(-1), 'web reply');
-});
-
-test('desktop single-chat ownership persists; another local conversation and images cannot reuse it', async () => {
-  const app = apply({ desktopThreadId: THREAD, desktopOwnerId: 'alice', desktopBridgePort: 0 });
-  const s = session(); await dispatch(app, s, '/desktop on');
-  const imageSession = session({ elements: [{ type: 'img', attrs: { src: png() } }] });
-  assert.match(await dispatch(app, imageSession), /仅支持文字/); assert.equal(jobFiles(app.root).length, 0);
-  await dispatch(app, s, '/new other');
-  assert.match(await dispatch(app, s, '/desktop on'), /只绑定一个本地会话/);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items.filter(c => c.backend === 'desktop').length, 1);
-});
 
 test('a private message is forwarded as-is and persisted as a job', async () => {
   const app = apply();

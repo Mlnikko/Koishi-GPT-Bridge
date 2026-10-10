@@ -44,13 +44,6 @@ plugins:
     # 默认 5141。改动后需重跑：node scripts/setup-web-bridge.cjs <端口>
     # webBridgePort: 5141
 
-    # 客户端 ChatGPT 单聊天文字原型（默认不开启）。详见 docs/desktop-text-prototype.md。
-    # 使用原始聊天 UUID，不能填分享链接中的 UUID；仅绑定一个明确授权的私聊用户。
-    # 执行器须在具有客户端聊天工具的 Codex 工作聊天中运行。
-    # desktopThreadId: '6ac9ff70-0c00-83ec-997b-b61ed3668413'
-    # desktopOwnerId: '你的 QQ openid'
-    # desktopBridgePort: 5142
-
     # 单条消息的文字上限，同时也是单条回复的拆分长度。默认 1500 字。
     # maxTextChars: 1500
 

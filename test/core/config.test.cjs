@@ -20,14 +20,6 @@ test('malformed access, timing, port and retention settings fail immediately', (
   }
 });
 
-test('desktop prototype requires one authorized owner, original chat ID and a separate port', () => {
-  const good = { allowedUsers: ['alice'], desktopOwnerId: 'alice', desktopThreadId: '11111111-2222-3333-4444-555555555555' };
-  assert.equal(normalizeConfig(good, '/tmp/bridge').desktopBridgePort, 5142);
-  for (const bad of [{ desktopOwnerId: '*' }, { desktopOwnerId: 'bob' }, { desktopOwnerId: undefined },
-    { desktopThreadId: 'https://chatgpt.com/share/uuid' }, { desktopBridgePort: 5141 }])
-    assert.throws(() => normalizeConfig({ ...good, ...bad }, '/tmp/bridge'));
-});
-
 test('LM Studio settings validate local endpoints, credentials and context limits', () => {
   const defaults = normalizeConfig({ allowedUsers: ['*'] }, '/tmp/bridge');
   assert.equal(defaults.lmStudioBaseUrl, 'http://127.0.0.1:1234/v1');
