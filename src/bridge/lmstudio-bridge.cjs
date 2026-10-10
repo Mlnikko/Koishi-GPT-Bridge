@@ -4,6 +4,7 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { writeJson } = require('../lib/state.cjs');
 const { submissionText } = require('../core/message.cjs');
+const { validatePresetSnapshot } = require('../core/presets.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
 const { sniffImage, MAX_INPUT_BYTES } = require('../lib/image.cjs');
 
@@ -177,11 +178,16 @@ class LMStudioBridge {
     // Recover a committed turn without submitting the same prompt twice.
     let turn = previous;
     if (!turn) {
+      const preset = job.preset === undefined ? undefined : validatePresetSnapshot(job.preset);
+      const promptChars = preset?.prompt.length || 0;
+      if (preset && promptChars + text.length > this.historyChars)
+        throw fail('lmstudio_context', '预设和本次消息超出本地上下文字数上限，请缩短预设或消息，或调整 lmStudioHistoryChars');
       const started = Date.now(), prepared = this.prepare(job);
-      const turns = this.trim(history.turns, { chars: text.length, images: prepared.images, bytes: prepared.bytes });
+      const turns = this.trim(history.turns, { chars: promptChars + text.length, images: prepared.images, bytes: prepared.bytes });
       if (prepared.images || turns.some(t => imageStats(t.input).images))
         await this.ensureVision(job.model, { signal, timeoutMs: Math.min(5000, timeoutMs) });
       const messages = turns.flatMap(t => [{ role: 'user', content: this.content(t, history) }, { role: 'assistant', content: t.assistant }]);
+      if (preset) messages.unshift({ role: 'system', content: preset.prompt });
       messages.push({ role: 'user', content: this.content({ user: text, input: prepared.input }, history, prepared.pending) });
       onProgress(`本地模型 ${job.model} 正在生成回复`);
       const remaining = timeoutMs - (Date.now() - started);

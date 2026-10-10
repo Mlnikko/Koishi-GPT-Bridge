@@ -120,6 +120,26 @@ function imageJob(job, id, input, overrides = {}) {
 }
 const chats = requests => requests.filter(r => r.url === '/v1/chat/completions');
 
+test('preset system prompts survive history trimming, reserve budget and remain compatible with image turns', async t => {
+  const { Presets } = require('../../src/core/presets.cjs');
+  const { root, bridge, job, requests } = await fixture(t, null, { historyChars: 60 });
+  const presets = new Presets(path.join(root, 'presets'));
+  fs.writeFileSync(path.join(presets.dir, 'role.md'), 'r'.repeat(40));
+  const preset = presets.read('role');
+  const first = imageJob(job, 'preset-image', [{ type: 'image', file: 'input-0.png' }], { preset });
+  await bridge.run(first);
+  assert.deepEqual(chats(requests)[0].body.messages[0], { role: 'system', content: preset.prompt });
+  assert.equal(chats(requests)[0].body.messages[1].content[0].type, 'image_url');
+  await new LMStudioBridge({ ...bridge }).run(job('preset-next', { preset, input: [{ type: 'text', text: 'x'.repeat(20) }] }));
+  const messages = chats(requests).at(-1).body.messages;
+  assert.deepEqual(messages, [{ role: 'system', content: preset.prompt }, { role: 'user', content: 'x'.repeat(20) }]);
+  const before = requests.length;
+  await assert.rejects(bridge.run(job('preset-overflow', { preset, input: [{ type: 'text', text: 'x'.repeat(21) }] })), /上下文字数/);
+  await assert.rejects(bridge.run(job('preset-invalid', { preset: { ...preset, revision: 'bad' } })), /快照/);
+  assert.equal(requests.length, before, 'invalid presets must fail before any HTTP submission');
+  await bridge.run(first); assert.equal(requests.length, before, 'replaying a committed result never regenerates');
+});
+
 test('mixed images preserve their order and exact pixels after restart and job-file pruning', async t => {
   const { bridge, job, requests } = await fixture(t);
   const first = imageJob(job, 'vision-first', [

@@ -73,7 +73,7 @@ async function dispatch({ stages }, s, text) {
   } finally { s.stripped = previous; }
 }
 const apply = (config = {}) => {
-  const root = temp();
+  const root = config.dataDir || temp();
   const built = harness();
   plugin.apply(built.ctx, { allowedUsers: ['*'], dataDir: root, webBridgePort: 0, ...config });
   apps.push(built);
@@ -370,7 +370,7 @@ const slash = (app, text, options = {}) => dispatch(app, session({ ...options, e
 test('help lists short commands including backend selection and stays local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/preset', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
@@ -418,7 +418,8 @@ test('removed Chinese commands only show the migration notice and never create j
 
 test('all short commands remain gated by private authorization and group mentions', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
-  for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
+  for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/preset', '/preset show', '/preset role',
+    '/preset create role\n正文', '/preset edit role\n正文', '/preset delete role', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
     assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
     assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
   }
@@ -736,6 +737,182 @@ async function localServer(t, onChat) {
   t.after(() => { server.closeAllConnections(); server.close(); });
   return { url: `http://127.0.0.1:${server.address().port}/v1`, requests };
 }
+
+test('QQ-created presets are public, creator-managed and selected independently by each user and session', async t => {
+  const provider = await localServer(t);
+  const config = { lmStudioBaseUrl: provider.url, notifyProgress: false, groupChat: true };
+  const app = apply(config);
+  const alice = session({ elements: [{ type: 'text', attrs: { content: '只有甲知道的秘密' } }] });
+  const bob = session({ userId: 'bob', messageId: 'bob-first', elements: [{ type: 'text', attrs: { content: '乙的对话' } }] });
+  assert.match(await dispatch(app, alice, '/preset create 共享角色\n你扮演角色甲。'), /已创建公共预设/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false, 'creating a preset does not create or change a conversation');
+  assert.match(await dispatch(app, alice, '/preset'), /共享角色 \[我创建\]/);
+  assert.match(await dispatch(app, bob, '/preset'), /共享角色 \[公共\]/);
+  assert.match(await dispatch(app, bob, '/preset show 共享角色'), /你扮演角色甲/);
+  const file = path.join(app.root, 'presets', '共享角色.md'), before = fs.readFileSync(file);
+  assert.match(await dispatch(app, bob, '/preset edit 共享角色\n覆盖'), /只有创建者/);
+  assert.match(await dispatch(app, bob, '/preset delete 共享角色'), /只有创建者/);
+  assert.match(await dispatch(app, bob, '/preset create 共享角色\n覆盖'), /同名/);
+  assert.deepEqual(fs.readFileSync(file), before); assert.deepEqual(jobFiles(app.root), []);
+  for (const s of [alice, bob]) {
+    await dispatch(app, s, '/backend lmstudio'); await dispatch(app, s, '/preset 共享角色');
+    await dispatch(app, s); await settle(app.root);
+  }
+  assert.deepEqual(provider.requests.map(r => r.messages[0].content), ['你扮演角色甲。', '你扮演角色甲。']);
+  assert.equal(provider.requests[1].messages.length, 2); assert.doesNotMatch(JSON.stringify(provider.requests[1]), /只有甲知道/);
+  assert.doesNotMatch(provider.requests[1].messages[0].content, /koishi-preset|owner/);
+  assert.match(await dispatch(app, alice, '/preset edit 共享角色\n你扮演角色乙。'), /已更新/);
+  bob.messageId = 'bob-edited'; await dispatch(app, bob); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages[0].content, '你扮演角色乙。');
+  assert.doesNotMatch(JSON.stringify(provider.requests.at(-1)), /只有甲知道/);
+  assert.match(await dispatch(app, bob, '/new 独立剧情'), /沿用本地预设：共享角色/);
+  bob.messageId = 'bob-new'; await dispatch(app, bob); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages.length, 2);
+  await dispatch(app, bob, '/preset create 乙的角色\n乙自己的设定');
+  await dispatch(app, bob, '/preset 乙的角色');
+  assert.match(await dispatch(app, alice, '/preset'), /当前本地预设：共享角色/);
+  for (const dispose of app.disposes) dispose();
+  const rebooted = apply({ ...config, dataDir: app.root });
+  assert.match(await dispatch(rebooted, bob, '/preset'), /当前本地预设：乙的角色/);
+  assert.match(await dispatch(rebooted, bob, '/preset edit 共享角色\n覆盖'), /只有创建者/);
+  assert.match(await dispatch(rebooted, alice, '/preset edit 共享角色\n重启后的设定'), /已更新/);
+  await dispatch(rebooted, bob, '/preset 共享角色');
+  assert.match(await dispatch(rebooted, alice, '/preset delete 共享角色'), /已删除公共预设/);
+  const calls = provider.requests.length, jobs = jobFiles(app.root).length;
+  bob.messageId = 'deleted-template'; assert.match(await dispatch(rebooted, bob), /未找到预设/);
+  assert.equal(provider.requests.length, calls); assert.equal(jobFiles(app.root).length, jobs);
+  assert.equal(fs.existsSync(path.join(app.root, 'presets', '乙的角色.md')), true);
+});
+
+test('public preset command syntax, pagination and text escaping work without generating or changing selection', async () => {
+  const app = apply();
+  const name = '带 空格的角色';
+  const prompt = '😀'.repeat(3200) + '\n末尾<at id="bot"/> &内容';
+  assert.match(await slash(app, `/preset create ${name}\n${prompt}`), /已创建/);
+  const first = await slash(app, `/preset show ${name}`);
+  const pages = Number(/第 1\/(\d+) 页/.exec(first)[1]); assert.ok(pages > 1);
+  for (let page = 1; page <= pages; page++) {
+    const result = await slash(app, `/preset show --page ${page} ${name}`);
+    assert.ok(result.length <= 1500);
+    assert.doesNotMatch(result, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    if (page === pages) assert.match(result, /末尾&lt;at id="bot"\/&gt; &amp;内容/);
+  }
+  assert.match(await slash(app, `/preset show --page ${pages + 1} ${name}`), /只有.*页/);
+  for (let i = 0; i < 16; i++) await slash(app, `/preset create 角色${i}\n设定`);
+  assert.match(await slash(app, '/preset list 2'), /第 2\/2 页/);
+  for (const value of ['create 名称', 'edit 名称', 'delete', 'delete 名称\n正文', 'show 名称\n正文', 'show --page 0', 'list zero', 'off extra'])
+    assert.match(await slash(app, '/preset ' + value), /用法/);
+  assert.match(await slash(app, '/preset create 超长\n' + '字'.repeat(8001)), /最多 8000/);
+  assert.equal(fs.existsSync(path.join(app.root, 'presets', '超长.md')), false);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('group members can publish public presets only when mentioned; other users can view but cannot manage them', async () => {
+  const app = apply({ allowedUsers: ['alice'], groupChat: true });
+  const command = '/preset create 群角色\n群里创建的公共角色';
+  const member = { userId: 'group-bob', isDirect: false, channelId: 'group', stripped: { appel: true } };
+  assert.equal(await slash(app, command, { userId: 'group-bob' }), undefined);
+  assert.equal(await slash(app, command, { ...member, stripped: { appel: false } }), undefined);
+  assert.equal(fs.readdirSync(path.join(app.root, 'presets')).length, 0);
+  assert.match(await slash(app, command, member), /已创建公共预设/);
+  assert.match(await slash(app, '/preset show 群角色'), /群里创建的公共角色/);
+  assert.match(await slash(app, '/preset edit 群角色\n覆盖'), /只有创建者/);
+  assert.match(await slash(app, '/preset delete 群角色', member), /已删除公共预设/);
+  assert.equal(fs.readdirSync(path.join(app.root, 'presets')).length, 0);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('preset commands bind per conversation, reread local edits, inherit on /new and survive plugin restart', async t => {
+  const provider = await localServer(t);
+  const config = { lmStudioBaseUrl: provider.url, notifyProgress: false, groupChat: true };
+  const app = apply(config);
+  const file = name => path.join(app.root, 'presets', name + '.md');
+  fs.writeFileSync(file('角色 A'), '设定 A'); fs.writeFileSync(file('角色 B'), '设定 B');
+  assert.match(await slash(app, '/preset'), /未启用[\s\S]*角色 A[\s\S]*角色 B/);
+  assert.match(await slash(app, '/preset 角色 A'), /已选择本地预设：角色 A[\s\S]*\/backend lmstudio/);
+  assert.match(await slash(app, '/preset show'), /设定 A/);
+  assert.deepEqual(jobFiles(app.root), [], 'preset commands never invoke either backend');
+  await slash(app, '/backend lmstudio');
+  assert.match(await slash(app, '/status'), /当前本地预设：角色 A/);
+  const s = session({ elements: [{ type: 'text', attrs: { content: '第一轮' } }] });
+  await dispatch(app, s); await settle(app.root);
+  const first = jobFiles(app.root)[0];
+  assert.deepEqual(provider.requests[0].messages[0], { role: 'system', content: '设定 A' });
+  assert.match(await slash(app, `/status ${first.id}`), /本地预设：角色 A（版本/);
+  fs.writeFileSync(file('角色 A'), '编辑后的 A');
+  s.messageId = 'preset-edited'; await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests[1].messages[0].content, '编辑后的 A');
+  assert.equal(jobFiles(app.root).find(j => j.id === first.id).preset.prompt, '设定 A');
+  assert.match(await slash(app, '/new 新剧情'), /沿用本地预设：角色 A/);
+  s.messageId = 'preset-new'; await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests[2].messages.length, 2, '/new starts with system and current user only');
+  assert.equal(provider.requests[2].messages[0].content, '编辑后的 A');
+  assert.match(await slash(app, '/preset 角色 B'), /已选择本地预设：角色 B/);
+  assert.match(await slash(app, '/preset', { userId: 'bob' }), /未启用/);
+  assert.match(await slash(app, '/preset', { isDirect: false, channelId: 'group', stripped: { appel: true } }), /未启用/);
+  assert.match(await slash(app, `/chat ${first.sessionId}`, { userId: 'bob' }), /未找到/);
+  assert.match(await slash(app, '/chat'), /本地预设：角色 A[\s\S]*本地预设：角色 B/);
+  await slash(app, `/chat ${first.sessionId}`);
+  assert.match(await slash(app, '/preset'), /当前本地预设：角色 A/);
+  await slash(app, '/preset off');
+  s.messageId = 'preset-off'; await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages.some(m => m.role === 'system'), false);
+  const conversations = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json')));
+  const second = conversations.items.find(c => c.id !== first.sessionId && c.owner === 'alice' && c.chat === 'qq:alice');
+  await slash(app, `/chat ${second.id}`);
+  for (const dispose of app.disposes) dispose();
+  const rebooted = apply({ ...config, dataDir: app.root });
+  assert.match(await slash(rebooted, '/preset show'), /当前本地预设：角色 B[\s\S]*设定 B/);
+  await slash(rebooted, '/backend web');
+  s.messageId = 'preset-web'; await dispatch(rebooted, s); await settle(rebooted.root);
+  assert.equal(jobFiles(app.root).find(j => j.messageId === 'preset-web').preset, undefined, 'saved local presets never enter web tasks');
+  assert.match(await slash(rebooted, '/new 网页新会话'), /沿用本地预设：角色 B/);
+});
+
+test('queued local messages keep their original preset when files change; switching waits until the task ends', async t => {
+  let reached, release;
+  const started = new Promise(resolve => { reached = resolve; });
+  const provider = await localServer(t, (body, res) => {
+    if (!release) { release = () => res.end('{"choices":[{"message":{"content":"done"}}]}'); reached(); }
+    else res.end('{"choices":[{"message":{"content":"done"}}]}');
+  });
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  await slash(app, '/preset create role\noriginal');
+  const a = session({ messageId: 'preset-running', elements: [{ type: 'text', attrs: { content: 'a' } }] });
+  await dispatch(app, a, '/backend lmstudio'); await dispatch(app, a, '/preset role');
+  await dispatch(app, a); await started;
+  const b = session({ userId: 'bob', messageId: 'preset-queued', elements: [{ type: 'text', attrs: { content: 'b' } }] });
+  await dispatch(app, b, '/backend lmstudio'); await dispatch(app, b, '/preset role'); await dispatch(app, b);
+  assert.equal(jobFiles(app.root).find(j => j.messageId === b.messageId).status, 'queued');
+  assert.match(await dispatch(app, a, '/preset off'), /正在处理任务/);
+  assert.match(await dispatch(app, b, '/preset off'), /正在处理任务/);
+  assert.match(await dispatch(app, a, '/preset edit role\nedited'), /已更新/);
+  assert.match(await dispatch(app, a, '/preset delete role'), /已删除/);
+  release(); await settle(app.root);
+  assert.deepEqual(provider.requests.map(body => body.messages[0].content), ['original', 'original']);
+  assert.equal(jobFiles(app.root).find(j => j.messageId === b.messageId).preset.prompt, 'original');
+  assert.match(await dispatch(app, b, '/preset show'), /未找到预设/);
+});
+
+test('missing or invalid selected presets and preset budget overflow never submit an unconfigured message', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url, lmStudioHistoryChars: 1500 });
+  const file = path.join(app.root, 'presets', 'role.md'); fs.writeFileSync(file, 'a'.repeat(1498));
+  assert.match(await slash(app, '/preset ../secret'), /预设名称/);
+  assert.match(await slash(app, '/preset missing'), /未找到预设/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  await slash(app, '/preset role'); await slash(app, '/backend lmstudio');
+  assert.match(await slash(app, '/preset show'), /预览已分页/);
+  const s = session({ elements: [{ type: 'text', attrs: { content: 'too long' } }] });
+  assert.match(await dispatch(app, s), /上下文字数/);
+  fs.writeFileSync(file, ''); assert.match(await dispatch(app, s), /非空/);
+  fs.unlinkSync(file); assert.match(await dispatch(app, s), /未找到预设/);
+  assert.equal(provider.requests.length, 0); assert.deepEqual(jobFiles(app.root), []);
+  await slash(app, '/preset off');
+  await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests.length, 1); assert.equal(provider.requests[0].messages.length, 1);
+});
 
 test('LM Studio commands drive continuous chat, isolate users and inherit the local backend on /new', async t => {
   const provider = await localServer(t);

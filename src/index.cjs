@@ -6,11 +6,12 @@ const { WebBridge } = require('./bridge/web-bridge.cjs');
 const { LMStudioBridge } = require('./bridge/lmstudio-bridge.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
+const { Presets } = require('./core/presets.cjs');
 const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('./core/reasoning.cjs');
 const { JobQueue } = require('./core/queue.cjs');
 const { normalizeConfig } = require('./core/config.cjs');
 const { toSegments, sessionSegments, submissionText, imagesOf } = require('./core/message.cjs');
-const { toMessages } = require('./lib/reply.cjs');
+const { toMessages, splitText } = require('./lib/reply.cjs');
 const { textMessage, safeReason } = require('./lib/feedback.cjs');
 const { downloadImage } = require('./lib/image.cjs');
 const { version } = require('../package.json');
@@ -26,6 +27,7 @@ exports.apply = (ctx, config) => {
   // The web backend remains the default; neither backend spawns a local CLI.
   const sessions = new Map(), locks = new Set();
   const chats = new Conversations(path.join(root, 'conversations.json'));
+  const presets = new Presets(path.join(root, 'presets'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141,
     timeoutMs: replyTimeoutMs, pluginVersion: version });
@@ -111,6 +113,7 @@ exports.apply = (ctx, config) => {
     + (j.progress && j.status === 'running' ? `\n${j.progress}` : '')
     + (j.sessionId ? `\n会话：${j.sessionId}` : '\n独立任务（不绑定网页会话）')
     + (j.backend === 'lmstudio' ? `\n本地模型：${j.model}` : '')
+    + (j.preset ? `\n本地预设：${j.preset.name}（版本 ${j.preset.revision.slice(0, 8)}）` : '')
     + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort)}` : '')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
@@ -174,9 +177,12 @@ exports.apply = (ctx, config) => {
         prepared.push({ type: 'image', file: image.file, ext: image.ext, mime: image.mime, size: image.size });
       }
       if (!chats.get(chat.id, session.userId, conversation(session))) throw Error('会话已关闭，请重新发送消息');
+      const preset = chat.backend === 'lmstudio' && chat.lmStudioPreset ? presets.read(chat.lmStudioPreset) : undefined;
+      if (preset && preset.prompt.length + text.length > config.lmStudioHistoryChars)
+        throw Error('预设和本次消息超出本地上下文字数上限，请缩短预设或消息，或调整 lmStudioHistoryChars');
       const { job, duplicate: again } = q.enqueue({ owner: session.userId, conversation: conversation(session),
         messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.backend === 'lmstudio' ? undefined : chat.reasoningEffort,
-        backend: chat.backend, model: chat.lmStudioModel, segments: prepared });
+        backend: chat.backend, model: chat.lmStudioModel, preset, segments: prepared });
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
@@ -213,8 +219,9 @@ exports.apply = (ctx, config) => {
   command('/help', '帮助').action(help);
   command('/new [name:text]', '开启新对话').action(manage((owner, chat, name) => {
     const previous = chats.current(owner, chat);
-    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel });
-    return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`;
+    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel, preset: previous?.lmStudioPreset });
+    return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`
+      + (s.lmStudioPreset ? `\n沿用本地预设：${s.lmStudioPreset}。` : '');
   }));
   command('/chat [id:string]', '会话列表；带编号切换').action(manage((owner, chat, id) => {
     if (id) {
@@ -223,7 +230,7 @@ exports.apply = (ctx, config) => {
     const current = chats.current(owner, chat);
     const list = chats.list(owner, chat);
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.lmStudioPreset ? ' [本地预设：' + s.lmStudioPreset + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
   }));
   command('/backend [target:text]', '查看或切换 web/lmstudio；可附模型编号').action(async ({ session }, target) => {
     try {
@@ -243,6 +250,74 @@ exports.apply = (ctx, config) => {
         : '当前会话已切回 ChatGPT 网页；本地模型的历史仍保留。');
     } catch (err) { return textMessage(safeReason(err.message)); }
   });
+  command('/preset [name:text]', '公共预设；show/list 查看，create/edit/delete 管理，off 关闭').action(manage((owner, chat, value) => {
+    const current = chats.current(owner, chat);
+    const label = `当前本地预设：${current?.lmStudioPreset || '未启用'}。`;
+    const lines = (value || '').split(/\r?\n/);
+    const parsed = /^(list|show|create|edit|delete|off)(?:[ \t]+(.*))?$/i.exec(lines[0]);
+    const action = parsed?.[1].toLowerCase(), argument = parsed?.[2]?.trim();
+    if (!value || action === 'list') {
+      if (lines.length > 1 || (argument && !/^[1-9]\d{0,3}$/.test(argument))) throw Error('用法：/preset list [页码]');
+      const page = Number(argument || 1);
+      const names = presets.list();
+      const pages = Math.max(1, Math.ceil(names.length / 15));
+      if (page > pages) throw Error(`公共预设列表只有 ${pages} 页`);
+      const entries = names.slice((page - 1) * 15, page * 15).map(name => {
+        try { const author = presets.readFile(name).owner; return name + (author === owner ? ' [我创建]' : author ? ' [公共]' : ' [本地模板]'); }
+        catch { return name + ' [文件无效]'; }
+      });
+      return label + `\n公共预设：${names.length} 个，第 ${page}/${pages} 页。\n`
+        + (entries.join('\n') || '暂无预设，发送 /preset create 名称 后换行填写正文创建。')
+        + (page < pages ? `\n/preset list ${page + 1} 查看下一页。` : '')
+        + '\n/preset 名称 选择；show 名称 查看；create/edit 名称 后换行填写正文；delete 名称 删除。仅创建者可修改、删除。';
+    }
+    if (action === 'create' || action === 'edit') {
+      if (!argument || lines.length < 2 || !lines.slice(1).join('\n').trim())
+        throw Error(`用法：/preset ${action} 名称\n下一行开始填写完整预设正文（最多 8000 字）`);
+      const preset = presets[action](argument, lines.slice(1).join('\n'), owner);
+      return `已${action === 'create' ? '创建' : '更新'}公共预设：${preset.name}。所有用户均可查看和选择，只有你能在 QQ 编辑或删除。`
+        + (action === 'create' ? `\n/preset ${preset.name} 在当前会话选择。` : '\n下一条消息使用更新后的内容，已入队任务保持原版本。');
+    }
+    if (action === 'delete') {
+      if (!argument || lines.length > 1) throw Error('用法：/preset delete 名称');
+      presets.delete(argument, owner);
+      return `已删除公共预设：${argument}。已有对话和任务保留；使用它的会话需重新选择预设或 /preset off。`;
+    }
+    if (action === 'show') {
+      if (lines.length > 1) throw Error('用法：/preset show [名称]，翻页用 /preset show --page 页码 [名称]');
+      let page = 1, name = argument;
+      if (argument?.startsWith('--page')) {
+        const paging = /^--page[ \t]+([1-9]\d{0,3})(?:[ \t]+(.+))?$/.exec(argument);
+        if (!paging) throw Error('用法：/preset show --page 页码 [名称]');
+        page = Number(paging[1]); name = paging[2];
+      }
+      name ||= current?.lmStudioPreset;
+      if (!name) return label + '\n/preset show 名称 可查看任意公共预设。';
+      const preset = presets.read(name);
+      const heading = (current?.lmStudioPreset === preset.name ? label + '\n' : '')
+        + `公共预设：${preset.name}。`
+        + (preset.owner === owner ? ' [我创建]' : preset.owner ? ' [仅创建者可管理]' : ' [本地模板]');
+      const navigation = `\n（预览已分页；/preset show --page 9999 ${preset.name} 查看下一页。）`;
+      const content = splitText(preset.prompt, Math.max(16, maxTextChars - heading.length - navigation.length - 80));
+      if (page > content.length) throw Error(`预设正文只有 ${content.length} 页`);
+      return heading
+        + `\n${preset.prompt.length} 字，版本 ${preset.revision.slice(0, 8)}，第 ${page}/${content.length} 页。\n`
+        + content[page - 1]
+        + (page < content.length ? `\n（预览已分页；/preset show --page ${page + 1} ${preset.name} 查看下一页。）` : '');
+    }
+    if (action === 'off' && (argument || lines.length > 1)) throw Error('用法：/preset off');
+    if (current && busy(current.id)) throw Error('当前会话正在处理任务，请等待完成或用 /stop 停止后再切换预设');
+    if (action === 'off') {
+      if (current) chats.setPreset(current.id, owner, chat, undefined);
+      return '当前会话已关闭本地预设。已有聊天记录保留，/new 开启空白上下文。';
+    }
+    const preset = presets.read(value);
+    const s = current || chats.ensure(owner, chat);
+    chats.setPreset(s.id, owner, chat, preset.name);
+    return `会话「${s.name}」已选择本地预设：${preset.name}。下一条本地模型消息起生效。`
+      + (s.backend === 'lmstudio' ? '' : '\n/backend lmstudio 切换到本地模型后使用。')
+      + '\n已有聊天记录保留，/new 沿用预设开启新剧情。';
+  }));
   command('/close [id:string]', '关闭当前或指定会话').action(manage((owner, chat, id) => {
     const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
     if (!s) throw Error('未找到你的会话');
@@ -257,7 +332,7 @@ exports.apply = (ctx, config) => {
     if (chat?.backend === 'lmstudio') {
       try {
         await local.resolveModel(chat.lmStudioModel);
-        connection = `桥接 ${version}；LM Studio 已连接；当前模型：${chat.lmStudioModel}`;
+        connection = `桥接 ${version}；LM Studio 已连接；当前模型：${chat.lmStudioModel}\n当前本地预设：${chat.lmStudioPreset || '未启用'}`;
       } catch (err) { connection = `桥接 ${version}；LM Studio：${textMessage(safeReason(err.message))}`; }
       return connection + '\n' + (j ? status(j) : '当前会话暂无任务');
     }

@@ -7,6 +7,7 @@ const { submissionText, imagesOf, isEmpty } = require('./message.cjs');
 const { validateSegments } = require('../lib/reply.cjs');
 const { writeJson } = require('../lib/state.cjs');
 const { normalizeReasoning } = require('./reasoning.cjs');
+const { validatePresetSnapshot } = require('./presets.cjs');
 
 // 任务负载的版本号。生图时代的任务没有这个字段，语义也已不适用，
 // 载入时直接跳过（不删除），把目录留给用户自己处理。
@@ -62,11 +63,15 @@ class JobQueue {
   }
   // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
   // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
-  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, segments = [] }) {
+  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, preset, segments = [] }) {
     const duplicate = messageId && this.jobs.find(j => j.owner === owner && j.conversation === conversation && j.messageId === messageId);
     if (duplicate) return { job: duplicate, duplicate: true };
     if (this.closed) throw new Error('桥接服务正在关闭');
     if (reasoningEffort !== undefined) reasoningEffort = normalizeReasoning(reasoningEffort);
+    if (preset !== undefined) {
+      if (backend !== 'lmstudio') throw Error('预设只适用于本地模型任务');
+      preset = validatePresetSnapshot(preset);
+    }
     if (sessionId && this.jobs.some(j => j.sessionId === sessionId && j.owner === owner && j.conversation === conversation && ['queued', 'running'].includes(j.status))) {
       throw new Error('当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。');
     }
@@ -92,6 +97,7 @@ class JobQueue {
     } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
     const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input,
       ...(backend === 'lmstudio' ? { backend, model } : {}),
+      ...(preset ? { preset } : {}),
       ...(reasoningEffort && reasoningEffort !== 'default' ? { reasoningEffort } : {}),
       status: 'queued', delivery: 'pending', createdAt: Date.now(), dir };
     try { this.save(j); } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "QQ ChatGPT 网页桥接",
-  "version": "0.3.8",
+  "version": "0.3.10",
   "minimum_chrome_version": "120",
   "description": "把本机 Koishi 收到的 QQ 消息原样送进 ChatGPT 普通聊天网页，并把回复原样送回。",
   "permissions": ["alarms", "storage", "scripting"],

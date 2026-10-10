@@ -6,6 +6,21 @@ const path = require('node:path');
 const { JobQueue, JOB_VERSION } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, segments: [{ type: 'text', text: 'a cat' }] });
+test('local preset snapshots survive queueing, deduplication and restart; web tasks reject them', () => {
+  const { Presets } = require('../../src/core/presets.cjs');
+  const dir = root(), presets = new Presets(path.join(dir, 'presets'));
+  fs.writeFileSync(path.join(presets.dir, 'role.md'), 'original');
+  const preset = presets.read('role'), q = new JobQueue(path.join(dir, 'jobs'), () => assert.fail('must not submit'));
+  assert.throws(() => q.enqueue({ ...input('web'), preset }), /只适用于本地/);
+  assert.throws(() => q.enqueue({ ...input('invalid'), backend: 'lmstudio', preset: { ...preset, prompt: 'tampered' } }), /快照/);
+  const first = q.enqueue({ ...input('m1'), backend: 'lmstudio', model: 'local', preset }).job;
+  preset.prompt = 'mutated'; fs.writeFileSync(path.join(presets.dir, 'role.md'), 'edited');
+  assert.equal(first.preset.prompt, 'original');
+  assert.equal(q.enqueue({ ...input('m1'), backend: 'lmstudio', preset: presets.read('role') }).job.preset.prompt, 'original');
+  const restored = new JobQueue(q.root, () => assert.fail('must not submit'));
+  assert.equal(restored.jobs[0].preset.prompt, 'original');
+  assert.equal(restored.jobs[0].status, 'interrupted');
+});
 test('queued reasoning is validated and retained across restarts and duplicate messages', () => {
   const dir = root(), q = new JobQueue(dir, async () => {});
   assert.throws(() => q.enqueue({ ...input('invalid'), reasoningEffort: 'unknown' }), /用法/);

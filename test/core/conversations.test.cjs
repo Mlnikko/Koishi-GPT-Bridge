@@ -126,3 +126,24 @@ test('reasoning settings persist per owned conversation and failed writes do not
   c.setReasoning(first.id, 'alice', 'qq:a', 'default');
   assert.equal(new Conversations(c.file).current('alice', 'qq:a').reasoningEffort, undefined);
 });
+
+test('preset selection is owned, independent, inherited explicitly and persisted atomically', () => {
+  const c = new Conversations(path.join(temp(), 'sessions.json'));
+  const first = c.create('alice', 'qq:a', 'first');
+  c.setPreset(first.id, 'alice', 'qq:a', '角色 A');
+  const next = c.create('alice', 'qq:a', 'next', { preset: first.lmStudioPreset });
+  c.setPreset(next.id, 'alice', 'qq:a', '角色 B');
+  assert.equal(first.lmStudioPreset, '角色 A');
+  assert.equal(new Conversations(c.file).current('alice', 'qq:a').lmStudioPreset, '角色 B');
+  assert.equal(c.create('bob', 'qq:a', 'other').lmStudioPreset, undefined);
+  for (const [owner, chat] of [['bob', 'qq:a'], ['alice', 'qq:b']])
+    assert.throws(() => c.setPreset(first.id, owner, chat, '角色 B'), /未找到/);
+  assert.throws(() => c.setPreset(first.id, 'alice', 'qq:a', '../secret'), /预设名称/);
+  const save = c.save.bind(c);
+  c.save = () => { throw Error('disk full'); };
+  assert.throws(() => c.setPreset(first.id, 'alice', 'qq:a', undefined), /disk full/);
+  assert.equal(first.lmStudioPreset, '角色 A');
+  c.save = save; c.setPreset(first.id, 'alice', 'qq:a', undefined);
+  assert.equal(new Conversations(c.file).get(first.id, 'alice', 'qq:a').lmStudioPreset, undefined);
+  assert.equal(next.lmStudioPreset, '角色 B');
+});

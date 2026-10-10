@@ -17,7 +17,7 @@ index.cjs            插件入口，可用全部
 | 分层 | 允许依赖 | 模块 |
 | --- | --- | --- |
 | `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs`、`state.cjs` |
-| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`queue.cjs` |
+| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`presets.cjs`、`queue.cjs` |
 | `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`lmstudio-bridge.cjs` |
 | `src/index.cjs` | 全部 | 入口 |
 
@@ -39,13 +39,15 @@ index.cjs            插件入口，可用全部
 | `src/lib/image.cjs` | 参考图安全下载（协议白名单、SSRF 防护、体积与超时限制、文件头嗅探）与 PNG 文件头解析。 |
 | `src/lib/reply.cjs` | 回复片段校验、Markdown 围栏还原、按段落拆分、总量截断。**纯函数。** |
 | `src/lib/feedback.cjs` | 面向用户的文案、失败分类、本机路径与凭据脱敏、模型文本转义。 |
-| `src/lib/state.cjs` | 原子发布 JSON 状态；失败保留原记录并清理暂存文件。 |
+| `src/lib/state.cjs` | 原子发布 JSON 状态及 Markdown 文本；失败保留原记录并清理暂存文件。 |
 | `src/core/config.cjs` | 集中归一化配置并校验用户名单、布尔项、端口、计时器和各输入/输出限制；校验完成后才装配服务。 |
 | `src/core/message.cjs` | QQ 消息元素 → 有序片段（文本/图片），剥掉开头的 @ 机器人。**纯函数。** |
-| `src/core/conversations.cjs` | 网页会话的持久化（名称、归属用户、选中状态、绑定的 ChatGPT 会话编号 `webThreadId`）。 |
+| `src/core/conversations.cjs` | 会话的持久化（名称、归属用户、选中状态、网页编号、本地模型与预设名称）；原子保存选择，`/new` 显式继承本地配置。 |
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
+| `src/core/presets.cjs` | 公共 UTF-8 Markdown 预设发现、创建、编辑与删除；单文件保存创建者和正文，编辑/删除验证创建者，剥离文件头并校验模型任务快照。 |
 | `src/core/queue.cjs` | 任务队列的持久化与串行执行；参考图从暂存目录移入任务目录；终态任务的保留期清理。 |
 | `src/bridge/web-bridge.cjs` | 本机 HTTP 桥接服务（默认 127.0.0.1:5141）。管理当前网页任务、令牌校验、进度与结果回传、参考图字节按需下发、回复图片二进制上传。 |
+| `src/bridge/lmstudio-bridge.cjs` | 本地模型 HTTP 请求、独立文字/图片历史及结果保存；在历史前注入任务的预设快照，并为系统提示词预留字数预算。 |
 
 ## 数据模型
 
@@ -79,8 +81,9 @@ index.cjs            插件入口，可用全部
 
 | 路径 | 内容 |
 | --- | --- |
-| `data/conversations.json` | 会话名称、所属用户、选中状态及 ChatGPT 会话编号。 |
-| `data/jobs/<id>/job.json` | 任务状态、入站片段、ChatGPT 会话编号（`version: 2`）。 |
+| `data/conversations.json` | 会话名称、所属用户、选中状态、网页编号、本地模型及 `lmStudioPreset` 预设名。 |
+| `data/presets/<名称>.md` | 实例共享预设正文，QQ 创建的文件首行注释保存创建者；按消息读取最新正文，创建者信息不进入模型任务快照，Git 忽略。 |
+| `data/jobs/<id>/job.json` | 任务状态、入站片段、网页编号及本地任务的 `preset: { name, prompt, revision }` 快照（`version: 2`）。 |
 | `data/jobs/<id>/input-<序号>.<扩展名>` | 该任务下载的参考图片。 |
 | `data/jobs/<id>/result-<序号>.png` | 回复中的第 n 张图片。 |
 | `data/jobs/<id>/reply.md` | 完整回复文本（含代码围栏），供重发与排查。 |

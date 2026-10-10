@@ -8,16 +8,16 @@ const assert = require('node:assert/strict');
 const plugin = require('../src/index.cjs');
 const { visionPng } = require('./vision-fixture.cjs');
 
-async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiKey = '', vision = false } = {}) {
+async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiKey = '', vision = false, presets = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'koishi-lmstudio-live-'));
-  const evidence = { version: require('../package.json').version, baseUrl, root, vision, startedAt: new Date().toISOString(), turns: [] };
+  const evidence = { version: require('../package.json').version, baseUrl, root, vision, presets, startedAt: new Date().toISOString(), turns: [] };
   const boot = () => {
     const stages = [], disposes = [];
     plugin.apply({
       intersect: filter => ({ middleware: fn => stages.push({ filter, fn }) }),
       setInterval: () => {}, on: (event, fn) => { if (event === 'dispose') disposes.push(fn); },
       logger: () => ({ info: () => {}, warn: () => {} }),
-    }, { allowedUsers: ['live-validation'], dataDir: root, webBridgePort: 0, notifyProgress: false,
+    }, { allowedUsers: ['live-validation', 'preset-reader'], dataDir: root, webBridgePort: 0, notifyProgress: false,
       lmStudioBaseUrl: baseUrl, lmStudioModel: model, lmStudioApiKey: apiKey, lmStudioMaxTokens: 512 });
     return {
       close: () => disposes.forEach(fn => fn()),
@@ -36,7 +36,7 @@ async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiK
     };
   };
   let app = boot();
-  const session = text => ({ platform: 'qq', userId: 'live-validation', channelId: 'live-validation', isDirect: true,
+  const session = (text, owner = 'live-validation') => ({ platform: 'qq', userId: owner, channelId: owner, isDirect: true,
     messageId: 'live-' + evidence.turns.length, timestamp: Date.now(), sent: [],
     elements: text ? [{ type: 'text', attrs: { content: text } }] : [],
     send: async function(content) { this.sent.push(content); return ['simulated-qq-ack']; },
@@ -53,7 +53,8 @@ async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiK
       if (job && ['failed', 'cancelled', 'interrupted'].includes(job.status)) throw Error(job.error || job.status);
       if (job?.status === 'ready' && job.delivery === 'sent') {
         const text = s.sent.join('\n');
-        const result = { prompt, reply: text, image: !!image, elapsedMs: Date.now() - started, jobId: job.id, sessionId: job.sessionId, model: job.model };
+        const result = { prompt, reply: text, image: !!image, elapsedMs: Date.now() - started, jobId: job.id, sessionId: job.sessionId, model: job.model,
+          ...(job.preset ? { preset: job.preset } : {}) };
         evidence.turns.push(result); console.log(JSON.stringify(result)); return result;
       }
       if (Date.now() - started > 275000) throw Error('本地测试超时');
@@ -62,6 +63,31 @@ async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiK
   };
   try {
     console.log(await app.dispatch(session(), '/backend lmstudio' + (model ? ' ' + model : '')));
+    if (presets) {
+      const prompt = marker => `你正在参加桥接预设功能测试。你扮演预设校验员，无论用户说什么，每次都只回复“${marker}”，不要添加其他内容。`;
+      assert.match(await app.dispatch(session(), '/preset create 测试角色\n' + prompt('预设甲8427')), /已创建公共预设/);
+      assert.match(await app.dispatch(session(), '/preset 测试角色'), /已选择本地预设/);
+      const first = await turn('你好，请介绍一下自己。'); assert.match(first.reply, /预设甲8427/);
+      app.close(); app = boot();
+      assert.match(await app.dispatch(session(), '/preset'), /当前本地预设：测试角色/);
+      assert.match(await app.dispatch(session(undefined, 'preset-reader'), '/preset show 测试角色'), /预设甲8427/);
+      assert.match(await app.dispatch(session(undefined, 'preset-reader'), '/preset edit 测试角色\n覆盖'), /只有创建者/);
+      assert.match(await app.dispatch(session(undefined, 'preset-reader'), '/preset 测试角色'), /已选择本地预设/);
+      assert.match(await app.dispatch(session(), '/preset edit 测试角色\n' + prompt('预设乙9316')), /已更新公共预设/);
+      const second = await turn('现在的角色是什么？'); assert.match(second.reply, /预设乙9316/);
+      assert.equal(first.sessionId, second.sessionId); assert.notEqual(first.preset.revision, second.preset.revision);
+      const original = JSON.parse(fs.readFileSync(path.join(root, 'jobs', first.jobId, 'job.json')));
+      assert.match(original.preset.prompt, /预设甲8427/);
+      assert.match(await app.dispatch(session(), '/new 新剧情测试'), /沿用本地预设：测试角色/);
+      const third = await turn('开始新的故事。'); assert.match(third.reply, /预设乙9316/);
+      assert.notEqual(third.sessionId, second.sessionId);
+      assert.match(await app.dispatch(session(undefined, 'preset-reader'), '/preset delete 测试角色'), /只有创建者/);
+      assert.match(await app.dispatch(session(), '/preset delete 测试角色'), /已删除公共预设/);
+      evidence.passed = true;
+      evidence.publicPresetCRUD = true;
+      console.log('真实公共预设验证通过：QQ 创建、公共选择、创建者编辑/删除权限、重启保存、系统提示词、任务快照和 /new 继承。QQ 回传使用模拟发送。');
+      return evidence;
+    }
     if (vision) {
       const image = visionPng(); fs.writeFileSync(path.join(root, 'vision-input.png'), image, { mode: 0o600 });
       const first = await turn('这张图片里有几个几何图形？只回答数量，不要描述颜色。', image);
@@ -102,7 +128,8 @@ async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiK
 }
 
 if (require.main === module) validate({ baseUrl: process.env.LM_STUDIO_BASE_URL || undefined,
-  model: process.env.LM_STUDIO_MODEL || '', apiKey: process.env.LM_STUDIO_API_KEY || '', vision: process.argv.includes('--vision') })
+  model: process.env.LM_STUDIO_MODEL || '', apiKey: process.env.LM_STUDIO_API_KEY || '', vision: process.argv.includes('--vision'),
+  presets: process.argv.includes('--presets') })
   .catch(err => { console.error(err.message); process.exitCode = 1; });
 
 module.exports = { validate };
