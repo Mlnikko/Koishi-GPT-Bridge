@@ -23,7 +23,7 @@ exports.apply = (ctx, config) => {
   // somewhere else; production uses the project's own data directory. `src/` is
   // one level down from the project root, hence the `..`.
   const { dataDir: root, maxTextChars, maxReplyChars, maxInputImages,
-    sendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
+    sendTimeoutMs, mediaSendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
   // The web backend remains the default; neither backend spawns a local CLI.
   const sessions = new Map(), locks = new Set();
   const chats = new Conversations(path.join(root, 'conversations.json'));
@@ -84,12 +84,12 @@ exports.apply = (ctx, config) => {
     }
   }, { maxImages: maxInputImages, maxChars: maxTextChars });
   const fresh = s => Date.now() - s.timestamp < 298000;
-  const send = async (s, content) => {
+  const send = async (s, content, timeoutMs = sendTimeoutMs) => {
     let timer;
     try {
       const ids = await Promise.race([
         Promise.resolve().then(() => s.send(content)),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('QQ 发送确认超时，送达状态不确定')), sendTimeoutMs); }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('QQ 发送确认超时，送达状态不确定')), timeoutMs); }),
       ]);
       if (!ids?.length) throw new Error('QQ 未确认发送成功');
     } finally { clearTimeout(timer); }
@@ -135,8 +135,11 @@ exports.apply = (ctx, config) => {
         const item = messages[index];
         // Image bytes are uploaded by the QQ adapter; local paths never leave the machine.
         if (item.type === 'image') {
-          const bytes = fs.readFileSync(path.join(j.dir, `result-${item.asset}.png`));
-          await send(s, `<img src="data:image/png;base64,${bytes.toString('base64')}"/>`);
+          const mime = item.mime || 'image/png';
+          const ext = { 'image/png': 'png', 'image/gif': 'gif', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime];
+          if (!ext || !Number.isInteger(item.asset) || item.asset < 0) throw Error('回复图片格式或序号无效');
+          const bytes = fs.readFileSync(path.join(j.dir, `result-${item.asset}.${ext}`));
+          await send(s, `<img src="data:${mime};base64,${bytes.toString('base64')}"/>`, mediaSendTimeoutMs);
         } else {
           await send(s, textMessage(item.text));
         }

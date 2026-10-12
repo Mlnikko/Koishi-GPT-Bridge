@@ -128,6 +128,13 @@ test('image position in the reply is preserved', () => {
     { type: 'text', text: '第二种：' },
   ]);
 });
+test('animation MIME survives splitting and text truncation for QQ delivery',()=>{
+ const {messages}=toMessages([
+  {type:'text',text:'x'.repeat(30)},{type:'image',asset:0,mime:'image/gif'},
+  {type:'image',asset:1,mime:'image/png'},
+ ],{maxTotal:5});
+ assert.deepEqual(messages.slice(1,3),[{type:'image',asset:0,mime:'image/gif'},{type:'image',asset:1}]);
+});
 
 test('a reply over the total budget is truncated with a visible notice', () => {
   const { messages, truncated } = toMessages([{ type: 'text', text: '丁'.repeat(100) }], { maxChars: 1000, maxTotal: 10 });

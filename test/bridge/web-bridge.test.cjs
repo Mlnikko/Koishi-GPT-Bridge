@@ -2,6 +2,7 @@ const { test }=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
+const {animatedGif}=require('../helpers/media.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
 test('explicit reasoning requires a capable extension and is advertised in the task', async t=>{
@@ -219,6 +220,36 @@ test('reply images are uploaded as raw bytes and referenced by index',async t=>{
  assert.equal(fs.existsSync(path.join(job.dir,'result-0.png')),true);
  assert.equal(fs.existsSync(path.join(job.dir,'result-1.png')),true);
 });
+test('GIF and PNG files keep their bytes and order, including upload retries and a forged MIME',async t=>{
+ const {b,job,call,asset}=await setup(t);await call('/state');
+ const result=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const gif=animatedGif();
+ for(let attempt=0;attempt<2;attempt++)assert.equal((await asset(`/result-asset?id=${job.id}&i=0`,gif)).status,200);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=1`,png())).status,200);
+ assert.equal((await call('/result',{id:job.id,threadId:id,segments:[
+  {type:'text',text:'动画：'},{type:'image',asset:0,mime:'image/png'},
+  {type:'text',text:'静态图：'},{type:'image',asset:1,mime:'image/gif'},
+ ]})).status,200);
+ const segments=await result;
+ assert.equal(segments[1].mime,'image/gif');assert.equal(segments[3].mime,'image/png');
+ assert.deepEqual(fs.readFileSync(path.join(job.dir,'result-0.gif')),gif);
+ assert.equal(fs.existsSync(path.join(job.dir,'result-0.png')),false);
+ assert.deepEqual(JSON.parse(fs.readFileSync(path.join(job.dir,'result.json'))).segments,segments);
+});
+test('GIF upload retries cannot replace the original animation with a different file',async t=>{
+ const {b,job,call,asset}=await setup(t);await call('/state');
+ const result=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=0`,animatedGif())).status,200);
+ assert.equal((await asset(`/result-asset?id=${job.id}&i=0`,png())).status,400);
+ assert.equal((await result).code,'image_invalid');
+ assert.deepEqual(fs.readFileSync(path.join(job.dir,'result-0.gif')),animatedGif());
+});
+test('truncated GIF and HTML error pages are refused without saving an asset',()=>{
+ const dir=temp(),destination=path.join(dir,'result-0.gif');
+ for(const bytes of [animatedGif().subarray(0,-1),Buffer.from('<html>'+ 'not a gif'.repeat(10)+'</html>')])
+  assert.throws(()=>saveAsset(bytes,destination),err=>err.code==='image_invalid');
+ assert.equal(fs.existsSync(destination),false);
+});
 test('a reply that references an image the page never uploaded is refused whole',async t=>{
  const {b,job,call}=await setup(t);await call('/state');
  const p=b.run(job).catch(e=>e);await new Promise(setImmediate);
@@ -248,7 +279,7 @@ test('unknown or empty reply segments are refused',async t=>{
 test('reply images are validated from their PNG header without external tools',()=>{
  const dir=temp(),destination=path.join(dir,'result-0.png');
  assert.throws(()=>saveAsset(Buffer.from('not an image at all, definitely not a png'),destination),err=>err.code==='image_invalid');
- assert.throws(()=>saveAsset(png(8,8,64),destination),err=>err.code==='image_invalid');
+ assert.throws(()=>saveAsset(png(8,8).subarray(0,20),destination),err=>err.code==='image_invalid');
  assert.equal(saveAsset(png(1254,1254),destination),destination);
  assert.equal(fs.existsSync(destination),true);
  if(process.platform!=='win32')assert.equal(fs.statSync(destination).mode & 0o777,0o600);

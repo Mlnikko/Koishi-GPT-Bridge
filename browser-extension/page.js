@@ -222,6 +222,38 @@ const inUserTurn=img=>!!userScopes.at(-1)?.contains?.(img);
 // blocks or an explicit generated gallery after this turn's user message.
 const replyImages=()=>[...new Set(replyRoots.flatMap(root=>Array.from(root.querySelectorAll?.('img')||[])))]
  .filter(img=>(!userAnchor||after(img,userAnchor))&&looksGenerated(img)&&!inUserTurn(img)&&!insideUser(img));
+// Generated files can be anchors, or the new renderer's span[role=link]
+// without an href. Only raster files inside this reply are eligible.
+const referencedFiles=new Set();
+const fileInfo=(node,allowHistory=false)=>{
+ const historical=allowHistory===true,referenced=referencedFiles.has(node);
+ if(!node||!visible(node)||insideUser(node))return null;
+ if(!inReplyTurn(node)&&!referenced&&!historical)return null;
+ if(historical&&!assistant.some(anchor=>turn(anchor)?.contains?.(node)))return null;
+ if(userAnchor&&!after(node,userAnchor)&&!referenced&&!historical)return null;
+ const tag=node.tagName,role=node.getAttribute?.('role');
+ if(tag!=='A'&&role!=='link'&&tag!=='BUTTON')return null;
+ const label=String(node.getAttribute?.('aria-label')||'');
+ if(tag==='BUTTON'&&!/预览|preview/i.test(label))return null;
+ const href=String(node.getAttribute?.('href')||'');
+ const text=String(node.getAttribute?.('download')||node.textContent||label).trim();
+ const name=(text.match(/[^\s/\\<>:"?*|]+\.(?:gif|png|jpe?g|webp)\b/i)||label.match(/[^\s/\\<>:"?*|]+\.(?:gif|png|jpe?g|webp)\b/i)||[])[0];
+ let url;
+ try{url=new URL(href,location.href);}catch{}
+ const rasterPath=url&&/\.(gif|png|jpe?g|webp)$/i.test(url.pathname);
+ const generated=href.startsWith('sandbox:/mnt/data/')||/^(?:blob:|data:image\/)/i.test(href)
+  ||(url?.origin==='https://chatgpt.com'&&/^\/backend-api\/(?:files|estuary|conversation)\//.test(url.pathname));
+ // External links stay prose. This also prevents fetching model-supplied URLs
+ // to local services or handing a remote page the user's ChatGPT credentials.
+ if(href&&!generated)return null;
+ if(!name&&!rasterPath)return null;
+ const filename=name||decodeURIComponent(url.pathname.split('/').at(-1));
+ return {name:filename,href,key:(messageId(node)||assistantId||'')+'/'+filename};
+};
+// The live resource row has a transparent preview button and separate filename,
+// type and Download labels. Treat that entire row as one media item.
+const fileCard=node=>String(node.getAttribute?.('class')||'').split(/\s+/).includes('group/resource-row')
+ &&Array.from(node.children||[]).find(child=>child.tagName==='BUTTON'&&fileInfo(child));
 const BLOCKS=new Set(['P','DIV','SECTION','ARTICLE','FIGURE','UL','OL','LI','BLOCKQUOTE','PRE','TABLE','H1','H2','H3','H4','H5','H6','HR']);
 // Inline rendering keeps the structure a reader would see: links carry their
 // target, inline code keeps its backticks, line breaks survive.
@@ -251,7 +283,14 @@ const tableText=table=>Array.from(table.querySelectorAll?.('tr')||[])
 // DOM → ordered segments. Images appear in document order, which is the order
 // they are read in and therefore the order they must be sent back to QQ in.
 const serializeReply=()=>{
- const segments=[],images=[];
+ const segments=[],images=[],fileKeys=new Set();
+ const pushFile=node=>{
+  const info=fileInfo(node);if(!info)return false;
+  if(!fileKeys.has(info.key)){
+   fileKeys.add(info.key);segments.push({type:'image',asset:images.length});images.push(node);
+  }
+  return true;
+ };
  const pushImage=img=>{
   if((userAnchor&&!after(img,userAnchor))||!looksGenerated(img)||inUserTurn(img)||insideUser(img)||images.includes(img))return;
   segments.push({type:'image',asset:images.length,mime:'image/png'});
@@ -269,13 +308,15 @@ const serializeReply=()=>{
   const text=String(code.innerText||code.textContent||'').replace(/\n+$/,'');
   if(text.trim())segments.push({type:'code',language,text});
  };
- const inlineSegments=node=>{
-  let text='';
+ const inlineSegments=(node,prefix='')=>{
+  let text=prefix;
   const flush=()=>{if(text.trim())segments.push({type:'text',text:text.trim()});text='';};
   const visit=parent=>{
    for(const child of parent.childNodes||[]){
     if(child.nodeType===3){text+=child.nodeValue;continue;}
     if(child.nodeType!==1)continue;
+    const card=fileCard(child);if(card){flush();pushFile(card);continue;}
+    if(fileInfo(child)){flush();pushFile(child);continue;}
     if(child.tagName==='IMG'){flush();pushImage(child);continue;}
     if(child.tagName==='BUTTON'){
      flush();for(const img of Array.from(child.querySelectorAll?.('img')||[]))pushImage(img);continue;
@@ -299,6 +340,8 @@ const serializeReply=()=>{
    if(child.getAttribute?.('data-user-message-bubble')!==null&&child.getAttribute?.('data-user-message-bubble')!==undefined)continue;
    if(child.getAttribute?.('data-message-author-role')==='user')continue;
    if(child.closest?.('[hidden], [aria-hidden="true"], nav, aside, form'))continue;
+   const card=fileCard(child);if(card){pushFile(card);continue;}
+   if(pushFile(child))continue;
    // Generated-image previews are interactive BUTTONs. Ignore their control text,
    // but keep any valid image nested inside; otherwise the real ChatGPT gallery
    // shape produces picked=true in the probe while serializeReply() returns zero.
@@ -326,6 +369,9 @@ const serializeReply=()=>{
     let index=1;
     for(const item of child.children||[]){
      if(item.tagName!=='LI')continue;
+     if(Array.from(item.querySelectorAll('a, [role="link"], button')).some(fileInfo)){
+      inlineSegments(item,tag==='OL'?(index++)+'. ':'- ');continue;
+     }
      const text=inlineText(item).trim();
      if(text)segments.push({type:'text',text:(tag==='OL'?(index++)+'. ':'- ')+text.replace(/\n/g,'\n  ')});
     }
@@ -348,6 +394,32 @@ const serializeReply=()=>{
   else{
    inlineSegments(root);
   }
+ }
+ // A follow-up can return only a sandbox path to an already generated file.
+ // Resolve that explicit reference against assistant file controls in this
+ // conversation, never arbitrary historical images or local filesystem paths.
+ for(let i=0;i<segments.length;i++){
+  const segment=segments[i];
+  if(segment.type!=='text')continue;
+  const match=/^(?:sandbox:)?\/mnt\/data\/([^/\\\r\n]+\.(?:gif|png|jpe?g|webp))$/i.exec(segment.text.trim());
+  if(!match)continue;
+  const historyMatches=new Map(),currentMatches=new Map();
+  for(const node of Array.from(document.querySelectorAll('a, [role="link"], button'))){
+   const info=fileInfo(node,true);
+   if(!info||info.name!==match[1])continue;
+   const matches=inReplyTurn(node)?currentMatches:historyMatches;
+   const existing=matches.get(info.key);
+   if(!existing||node.tagName==='BUTTON')matches.set(info.key,node);
+  }
+  const matches=currentMatches.size?currentMatches:historyMatches;
+  if(matches.size!==1)throw Error(matches.size?'回复文件存在同名版本，无法确定本轮引用，请要求 ChatGPT 重新提供文件附件':
+   '网页仅回复文件路径，未找到对应的文件附件，请要求 ChatGPT 重新提供下载链接或文件卡片');
+  const node=[...matches.values()][0];referencedFiles.add(node);
+  const key=fileInfo(node).key;
+  let asset=images.findIndex(image=>fileInfo(image)?.key===key);
+  if(asset>=0&&segments.some(s=>s.type==='image'&&s.asset===asset)){segments.splice(i--,1);continue;}
+  if(asset<0){asset=images.length;images.push(node);}
+  segments[i]={type:'image',asset};
  }
  return {segments,images};
 };
@@ -422,7 +494,8 @@ const probeDom=()=>({
  const {segments,images}=serializeReply();
  const answerText=segments.filter(segment=>segment.type!=='image').map(segment=>segment.text).join('\n');
  const replyLength=answerText.replace(/\s+/g,'').length;
- const imageLoading=images.some(image=>image.complete===false||!(Number(image.naturalWidth)>0));
+ const imageLoading=images.some(image=>image.tagName==='IMG'&&(image.complete===false||!(Number(image.naturalWidth)>0)));
+ const mediaKey=node=>fileInfo(node)?.key||source(node);
  // 画廊已经出现但还没有可用图片，说明图正在画。
  const galleries=[...new Set(replyRoots.flatMap(root=>[
   ...(root.getAttribute?.('data-testid')?.includes('generated-image-gallery')?[root]:[]),
@@ -439,7 +512,7 @@ const probeDom=()=>({
  const snapshot={url:location.href,threadId,users:user.length,assistants:assistant.length,submitted,
   textMatched:sameText(job.sentText,userText),userText,userId,userChanged,replyBlocks:replyRoots.length,replyBounded:!!userAnchor,
   editor:!!editor,editorAmbiguous:candidates.length>1,editorSelection:best,unknownDrafts,recoverySafe,stopping:!!stop,images:images.length,imageLoading,gallery,pendingGallery,attachments:attachments.length,uploading,
-  replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(source).join('|')),
+  replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(mediaKey).join('|')),
   busyText,
   needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
@@ -531,12 +604,77 @@ const probeDom=()=>({
   send.click();return {clicked:true};
  }
  if(operation==='read'){
-  return {threadId,segments,imageCount:images.length,probe:probeDom()};
+  const requiresPreview=images.some(node=>{const file=fileInfo(node);return file&&(!file.href||file.href.startsWith('sandbox:'));});
+  return {threadId,segments,imageCount:images.length,requiresPreview,assetKeys:images.map(mediaKey),probe:probeDom()};
  }
  if(operation==='image'){
-  const img=images[Number(job.imageIndex)||0];
+  const index=Number(job.imageIndex)||0;
+  let img=images[index];
   if(!img)throw Error('回复中的图片不存在');
+  if(job.reply?.assetKeys&&job.reply.assetKeys[index]!==mediaKey(img))throw Error('回复文件发生变化，未回传其他文件');
+  const limit=20*1024*1024;
+  const readImage=async url=>{
+   let target;try{target=new URL(url,location.href);}catch{throw Error('回复文件地址无效');}
+   if(!['https:','blob:','data:'].includes(target.protocol)
+    ||(target.protocol==='https:'&&target.origin!=='https://chatgpt.com')
+    ||(target.protocol==='blob:'&&!url.startsWith('blob:https://chatgpt.com/'))
+    ||(target.protocol==='data:'&&!/^data:image\//i.test(url)))throw Error('回复文件地址不受支持');
+   const response=await fetch(target.href,{credentials:target.origin==='https://chatgpt.com'?'same-origin':'omit',signal:AbortSignal.timeout(30000)});
+   if(!response.ok)throw Error('回复文件下载失败（HTTP '+response.status+'）');
+   if(Number(response.headers?.get('Content-Length'))>limit)throw Error('回复文件超过 20 MB 上限');
+   const chunks=[];let size=0;
+   if(response.body?.getReader){
+    const reader=response.body.getReader();
+    try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit)throw Error('回复文件超过 20 MB 上限');chunks.push(value);}}
+    finally{await reader.cancel().catch(()=>{});}
+   }else{const value=new Uint8Array(await response.arrayBuffer());size=value.length;chunks.push(value);}
+   if(size<32||size>limit)throw Error('回复文件大小异常');
+   const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
+   const head=String.fromCharCode(...bytes.subarray(0,12));
+   const mime=/^GIF8[79]a/.test(head)?'image/gif':bytes[0]===0x89&&head.slice(1,4)==='PNG'?'image/png':
+    bytes[0]===0xff&&bytes[1]===0xd8&&bytes[2]===0xff?'image/jpeg':head.startsWith('RIFF')&&head.slice(8,12)==='WEBP'?'image/webp':'';
+   if(!mime)throw Error('回复文件不是有效的 GIF、PNG、JPEG 或 WebP 图片');
+   let binary='';for(let i=0;i<bytes.length;i+=0x8000)binary+=String.fromCharCode(...bytes.subarray(i,i+0x8000));
+   return {base64:btoa(binary),mime};
+  };
+  const file=fileInfo(img);
+  if(file){
+   // New file controls open the site's own viewer, whose img carries the raw
+   // data/blob bytes. Do not flatten an animation through canvas.
+   if(file.href&&!file.href.startsWith('sandbox:'))return await readImage(file.href);
+   const previews=()=>Array.from(document.querySelectorAll('img[alt="图片预览"], img[alt="Image preview"]')).filter(visible);
+   if(previews().length)throw Error('网页已有文件预览，未读取不属于本任务的文件');
+   const previewButton=replyRoots.flatMap(root=>Array.from(root.querySelectorAll('button')))
+    .find(node=>fileInfo(node)?.key===file.key);
+   (previewButton||img).click();
+   const started=Date.now();let preview;
+   try{
+    while(Date.now()-started<15000){
+     preview=previews().find(node=>node.complete!==false&&source(node));
+     if(preview)break;
+     await new Promise(resolve=>setTimeout(resolve,200));
+    }
+    if(!preview)throw Error('回复文件预览未加载，无法读取原始文件');
+    const latest=roles('user').at(-1);
+    if(latest!==userAnchor&&messageId(latest)!==userId)throw Error('网页出现其他用户轮次，未读取不属于本任务的文件');
+    return await readImage(source(preview));
+   }finally{
+    const close=buttons().find(node=>visible(node)&&['关闭查看器','Close viewer'].includes(node.getAttribute('aria-label')));
+    if(close){
+     close.click();
+     const closedAt=Date.now();
+     while(previews().length&&Date.now()-closedAt<2000)await new Promise(resolve=>setTimeout(resolve,100));
+    }
+   }
+  }
   if(img.naturalWidth*img.naturalHeight>32*1024*1024)throw Error('图片尺寸超过上限');
+  const explicitGif=/(?:\.gif(?:[?#]|$)|^data:image\/gif[;,])/i.test(source(img));
+  try{return await readImage(source(img));}
+  catch(err){
+   // Keep the established canvas fallback for ordinary cross-origin previews.
+   // Explicit GIFs and size-limit failures must not be flattened or bypassed.
+   if(explicitGif||/20 MB|大小异常/.test(err.message))throw err;
+  }
   const canvas=document.createElement('canvas');canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
   canvas.getContext('2d').drawImage(img,0,0);
   return {base64:canvas.toDataURL('image/png').split(',')[1]};

@@ -22,7 +22,7 @@ const TRUNCATED_NOTICE = '（回复过长，以上为前一部分；完整内容
 function replyError(code, message) { return Object.assign(new Error(message), { code }); }
 
 // 网页侧只允许这三种片段；其余一律拒收，宁可整条失败也不落盘半截回复。
-function validateSegments(input, { uploaded = 0 } = {}) {
+function validateSegments(input, { uploaded = 0, assets } = {}) {
   if (!Array.isArray(input) || !input.length) throw replyError('empty_reply', '网页没有返回可用的回复内容');
   if (input.length > LIMITS.maxSegments) throw replyError('reply_too_large', '网页回复的结构过于复杂，已拒绝');
   const segments = [];
@@ -33,7 +33,9 @@ function validateSegments(input, { uploaded = 0 } = {}) {
       if (!Number.isInteger(asset) || asset < 0 || asset >= uploaded)
         throw replyError('reply_invalid', `网页回复引用了未上传的图片（${String(raw.asset).slice(0, 12)}）`);
       if (++images > LIMITS.maxImages) throw replyError('reply_too_large', `网页回复中的图片超过 ${LIMITS.maxImages} 张`);
-      segments.push({ type: 'image', asset, mime: typeof raw.mime === 'string' ? raw.mime.slice(0, 64) : 'image/png' });
+      // File type comes from the uploaded bytes, never from page metadata.
+      const stored = assets?.get(asset);
+      segments.push({ type: 'image', asset, mime: stored?.mime || (typeof raw.mime === 'string' ? raw.mime.slice(0, 64) : 'image/png') });
       continue;
     }
     if (raw?.type !== 'text' && raw?.type !== 'code')
@@ -153,7 +155,8 @@ function toMessages(segments, { maxChars = 1500, maxTotal = 6000 } = {}) {
   };
 
   for (const segment of segments || []) {
-    if (segment.type === 'image') { flush(); messages.push({ type: 'image', asset: segment.asset }); continue; }
+    if (segment.type === 'image') { flush(); messages.push({ type: 'image', asset: segment.asset,
+      ...(segment.mime && segment.mime !== 'image/png' ? { mime: segment.mime } : {}) }); continue; }
     const text = segment.type === 'code' ? fenceCode(segment) : String(segment.text ?? '');
     if (!text.trim()) continue;
     const separator = pending.length ? 2 : 0;

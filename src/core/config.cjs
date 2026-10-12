@@ -31,6 +31,7 @@ function normalizeConfig(config, defaultRoot) {
   }
   const maxInputImages = integer('maxInputImages', 2, 1, 10);
   const maxInputBytes = integer('maxInputBytes', 10 * 1024 * 1024);
+  const sendTimeoutMs = integer('sendTimeoutMs', 20000, 1, 2147483647);
   return {
     ...config,
     allowedUsers: [...new Set(config.allowedUsers.map(user => user.trim()))],
@@ -49,7 +50,8 @@ function normalizeConfig(config, defaultRoot) {
     maxInputImages,
     maxInputBytes,
     replyTimeoutMs: integer('replyTimeoutMs', 300000, 1, 2147483647),
-    sendTimeoutMs: integer('sendTimeoutMs', 20000, 1, 2147483647),
+    sendTimeoutMs,
+    mediaSendTimeoutMs: integer('mediaSendTimeoutMs', Math.max(sendTimeoutMs, 60000), 1, 2147483647),
     retentionDays: integer('retentionDays', 0, 0),
   };
 }

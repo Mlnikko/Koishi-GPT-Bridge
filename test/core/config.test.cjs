@@ -8,13 +8,21 @@ test('configuration normalizes defaults and deduplicates user IDs', () => {
   assert.equal(config.webBridgePort, 5142);
   assert.equal(config.retentionDays, 0);
   assert.equal(config.replyTimeoutMs, 300000);
+  assert.equal(config.sendTimeoutMs, 20000);
+  assert.equal(config.mediaSendTimeoutMs, 60000);
+});
+
+test('media confirmation has a separate configurable budget and follows a longer text budget by default',()=>{
+ assert.equal(normalizeConfig({allowedUsers:['*'],sendTimeoutMs:90000},'/tmp/bridge').mediaSendTimeoutMs,90000);
+ assert.equal(normalizeConfig({allowedUsers:['*'],mediaSendTimeoutMs:100},'/tmp/bridge').mediaSendTimeoutMs,100);
 });
 
 test('malformed access, timing, port and retention settings fail immediately', () => {
   for (const bad of [{ allowedUsers: '*' }, { allowedUsers: [1] }, { allowedUsers: [''] },
     { groupChat: 'false' }, { notifyProgress: 'false' }, { dataDir: {} }, { dataDir: '' },
     { webBridgePort: -1 }, { webBridgePort: 65536 }, { webBridgePort: 1.5 },
-    { sendTimeoutMs: 2147483648 }, { replyTimeoutMs: Infinity }, { retentionDays: -1 },
+    { sendTimeoutMs: 2147483648 }, { mediaSendTimeoutMs: 0 }, { mediaSendTimeoutMs: NaN },
+    { mediaSendTimeoutMs: 2147483648 }, { replyTimeoutMs: Infinity }, { retentionDays: -1 },
     { retentionDays: 'invalid' }, { maxInputImages: 11 }]) {
     assert.throws(() => normalizeConfig({ allowedUsers: ['*'], ...bad }, '/tmp/bridge'));
   }

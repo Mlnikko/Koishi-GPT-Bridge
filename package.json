@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-codex-image-local",
-  "version": "0.3.10",
+  "version": "0.3.12",
   "private": true,
   "description": "QQ 与 ChatGPT 网页或本机 LM Studio 连续对话桥接；插件直接使用本机 HTTP，不启动外部进程。",
   "main": "src/index.cjs",

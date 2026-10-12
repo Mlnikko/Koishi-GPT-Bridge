@@ -76,6 +76,15 @@ async function waitForComposer(current,info){
 }
 async function returnReply(current){
  const reply=current.reply,timing=timings(current);
+ let previousTab;
+ // File viewers can defer loading in an inactive tab, and Chrome throttles
+ // their timers. Activate only while retrieving preview-backed files.
+ if(reply.requiresPreview&&(current.uploaded||0)<reply.imageCount){
+  const tab=await chrome.tabs.get(current.tabId);
+  [previousTab]=await chrome.tabs.query({active:true,windowId:tab.windowId});
+  await chrome.tabs.update(current.tabId,{active:true});
+ }
+ try{
  timing.returnStartedAt=timing.returnStartedAt||Date.now();
  for(let index=current.uploaded||0;index<reply.imageCount;index++){
   const upload=(timing.uploads||(timing.uploads=[]))[index]||{index,startedAt:Date.now()};
@@ -83,7 +92,7 @@ async function returnReply(current){
   await store(current,'正在读取并回传回复图片');
   const image=await page(current.tabId,'image',{...current,imageIndex:index});
   upload.encodedAt=Date.now();
-  await uploadAsset(current.id,index,image.base64);
+  await uploadAsset(current.id,index,image.base64,image.mime);
   upload.uploadedAt=Date.now();
   current.uploaded=index+1;await store(current,'正在回传回复图片');
  }
@@ -91,6 +100,13 @@ async function returnReply(current){
  await store(current,'正在将完整回复交给 Koishi');
  await api('/result',{id:current.id,threadId:reply.threadId,segments:reply.segments,probe:{...reply.probe,timing}});
  await store(null,'回复已交给 Koishi 回传 QQ');
+ }finally{
+  if(previousTab&&previousTab.id!==current.tabId){
+   const tab=await chrome.tabs.get(current.tabId).catch(()=>null);
+   // A user switching tabs during retrieval keeps their new selection.
+   if(tab?.active)await chrome.tabs.update(previousTab.id,{active:true}).catch(()=>{});
+  }
+ }
  await chrome.tabs.remove(current.tabId).catch(()=>{});
 }
 async function returnFailure(current){

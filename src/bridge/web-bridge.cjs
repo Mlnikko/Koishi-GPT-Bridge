@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { failureInfo, safeReason } = require('../lib/feedback.cjs');
-const { pngSize } = require('../lib/image.cjs');
+const { pngSize, sniffImage } = require('../lib/image.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
 const { submissionText, imagesOf } = require('../core/message.cjs');
 const { writeJson } = require('../lib/state.cjs');
@@ -54,11 +54,21 @@ function webFailure(reply) {
   return error(info.code, info.message);
 }
 
-function saveAsset(bytes, destination) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 100 || bytes.length > ASSET_LIMIT)
+function assetType(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 32 || bytes.length > ASSET_LIMIT)
     throw error('image_invalid', '网页返回的图片大小异常');
-  try { pngSize(bytes); }
-  catch (err) { throw error('image_invalid', '网页返回的图片不是有效 PNG：' + (err.code || 'decode')); }
+  const type = sniffImage(bytes);
+  if (type.ext === 'png') {
+    pngSize(bytes);
+  }
+  if (type.ext === 'gif' && (!/^GIF8[79]a$/.test(bytes.subarray(0, 6).toString('latin1'))
+    || !bytes.readUInt16LE(6) || !bytes.readUInt16LE(8) || bytes.at(-1) !== 0x3b))
+    throw error('image_invalid', '网页返回的 GIF 数据不完整');
+  return type;
+}
+
+function saveAsset(bytes, destination) {
+  assetType(bytes);
   const tmp = destination + '.tmp';
   try { fs.writeFileSync(tmp, bytes, { mode: 0o600 }); fs.renameSync(tmp, destination); }
   catch (err) { throw error('image_invalid', '网页图片保存失败：' + (err.code || 'write')); }
@@ -161,12 +171,14 @@ class WebBridge {
         if(this.pending!==p || p.cancelled) return send(409,{error:'job is no longer active'});
         // A lost HTTP acknowledgement must not turn a retry into task failure.
         if(p.assets.has(index)) {
-          if(!fs.readFileSync(path.join(p.job.dir,`result-${index}.png`)).equals(bytes))
+          const type=p.assets.get(index);
+          if(!fs.readFileSync(path.join(p.job.dir,`result-${index}.${type.ext}`)).equals(bytes))
             throw error('image_invalid','同一回复图片的重试内容发生变化');
           return send(200,{ok:true,index});
         }
-        saveAsset(bytes,path.join(p.job.dir,`result-${index}.png`));
-        p.assets.add(index);
+        const type=assetType(bytes);
+        saveAsset(bytes,path.join(p.job.dir,`result-${index}.${type.ext}`));
+        p.assets.set(index,{mime:type.mime,ext:type.ext});
         return send(200,{ok:true,index});
       }
       const raw=await readBody(req,JSON_BODY_LIMIT);
@@ -205,7 +217,7 @@ class WebBridge {
         // signed-in account avatar) can be handed back. Keep that snapshot beside
         // the job so a bad result stays auditable; never let it break the result.
         saveProbe(p.job.dir, 'result-probe.json', body.probe);
-        const segments=validateSegments(body.segments,{uploaded:p.assets.size});
+        const segments=validateSegments(body.segments,{uploaded:p.assets.size,assets:p.assets});
         // Commit the structured reply before acknowledging receipt. Queue startup
         // can recover this if the process dies before job.json reaches ready.
         const receipt=path.join(p.job.dir,'result.json');
@@ -245,7 +257,7 @@ class WebBridge {
       let done=false,timer,grace;
       const cancel=reason=>{if(p.cancelled)return;p.cancelled=reason;onProgress('正在请求网页停止生成');grace=setTimeout(()=>p.finish(reason),15000);};
       const abort=()=>cancel(error('cancelled','任务已取消；网页生成是否停止取决于浏览器连接状态'));
-      const p={job,threadId,onThread,onProgress,assets:new Set(),finish:(err,segments)=>{
+      const p={job,threadId,onThread,onProgress,assets:new Map(),finish:(err,segments)=>{
         if(done)return;done=true;clearTimeout(timer);clearTimeout(grace);signal?.removeEventListener('abort',abort);
         if(this.pending===p)this.pending=null;
         if(err){

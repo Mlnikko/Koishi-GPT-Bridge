@@ -6,6 +6,7 @@ const path = require('node:path');
 const http = require('node:http');
 const plugin = require('../src/index.cjs');
 const { visionPng } = require('../scripts/vision-fixture.cjs');
+const { animatedGif } = require('./helpers/media.cjs');
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-test-'));
 const wait = () => new Promise(resolve => setImmediate(resolve));
@@ -347,6 +348,34 @@ test('the reply is delivered in order, with images in their original position', 
   assert.match(delivered[2], /```python\nprint\(1\)\n```/);
 });
 
+test('QQ receives original GIF and PNG bytes and retries unfinished delivery from persisted media',async()=>{
+ const app=apply({notifyProgress:false});
+ const {port,token}=await bridgeOf(app.root),headers={'x-bridge-token':token,'Content-Type':'application/json'};
+ const beat=()=>fetch(`http://127.0.0.1:${port}/state`,{headers});await beat();
+ const s=session({elements:[{type:'text',attrs:{content:'create animation'}}]});
+ s.send=async content=>{if(content.includes('data:image/gif;'))throw Error('QQ temporarily unavailable');s.sent.push(content);return ['ok'];};
+ await dispatch(app,s);
+ let job;
+ for(let attempt=0;attempt<300&&!job;attempt++){
+  job=(await(await beat()).json()).job;if(!job)await new Promise(resolve=>setTimeout(resolve,10));
+ }
+ assert.ok(job);
+ const gif=animatedGif(),png=pngBytes(128);
+ for(const [index,bytes]of [gif,png].entries())assert.equal((await fetch(`http://127.0.0.1:${port}/result-asset?id=${job.id}&i=${index}`,
+  {method:'POST',headers:{'x-bridge-token':token},body:bytes})).status,200);
+ const segments=[{type:'text',text:'两种格式：'},{type:'image',asset:0},{type:'image',asset:1}];
+ assert.equal((await fetch(`http://127.0.0.1:${port}/result`,{method:'POST',headers,
+  body:JSON.stringify({id:job.id,threadId:THREAD,segments})})).status,200);
+ const [failed]=await settle(app.root);assert.equal(failed.delivery,'failed');assert.equal(failed.deliveryCursor,1);
+ // Dispose and recreate the plugin; /retry must use saved GIF data, with no model call.
+ for(const dispose of app.disposes)dispose();
+ const restarted=apply({dataDir:app.root,notifyProgress:false});
+ const retry=session({messageId:'gif-retry'});await dispatch(restarted,retry,`/retry ${job.id}`);
+ assert.deepEqual(retry.sent,[`<img src="data:image/gif;base64,${gif.toString('base64')}"/>`,
+  `<img src="data:image/png;base64,${png.toString('base64')}"/>`]);
+ assert.equal(jobFiles(app.root)[0].delivery,'sent');
+});
+
 test('a job handed to the bridge fails cleanly while no browser is connected', async () => {
   const app = apply();
   const s = session({ elements: [{ type: 'text', attrs: { content: '你好' } }] });
@@ -662,6 +691,27 @@ test('a stuck QQ acknowledgement times out and the job still reaches the browser
  await fetch(`http://127.0.0.1:${port}/failure`,{method:'POST',headers,body:JSON.stringify({id:remote.job.id,message:'页面加载失败'})});
  await new Promise(resolve=>setTimeout(resolve,40));
  assert.equal(jobFiles(app.root)[0].feedbackDelivery,'failed');
+});
+
+test('GIF upload confirmation can outlast the text budget without a false failed delivery',async()=>{
+ const app=apply({notifyProgress:false,sendTimeoutMs:15,mediaSendTimeoutMs:100});
+ const {port,token}=await bridgeOf(app.root),headers={'x-bridge-token':token,'Content-Type':'application/json'};
+ await fetch(`http://127.0.0.1:${port}/state`,{headers});
+ const s=session({elements:[{type:'text',attrs:{content:'send GIF'}}]});
+ s.send=async content=>{
+  if(content.includes('data:image/gif;'))await new Promise(resolve=>setTimeout(resolve,45));
+  s.sent.push(content);return ['ok'];
+ };
+ await dispatch(app,s);const [job]=jobFiles(app.root);
+ assert.equal((await fetch(`http://127.0.0.1:${port}/result-asset?id=${job.id}&i=0`,{
+  method:'POST',headers,body:animatedGif(),
+ })).status,200);
+ assert.equal((await fetch(`http://127.0.0.1:${port}/result`,{method:'POST',headers,
+  body:JSON.stringify({id:job.id,threadId:THREAD,segments:[{type:'image',asset:0}]}),
+ })).status,200);
+ const [done]=await settle(app.root);assert.equal(done.delivery,'sent');assert.equal(done.deliveryCursor,1);
+ assert.ok(s.sent.some(content=>content.startsWith('<img src="data:image/gif;')));
+ assert.ok(!s.sent.some(content=>content.includes('发送失败')));
 });
 
 

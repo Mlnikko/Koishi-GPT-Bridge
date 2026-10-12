@@ -1,6 +1,7 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
 const {el,img,createDocument}=require('./helpers/dom.cjs');
+const {animatedGif}=require('./helpers/media.cjs');
 
 const WORKER=fs.readFileSync(path.join(__dirname,'../browser-extension/background.js'),'utf8');
 const THREAD='11111111-2222-3333-4444-555555555555';
@@ -22,7 +23,7 @@ function stubChrome(){
 // pageStep 与 tick 都是顶层函数，可以直接调用 —— 不再需要按函数名切源码。
 function sandboxOf({document=createDocument(),location={href:'https://chatgpt.com/',pathname:'/'},chrome,fetch:fetchImpl,
  importScripts:importImpl=()=>{},config={url:'http://127.0.0.1:5141',token:'test'}}={}){
- const sandbox={console,AbortSignal,structuredClone,
+ const sandbox={console,AbortSignal,structuredClone,URL,setTimeout,
   setInterval:()=>{},importScripts:(...files)=>{
    for(const file of files){
     if(file==='config.js')importImpl(file);
@@ -63,6 +64,212 @@ function worker({state=null,results={},storageSeed={}}={}){
 }
 const opsOf=(calls,op)=>calls.filter(call=>call.op===op);
 const routeOf=(calls,route)=>calls.filter(call=>call.route===route);
+
+function fileReplyFixture(){
+ const document=createDocument();
+ const user=el('div',{'data-message-author-role':'user','data-message-id':'file-user'},['create GIF']);
+ const assistant=el('div',{'data-message-author-role':'assistant','data-message-id':'file-answer'});
+ const link=el('span',{role:'link','aria-label':'Open 下载 motion.gif'},['下载 motion.gif']);
+ const preview=el('button',{'aria-label':'打开 motion.gif 的预览'},['motion.gif']);
+ const close=el('button',{'aria-label':'关闭查看器'});
+ const viewer=el('div',{hidden:''},[img('data:image/gif;base64,'+animatedGif().toString('base64'),{width:1,height:1,alt:'图片预览'}),close]);
+ const open=()=>{delete viewer.attrs.hidden;};link.click=open;preview.click=open;
+ close.click=()=>{viewer.attrs.hidden='';};
+ assistant.appendChild(el('p',{},['动画：',link,' 完成。']));
+ assistant.appendChild(preview);
+ document.body.appendChild(user);document.body.appendChild(assistant);document.body.appendChild(viewer);
+ return {document,assistant,link,preview,viewer,user};
+}
+
+test('new renderer file links without href are ordered media and duplicate preview cards are ignored',async()=>{
+ const {document,assistant}=fileReplyFixture();
+ assistant.appendChild(img('blob:static'));
+ const sandbox=sandboxOf({document});
+ const reply=await sandbox.pageStep('read',{});
+ assert.equal(reply.imageCount,2);
+ assert.deepEqual(plain(reply.segments),[
+  {type:'text',text:'动画：'},{type:'image',asset:0},{type:'text',text:'完成。'},{type:'image',asset:1,mime:'image/png'},
+ ]);
+ const info=await sandbox.pageStep('inspect',{});assert.equal(info.imageLoading,false);assert.equal(info.images,2);
+});
+
+test('preview-only GIF files are usable replies, including small animated images',async()=>{
+ const {document,assistant,preview}=fileReplyFixture();
+ assistant.childNodes=[];assistant.appendChild(preview);
+ const sandbox=sandboxOf({document});
+ const reply=await sandbox.pageStep('read',{}),info=await sandbox.pageStep('inspect',{});
+ assert.deepEqual(plain(reply.segments),[{type:'image',asset:0}]);
+ assert.equal(info.replyLength,0);assert.equal(info.images,1);assert.equal(info.imageLoading,false);
+});
+test('live resource rows return media without leaking filenames, type or download controls as prose',async()=>{
+ const {document,assistant,preview}=fileReplyFixture();
+ assistant.appendChild(el('span',{class:'group/resource-row relative'},[
+  preview,el('span',{},['motion.gif',el('span',{},['图像']),el('span',{},['打开文件'])]),
+  el('button',{'aria-label':'下载文件'}),
+ ]));
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[
+  {type:'text',text:'动画：'},{type:'image',asset:0},{type:'text',text:'完成。'},
+ ]);
+});
+
+test('inline blob GIF images also retain animation instead of being flattened to PNG',async()=>{
+ const document=createDocument();
+ document.body.appendChild(el('div',{'data-message-author-role':'assistant'},[img('blob:https://chatgpt.com/animated')]));
+ const sandbox=sandboxOf({document,fetch:async()=>new Response(animatedGif())});
+ const reply=await sandbox.pageStep('read',{}),asset=await sandbox.pageStep('image',{reply});
+ assert.equal(asset.mime,'image/gif');assert.deepEqual(Buffer.from(asset.base64,'base64'),animatedGif());
+});
+
+test('GIF viewer returns the original animation bytes and closes before the next media',async()=>{
+ const {document,viewer}=fileReplyFixture();
+ const sandbox=sandboxOf({document,fetch:async url=>{
+  assert.ok(String(url).startsWith('data:image/gif;base64,'));return new Response(animatedGif());
+ }});
+ const reply=await sandbox.pageStep('read',{});
+ const asset=await sandbox.pageStep('image',{imageIndex:0,reply});
+ assert.equal(asset.mime,'image/gif');assert.deepEqual(Buffer.from(asset.base64,'base64'),animatedGif());
+ assert.equal(viewer.getAttribute('hidden'),'');
+ // A local transport retry can reopen the same viewer without changing bytes.
+ const retried=await sandbox.pageStep('image',{imageIndex:0,reply});
+ assert.equal(retried.base64,asset.base64);
+});
+
+test('a standalone sandbox path retrieves the exact historical assistant file, retaining GIF bytes',async()=>{
+ const {document,assistant,user,preview,viewer}=fileReplyFixture();
+ preview.attrs['aria-label']='打开 琪露诺_自然动态.gif 的预览';preview.childNodes=[];
+ const user2=el('div',{'data-message-author-role':'user','data-message-id':'followup-user'},['再次发送']);
+ const assistant2=el('div',{'data-message-author-role':'assistant','data-message-id':'followup-answer'},[
+  el('p',{},[el('span',{},['/mnt/data/琪露诺_自然动态.gif'])]),
+ ]);
+ document.body.appendChild(user2);document.body.appendChild(assistant2);
+ const sandbox=sandboxOf({document,fetch:async()=>new Response(animatedGif())});
+ const reply=await sandbox.pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[{type:'image',asset:0}]);
+ assert.equal(reply.assetKeys[0],'file-answer/琪露诺_自然动态.gif');
+ const asset=await sandbox.pageStep('image',{reply});
+ assert.equal(asset.mime,'image/gif');assert.deepEqual(Buffer.from(asset.base64,'base64'),animatedGif());
+ assert.equal(viewer.getAttribute('hidden'),'');
+});
+
+test('sandbox path references never read local files, user attachments or ambiguous historical versions',async()=>{
+ for(const mode of ['missing','user','ambiguous']){
+  const {document,assistant,user,preview}=fileReplyFixture();
+  if(mode==='missing'){assistant.childNodes=[];}
+  if(mode==='user'){assistant.childNodes=[];user.appendChild(preview);}
+  if(mode==='ambiguous')document.body.appendChild(el('div',{'data-message-author-role':'assistant','data-message-id':'second-version'},[
+   el('button',{'aria-label':'打开 motion.gif 的预览'}),
+  ]));
+  document.body.appendChild(el('div',{'data-message-author-role':'user'},['send']));
+  document.body.appendChild(el('div',{'data-message-author-role':'assistant'},[el('p',{},['/mnt/data/motion.gif'])]));
+  const sandbox=sandboxOf({document,fetch:()=>assert.fail('do not fetch an unbound path')});
+  const reply=await sandbox.pageStep('read',{});assert.match(reply.error,mode==='ambiguous'?/同名版本/:/仅回复文件路径/);
+ }
+});
+test('a current file card takes precedence over an older same-name file and a repeated path is deduplicated',async()=>{
+ const {document}=fileReplyFixture();
+ document.body.appendChild(el('div',{'data-message-author-role':'user'},['new version']));
+ document.body.appendChild(el('div',{'data-message-author-role':'assistant','data-message-id':'new-version'},[
+  el('p',{},['/mnt/data/motion.gif']),el('p',{},['/mnt/data/motion.gif']),
+  el('button',{'aria-label':'打开 motion.gif 的预览'}),
+ ]));
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.deepEqual(plain(reply.segments),[{type:'image',asset:0}]);
+ assert.deepEqual(plain(reply.assetKeys),['new-version/motion.gif']);
+});
+
+test('raw generated GIF links and list entries are downloaded without canvas conversion',async()=>{
+ const document=createDocument();
+ document.body.appendChild(el('div',{'data-message-author-role':'assistant'},[
+  el('ul',{},[el('li',{},[el('a',{href:'data:image/gif;base64,'+animatedGif().toString('base64'),download:'animation.gif'},['下载'])])]),
+ ]));
+ const sandbox=sandboxOf({document,fetch:async()=>new Response(animatedGif())});
+ const reply=await sandbox.pageStep('read',{});assert.equal(reply.imageCount,1);
+ const asset=await sandbox.pageStep('image',{reply});assert.equal(asset.mime,'image/gif');
+ assert.deepEqual(Buffer.from(asset.base64,'base64'),animatedGif());
+});
+
+test('external links and files in other turns remain outside the reply media pipeline',async()=>{
+ const {document,assistant,user}=fileReplyFixture();
+ user.appendChild(el('a',{href:'sandbox:/mnt/data/user.gif'},['user.gif']));
+ assistant.appendChild(el('p',{},[
+  el('a',{href:'https://example.com/external.gif'},['external.gif']),
+  el('a',{href:'http://127.0.0.1:9000/private.gif'},['private.gif']),
+  el('a',{href:'sandbox:/mnt/data/document.pdf'},['document.pdf']),
+ ]));
+ const sandbox=sandboxOf({document});
+ const reply=await sandbox.pageStep('read',{});
+ assert.equal(reply.imageCount,1);
+ assert.ok(reply.segments.some(s=>s.text?.includes('https://example.com/external.gif')));
+ assert.ok(!reply.segments.some(s=>s.text?.includes('user.gif')));
+});
+
+test('file identity changes and existing viewers cannot hand back unrelated files',async()=>{
+ const {document,viewer,link,preview}=fileReplyFixture();
+ const sandbox=sandboxOf({document,fetch:()=>assert.fail('do not download unrelated files')});
+ const reply=await sandbox.pageStep('read',{});
+ delete viewer.attrs.hidden;
+ assert.match((await sandbox.pageStep('image',{reply})).error,/已有文件预览/);
+ viewer.attrs.hidden='';link.childNodes=[];link.appendChild('other.gif');preview.attrs['aria-label']='打开 other.gif 的预览';
+ assert.match((await sandbox.pageStep('image',{reply})).error,/发生变化/);
+});
+
+test('file downloads reject HTTP errors, non-images and over-limit streams and always close the viewer',async()=>{
+ for(const response of [new Response('expired',{status:403}),new Response('<html>expired</html>'.repeat(5)),
+  new Response(new Uint8Array(21*1024*1024))]){
+  const {document,viewer}=fileReplyFixture();
+  const sandbox=sandboxOf({document,fetch:async()=>response});
+  const reply=await sandbox.pageStep('read',{});
+  assert.ok((await sandbox.pageStep('image',{reply})).error);
+  assert.equal(viewer.getAttribute('hidden'),'');
+ }
+});
+
+test('worker uploads GIF bytes with the real MIME and can resume an unacknowledged asset',async()=>{
+ const task={id:'gif-return',text:'create GIF'};
+ const {sandbox,storage,calls}=worker({state:task,results:{image:{base64:animatedGif().toString('base64'),mime:'image/gif'}}});
+ await wait();
+ storage.current={id:task.id,tabId:1,phase:'returning',reply:{threadId:THREAD,imageCount:1,segments:[{type:'image',asset:0}]}};
+ const fetch=sandbox.fetch;let attempts=0;
+ sandbox.fetch=async(url,options)=>{
+  if(new URL(url).pathname==='/result-asset'){
+   assert.equal(options.headers['Content-Type'],'image/gif');assert.deepEqual(Buffer.from(options.body),animatedGif());
+   if(++attempts===1)throw Error('acknowledgement lost');
+  }
+  return fetch(url,options);
+ };
+ await sandbox.tick();assert.equal(storage.current.phase,'returning');assert.equal(storage.current.uploaded,undefined);
+ await sandbox.tick();assert.equal(storage.current,null);assert.equal(attempts,2);
+ assert.equal(routeOf(calls,'/result').length,1);assert.equal(opsOf(calls,'send').length,0);
+});
+test('preview-backed files activate their task tab and restore the original tab on a transport retry',async()=>{
+ const task={id:'preview-focus',text:'send GIF'};
+ const {sandbox,storage}=worker({state:task,results:{image:{base64:animatedGif().toString('base64'),mime:'image/gif'}}});
+ await wait();
+ storage.current={id:task.id,tabId:1,phase:'returning',reply:{threadId:THREAD,imageCount:1,requiresPreview:true,segments:[{type:'image',asset:0}]}};
+ const updates=[];
+ sandbox.chrome.tabs.get=async()=>({url:'https://chatgpt.com/c/'+THREAD,windowId:7,active:true});
+ sandbox.chrome.tabs.query=async options=>{assert.equal(options.windowId,7);return [{id:42}];};
+ sandbox.chrome.tabs.update=async id=>{updates.push(id);};
+ const fetch=sandbox.fetch;
+ sandbox.fetch=async(url,options)=>{if(new URL(url).pathname==='/result-asset')throw Error('network retry');return fetch(url,options);};
+ await sandbox.tick();assert.deepEqual(updates,[1,42]);assert.equal(storage.current.phase,'returning');
+});
+for(const switched of [false,true])test('successful file retrieval restores the original selection unless the user switched tabs: '+switched,async()=>{
+ const task={id:'preview-success',text:'send GIF'};
+ const {sandbox,storage}=worker({state:task,results:{image:{base64:animatedGif().toString('base64'),mime:'image/gif'}}});
+ await wait();
+ storage.current={id:task.id,tabId:1,phase:'returning',reply:{threadId:THREAD,imageCount:1,requiresPreview:true,segments:[{type:'image',asset:0}]}};
+ let active=true;const events=[];
+ sandbox.chrome.tabs.get=async()=>({url:'https://chatgpt.com/c/'+THREAD,windowId:7,active});
+ sandbox.chrome.tabs.query=async()=>[{id:42}];
+ sandbox.chrome.tabs.update=async id=>{events.push(id);};
+ sandbox.chrome.tabs.remove=async id=>{events.push('remove '+id);};
+ const inject=sandbox.chrome.scripting.executeScript;
+ sandbox.chrome.scripting.executeScript=async args=>{if(args.args[0]==='image'&&switched)active=false;return inject(args);};
+ await sandbox.tick();assert.equal(storage.current,null);
+ assert.deepEqual(events,switched?[1,'remove 1']:[1,42,'remove 1']);
+});
 
 for(const existing of [{unknownDrafts:true},{attachments:1},{uploading:true}])test('opening never appends input to existing composer content '+JSON.stringify(existing),async()=>{
  const task={id:'composer-owned',text:'new task',images:[{index:0}]};

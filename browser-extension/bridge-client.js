@@ -40,11 +40,11 @@ async function api(route,body){
 }
 // Reply images travel as raw bytes: base64 inside the JSON result would inflate
 // every picture by a third and blow the bridge body limit on a multi-image answer.
-async function uploadAsset(id,index,base64){
+async function uploadAsset(id,index,base64,mime='image/png'){
  const binary=atob(base64);
  const bytes=new Uint8Array(binary.length);
  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
  const response=await bridgeFetch(bridgeConfig.url+'/result-asset?id='+encodeURIComponent(id)+'&i='+index,
-  {method:'POST',headers:{'x-bridge-token':bridgeConfig.token,'Content-Type':'image/png'},body:bytes,signal:AbortSignal.timeout(60000)});
+  {method:'POST',headers:{'x-bridge-token':bridgeConfig.token,'Content-Type':mime},body:bytes,signal:AbortSignal.timeout(60000)});
  if(!response.ok)throw new Error('回复图片上传失败（'+response.status+'）');
 }
