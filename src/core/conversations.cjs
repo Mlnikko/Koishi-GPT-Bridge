@@ -4,6 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { writeJson } = require('../lib/state.cjs');
 const { normalizeReasoning } = require('./reasoning.cjs');
 const { presetName } = require('./presets.cjs');
+const { promptName } = require('./image-prompts.cjs');
 // 默认会话的名字。每条消息都自动落到一个持续会话里，所以「没有会话」不是一种
 // 正常状态：`ensure` 会在第一次收到消息时就把这个会话建出来。
 const DEFAULT_NAME = '默认会话';
@@ -42,12 +43,14 @@ class Conversations {
   // 会话里」的落点。第一次收到消息时按需建出来，之后一直复用，所以改图这类
   // 「接着上一张继续说」的用法不需要任何命令。
   ensure(owner, chat, name) { return this.current(owner, chat) || this.create(owner, chat, name); }
-  create(owner, chat, name, { backend, model, preset } = {}) {
+  create(owner, chat, name, { backend, model, preset, imagePrompt } = {}) {
     if (preset !== undefined) preset = presetName(preset);
+    if (imagePrompt !== undefined) imagePrompt = promptName(imagePrompt);
     if (this.list(owner, chat).length >= 20) throw Error('最多保留 20 个打开的会话，请先用「/close 编号」关闭不需要的会话');
     const s = { id: randomUUID().replaceAll('-', '').slice(0, 8), owner, chat, name: this.name(name), createdAt: Date.now(),
       ...(backend === 'lmstudio' && model ? { backend, lmStudioModel: model } : {}),
-      ...(preset ? { lmStudioPreset: preset } : {}) };
+      ...(preset ? { lmStudioPreset: preset } : {}),
+      ...(imagePrompt ? { imagePrompt } : {}) };
     return this.commit(data => { data.items.push(s); data.current[this.key(owner, chat)] = s.id; return s.id; });
   }
   select(id, owner, chat) {
@@ -77,6 +80,16 @@ class Conversations {
       const item = data.items.find(item => item.id === id);
       if (value === undefined) delete item.lmStudioPreset;
       else item.lmStudioPreset = value;
+      return id;
+    });
+  }
+  setImagePrompt(id, owner, chat, value) {
+    if (!this.get(id, owner, chat)) throw Error('未找到你的会话');
+    if (value !== undefined) value = promptName(value);
+    return this.commit(data => {
+      const item = data.items.find(item => item.id === id);
+      if (value === undefined) delete item.imagePrompt;
+      else item.imagePrompt = value;
       return id;
     });
   }

@@ -8,6 +8,7 @@ const { QQDelivery, isFresh } = require('./bridge/qq-delivery.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
 const { Presets } = require('./core/presets.cjs');
+const { ImagePrompts, MAX_PROMPT_CHARS } = require('./core/image-prompts.cjs');
 const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('./core/reasoning.cjs');
 const { JobQueue } = require('./core/queue.cjs');
 const { normalizeConfig } = require('./core/config.cjs');
@@ -29,6 +30,7 @@ exports.apply = (ctx, config) => {
   const sessions = new Map();
   const chats = new Conversations(path.join(root, 'conversations.json'));
   const presets = new Presets(path.join(root, 'presets'));
+  const imagePrompts = new ImagePrompts(path.join(root, 'prompts'), path.join(__dirname, '..', 'examples', 'prompts'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
   const web = new WebBridge({ root, port: config.webBridgePort ?? 5141,
     timeoutMs: replyTimeoutMs, pluginVersion: version });
@@ -106,6 +108,7 @@ exports.apply = (ctx, config) => {
     + (j.sessionId ? `\n会话：${j.sessionId}` : '\n独立任务（不绑定网页会话）')
     + (j.backend === 'lmstudio' ? `\n本地模型：${j.model}` : '')
     + (j.preset ? `\n本地预设：${j.preset.name}（版本 ${j.preset.revision.slice(0, 8)}）` : '')
+    + (j.imagePrompt ? `\n图片模板：${j.imagePrompt.name}（版本 ${j.imagePrompt.revision.slice(0, 8)}）` : '')
     + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort)}` : '')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
@@ -115,13 +118,14 @@ exports.apply = (ctx, config) => {
     maxTotal: maxReplyChars, sendTimeoutMs, mediaSendTimeoutMs });
   const deliver = (job, session) => delivery.deliver(job, session);
   // 普通消息按原顺序转发；引用回复先附上有明确边界的引用内容，图片依次作为附件。
-  async function forward(session) {
+  async function forward(session, imagePrompt) {
     let segments;
-    try { segments = sessionSegments(session); }
+    try { segments = imagePrompt ? [{ type: 'text', text: imagePrompt.text }] : sessionSegments(session); }
     catch (err) { return textMessage(safeReason(err.message)); }
     if (!segments.length) return;
     const text = submissionText(segments);
-    if (text.length > maxTextChars) return `文字最多 ${maxTextChars} 字，请缩短后重新发送。`;
+    const inputLimit = imagePrompt ? MAX_PROMPT_CHARS : maxTextChars;
+    if (text.length > inputLimit) return `文字最多 ${inputLimit} 字，请缩短后重新发送。`;
     const sources = imagesOf(segments);
     if (sources.length > maxInputImages) return `一次最多发送 ${maxInputImages} 张图片，请减少后重新发送。`;
     // 默认就有一个持续会话：第一次发消息时自动建出来，之后所有消息都留在同一个
@@ -130,6 +134,7 @@ exports.apply = (ctx, config) => {
     let chat;
     try { chat = chats.ensure(session.userId, conversation(session)); }
     catch (err) { return textMessage(safeReason(err.message)); }
+    if (imagePrompt && chat.backend === 'lmstudio') return '图片模板通过 ChatGPT 网页生成图片，请先发送 /backend web，再用 /draw 角色名。';
     const duplicate = q.duplicate(session.userId, conversation(session), session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
     if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。';
@@ -148,7 +153,7 @@ exports.apply = (ctx, config) => {
         throw Error('预设和本次消息超出本地上下文字数上限，请缩短预设或消息，或调整 lmStudioHistoryChars');
       const { job, duplicate: again } = q.enqueue({ owner: session.userId, conversation: conversation(session),
         messageId: session.messageId, sessionId: chat.id, reasoningEffort: chat.backend === 'lmstudio' ? undefined : chat.reasoningEffort,
-        backend: chat.backend, model: chat.lmStudioModel, preset, segments: prepared });
+        backend: chat.backend, model: chat.lmStudioModel, preset, imagePrompt, segments: prepared });
       if (again) return notifications(session) ? status(job) : undefined;
       sessions.set(job.id, session);
       const reference = imagesIn(job).length ? `（含 ${imagesIn(job).length} 张图片）` : '';
@@ -185,9 +190,10 @@ exports.apply = (ctx, config) => {
   command('/help', '帮助').action(help);
   command('/new [name:text]', '开启新对话').action(manage((owner, chat, name) => {
     const previous = chats.current(owner, chat);
-    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel, preset: previous?.lmStudioPreset });
+    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel, preset: previous?.lmStudioPreset, imagePrompt: previous?.imagePrompt });
     return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`
-      + (s.lmStudioPreset ? `\n沿用本地预设：${s.lmStudioPreset}。` : '');
+      + (s.lmStudioPreset ? `\n沿用本地预设：${s.lmStudioPreset}。` : '')
+      + (s.imagePrompt ? `\n沿用图片模板：${s.imagePrompt}，/draw 角色名 生成图片。` : '');
   }));
   command('/chat [id:string]', '会话列表；带编号切换').action(manage((owner, chat, id) => {
     if (id) {
@@ -284,6 +290,64 @@ exports.apply = (ctx, config) => {
       + (s.backend === 'lmstudio' ? '' : '\n/backend lmstudio 切换到本地模型后使用。')
       + '\n已有聊天记录保留，/new 沿用预设开启新剧情。';
   }));
+  command('/prompt [name:text]', '图片模板；list/show/preview 查看，名称选择，off 取消').action(manage((owner, chat, value) => {
+    const current = chats.current(owner, chat);
+    const label = `当前图片模板：${current?.imagePrompt || '未选择'}。`;
+    const parsed = /^(list|show|preview|off)(?:[ \t]+(.*))?$/i.exec(value || '');
+    const action = parsed?.[1].toLowerCase(), argument = parsed?.[2]?.trim();
+    if (!value || action === 'list') {
+      if (argument && !/^[1-9]\d{0,3}$/.test(argument)) throw Error('用法：/prompt list [页码]');
+      const names = imagePrompts.list(), page = Number(argument || 1), pages = Math.max(1, Math.ceil(names.length / 15));
+      if (page > pages) throw Error(`模板列表只有 ${pages} 页`);
+      return label + `\n图片模板：${names.length} 个，第 ${page}/${pages} 页。\n`
+        + (names.slice((page - 1) * 15, page * 15).join('\n') || '暂无模板，请在本地数据目录的 prompts/ 添加 .md 文件。')
+        + (page < pages ? `\n/prompt list ${page + 1} 查看下一页。` : '')
+        + '\n/prompt 模板名 选择；/prompt show 查看正文；/prompt preview 角色名 预览替换；/draw 角色名 发送到 GPT 生成图片。可追加 | 参数名=内容。';
+    }
+    if (action === 'show' || action === 'preview') {
+      let page = 1, target = argument;
+      if (argument?.startsWith('--page')) {
+        const paging = /^--page[ \t]+([1-9]\d{0,3})(?:[ \t]+(.+))?$/.exec(argument);
+        if (!paging) throw Error(`用法：/prompt ${action} [--page 页码] ${action === 'show' ? '[模板名]' : '角色名'}`);
+        page = Number(paging[1]); target = paging[2];
+      }
+      const name = action === 'show' ? target || current?.imagePrompt : current?.imagePrompt;
+      if (!name) throw Error('请先用 /prompt 模板名 选择图片模板');
+      const snapshot = action === 'show' ? imagePrompts.read(name) : imagePrompts.render(name, target);
+      const body = action === 'show' ? snapshot.template : snapshot.text;
+      const heading = `${action === 'show' ? '图片模板' : '发送内容预览'}：${name}，${body.length} 字。`;
+      const nextArgument = action === 'show' ? name : snapshot.request;
+      const navigation = `/prompt ${action} --page 9999 ${nextArgument}`;
+      const pages = splitText(body, Math.max(16, maxTextChars - heading.length - navigation.length - 100));
+      if (page > pages.length) throw Error(`正文只有 ${pages.length} 页`);
+      return heading + `\n第 ${page}/${pages.length} 页。\n` + pages[page - 1]
+        + (page < pages.length ? `\n/prompt ${action} --page ${page + 1} ${nextArgument} 查看下一页。` : '')
+        + (action === 'preview' ? '\n尚未发送；/draw 后填写相同角色名和参数，使用发送时的最新模板生成图片。' : '');
+    }
+    if (action === 'off') {
+      if (argument) throw Error('用法：/prompt off');
+      if (current) chats.setImagePrompt(current.id, owner, chat, undefined);
+      return '已取消当前图片模板选择。已提交任务和聊天历史保留。';
+    }
+    const template = imagePrompts.read(value);
+    const s = current || chats.ensure(owner, chat);
+    chats.setImagePrompt(s.id, owner, chat, template.name);
+    const required = template.fields.filter(f => f.name !== '角色名' && f.name !== '补充要求' && f.fallback === undefined).map(f => f.name);
+    const optional = [...new Set([...template.fields.filter(f => f.name !== '角色名' && f.fallback !== undefined).map(f => f.name), '补充要求'])];
+    return `已选择图片模板：${template.name}。\n/draw 角色名 发送到 GPT；/prompt preview 角色名 仅预览。`
+      + (required.length ? `\n必填参数：${required.join('、')}。` : '')
+      + `\n可选参数：${optional.join('、')}。\n追加参数：角色名 | 参数名=内容。/prompt show 查看默认值和适配规则。普通消息仍正常聊天。`;
+  }));
+  command('/draw [request:text]', '图片模板生图：角色名，可追加 | 参数名=内容').action(async ({ session }, request) => {
+    try {
+      const duplicate = q.duplicate(session.userId, conversation(session), session.messageId);
+      if (duplicate) return notifications(session) ? textMessage(status(duplicate)) : undefined;
+      const chat = chats.current(session.userId, conversation(session));
+      if (!chat?.imagePrompt) return '请先用 /prompt 查看列表，再用 /prompt 模板名 选择图片模板。';
+      if (chat.backend === 'lmstudio') return '图片模板通过 ChatGPT 网页生成图片，请先发送 /backend web，再用 /draw 角色名。';
+      return await forward(session, imagePrompts.render(chat.imagePrompt, request));
+    } catch (err) { return textMessage(safeReason(err.message)); }
+  });
   command('/close [id:string]', '关闭当前或指定会话').action(manage((owner, chat, id) => {
     const s = chats.get(id || chats.current(owner, chat)?.id, owner, chat);
     if (!s) throw Error('未找到你的会话');

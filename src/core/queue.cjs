@@ -9,6 +9,7 @@ const { recoverAssets } = require('../lib/reply-assets.cjs');
 const { writeJson } = require('../lib/state.cjs');
 const { normalizeReasoning } = require('./reasoning.cjs');
 const { validatePresetSnapshot } = require('./presets.cjs');
+const { validateImagePrompt, MAX_PROMPT_CHARS } = require('./image-prompts.cjs');
 
 // 任务负载的版本号。生图时代的任务没有这个字段，语义也已不适用，
 // 载入时直接跳过（不删除），把目录留给用户自己处理。
@@ -87,7 +88,7 @@ class JobQueue {
   }
   // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
   // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
-  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, preset, segments = [] }) {
+  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, preset, imagePrompt, segments = [] }) {
     const duplicate = this.duplicate(owner, conversation, messageId);
     if (duplicate) return { job: duplicate, duplicate: true };
     if (this.closed) throw new Error('桥接服务正在关闭');
@@ -101,7 +102,14 @@ class JobQueue {
     }
     const list = Array.isArray(segments) ? segments : [];
     const text = submissionText(list);
-    if (text.length > this.maxChars) throw new Error(`文字最多 ${this.maxChars} 字，请缩短后重新发送`);
+    if (imagePrompt !== undefined) {
+      if (backend === 'lmstudio') throw Error('图片提示词只适用于 ChatGPT 网页');
+      imagePrompt = validateImagePrompt(imagePrompt);
+      if (list.length !== 1 || list[0].type !== 'text' || text !== imagePrompt.text)
+        throw Error('图片提示词与任务正文不一致');
+    }
+    const maxChars = imagePrompt ? MAX_PROMPT_CHARS : this.maxChars;
+    if (text.length > maxChars) throw new Error(`文字最多 ${maxChars} 字，请缩短后重新发送`);
     if (isEmpty(list)) throw new Error('消息里既没有文字也没有图片');
     if (imagesOf(list).length > this.maxImages) throw new Error(`一次最多发送 ${this.maxImages} 张图片`);
     if (Array.from(this.pendingJobs).filter(pending).length >= MAX_QUEUED) throw new Error('队列已满，请稍后再试');
@@ -122,6 +130,7 @@ class JobQueue {
     const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input,
       ...(backend === 'lmstudio' ? { backend, model } : {}),
       ...(preset ? { preset } : {}),
+      ...(imagePrompt ? { imagePrompt } : {}),
       ...(reasoningEffort && reasoningEffort !== 'default' ? { reasoningEffort } : {}),
       status: 'queued', delivery: 'pending', createdAt: Date.now(), dir };
     try { this.save(j); } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }

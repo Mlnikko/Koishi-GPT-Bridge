@@ -399,7 +399,7 @@ const slash = (app, text, options = {}) => dispatch(app, session({ ...options, e
 test('help lists short commands including backend selection and stays local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/preset', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/preset', '/prompt', '/draw', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
@@ -448,7 +448,7 @@ test('removed Chinese commands only show the migration notice and never create j
 test('all short commands remain gated by private authorization and group mentions', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/preset', '/preset show', '/preset role',
-    '/preset create role\n正文', '/preset edit role\n正文', '/preset delete role', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
+    '/preset create role\n正文', '/preset edit role\n正文', '/preset delete role', '/prompt', '/prompt 角色海报', '/prompt preview 英雄', '/draw 英雄', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
     assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
     assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
   }
@@ -1077,4 +1077,119 @@ test('a failed or racing model lookup never changes backend or submits a task', 
   await dispatch(app, s, '/new other');
   assert.match(await changing, /状态已变化/);
   assert.match(await dispatch(app, s, '/backend'), /当前后端：ChatGPT 网页/);
+});
+
+test('image template selection, preview and paging are local and persist per conversation', async () => {
+  const app = apply({ groupChat: true });
+  assert.match(await slash(app, '/prompt'), /未选择[\s\S]*角色海报/);
+  assert.match(await slash(app, '/draw 英雄'), /请先用 \/prompt/);
+  assert.match(await slash(app, '/prompt 角色海报'), /已选择图片模板/);
+  assert.match(await slash(app, '/prompt show'), /\{\{角色名\}\}/);
+  const preview = await slash(app, '/prompt preview 黑衣剑士 $&');
+  assert.match(preview, /黑衣剑士 \$&amp;/);
+  assert.ok(!preview.includes('{{角色名}}'));
+  assert.match(preview, /尚未发送/);
+  assert.match(await slash(app, '/prompt', { userId: 'bob' }), /未选择/);
+  assert.match(await slash(app, '/prompt', { isDirect: false, channelId: 'group', stripped: { appel: true } }), /未选择/);
+  const first = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
+  await slash(app, '/new 新图');
+  assert.match(await slash(app, '/prompt'), /当前图片模板：角色海报/);
+  await slash(app, '/prompt off');
+  assert.match(await slash(app, '/prompt'), /未选择/);
+  await slash(app, `/chat ${first.id}`);
+  fs.writeFileSync(path.join(app.root, 'prompts', '角色海报.md'), '{{角色名}}' + '长'.repeat(3000));
+  assert.match(await slash(app, '/prompt show'), /第 1\/3 页/);
+  assert.match(await slash(app, '/prompt preview --page 2 英雄'), /第 2\/3 页/);
+  assert.match(await slash(app, '/prompt show --page 99'), /只有 3 页/);
+  assert.deepEqual(jobFiles(app.root), []);
+  for (const dispose of app.disposes) dispose();
+  const restarted = apply({ dataDir: app.root });
+  assert.match(await slash(restarted, '/prompt'), /当前图片模板：角色海报/);
+  assert.match(await slash(restarted, '/prompt show'), /长/);
+});
+
+test('/draw submits the expanded text to the web bridge and returns image bytes through existing delivery', async () => {
+  const app = apply({ notifyProgress: false });
+  const { port, token } = await bridgeOf(app.root);
+  const headers = { 'x-bridge-token': token, 'Content-Type': 'application/json' };
+  const beat = () => fetch(`http://127.0.0.1:${port}/state`, { headers });
+  await beat();
+  const file = path.join(app.root, 'prompts', '测试海报.md');
+  const body = '生成{{角色名}}的图片。' + '细节'.repeat(850) + '\n主角：{{角色名}}';
+  fs.writeFileSync(file, body);
+  await slash(app, '/prompt 测试海报');
+  const s = session({ messageId: 'draw-test' });
+  await dispatch(app, s, '/draw 黑衣剑士');
+  let request;
+  for (let attempt = 0; attempt < 300 && !request; attempt++) {
+    request = (await (await beat()).json()).job;
+    if (!request) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.ok(request);
+  assert.equal(request.text, body.replaceAll('{{角色名}}', '黑衣剑士'));
+  assert.ok(!request.text.includes('/draw'));
+  fs.writeFileSync(file, '新版{{角色名}}');
+  assert.match(await slash(app, '/draw 第二人', { messageId: 'busy-draw' }), /当前会话仍在处理/);
+  await dispatch(app, s, '/draw 黑衣剑士');
+  assert.equal(jobFiles(app.root).length, 1, 'duplicate draw never submits twice');
+  assert.equal(jobFiles(app.root)[0].imagePrompt.template, body);
+  const bytes = pngBytes(512);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/result-asset?id=${request.id}&i=0`,
+    { method: 'POST', headers: { 'x-bridge-token': token }, body: bytes })).status, 200);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/result`, { method: 'POST', headers,
+    body: JSON.stringify({ id: request.id, threadId: THREAD, segments: [{ type: 'image', asset: 0 }] }) })).status, 200);
+  const [finished] = await settle(app.root);
+  assert.equal(finished.delivery, 'sent');
+  assert.deepEqual(s.sent, [`<img src="data:image/png;base64,${bytes.toString('base64')}"/>`]);
+  assert.equal(finished.input[0].text, request.text);
+  await slash(app, `/retry ${request.id}`, { messageId: 'retry-draw' });
+  assert.equal(jobFiles(app.root).length, 1);
+});
+
+test('draw validates missing files and roles and refuses local backend without submitting; ordinary chat stays unchanged', async t => {
+  const provider = await localServer(t);
+  const app = apply({ lmStudioBaseUrl: provider.url });
+  await slash(app, '/prompt 角色海报');
+  assert.match(await slash(app, '/draw'), /角色名须/);
+  assert.match(await slash(app, '/draw a\nb'), /单行文本/);
+  assert.match(await slash(app, '/prompt ../secret'), /模板名称/);
+  const file = path.join(app.root, 'prompts', '角色海报.md');
+  fs.unlinkSync(file);
+  assert.match(await slash(app, '/draw 英雄'), /未找到模板/);
+  fs.writeFileSync(file, '{{角色名}}'.repeat(100));
+  assert.match(await slash(app, '/draw ' + '人'.repeat(100)), /替换后/);
+  fs.writeFileSync(file, '生成{{角色名}}的图片');
+  await slash(app, '/backend lmstudio');
+  assert.match(await slash(app, '/draw 英雄'), /先发送 \/backend web/);
+  assert.deepEqual(jobFiles(app.root), []);
+  assert.equal(provider.requests.length, 0);
+  await slash(app, '/backend web');
+  const s = session({ messageId: 'ordinary-after-template', elements: [{ type: 'text', attrs: { content: '修改上一张图的背景' } }] });
+  await dispatch(app, s); await settle(app.root);
+  assert.deepEqual(jobFiles(app.root)[0].input, [{ type: 'text', text: '修改上一张图的背景' }]);
+  assert.equal(jobFiles(app.root)[0].imagePrompt, undefined);
+  assert.match(await dispatch(app, session({ messageId: 'long-ordinary', elements: [{ type: 'text', attrs: { content: '字'.repeat(1501) } }] })), /文字最多 1500/);
+});
+
+test('multi-variable previews preserve all parameters in page navigation and /draw sends the same expanded text', async () => {
+  const app = apply({ notifyProgress: false });
+  const body = '{{角色名}} {{场景|花园}} {{道具}}\n' + '细节'.repeat(1500);
+  fs.writeFileSync(path.join(app.root, 'prompts', '参数测试.md'), body);
+  assert.match(await slash(app, '/prompt 参数测试'), /必填参数：道具[\s\S]*可选参数：场景、补充要求/);
+  assert.match(await slash(app, '/draw 孙悟空'), /缺少必填参数：道具/);
+  const request = String.raw`孙悟空 | 场景=雨\|夜 | 道具=金箍棒 | 补充要求=水彩`;
+  const preview = await slash(app, '/prompt preview ' + request);
+  assert.match(preview, /孙悟空 雨\|夜 金箍棒/);
+  const navigation = preview.match(/(\/prompt preview --page 2 [^\n]+) 查看下一页。/)[1];
+  assert.equal(navigation, '/prompt preview --page 2 ' + request);
+  assert.match(await slash(app, navigation), /第 2\//);
+  assert.deepEqual(jobFiles(app.root), [], 'previews and validation failures never submit');
+  await slash(app, '/draw ' + request, { messageId: 'multi-draw' }); await settle(app.root);
+  const [job] = jobFiles(app.root);
+  assert.equal(job.imagePrompt.request, request);
+  assert.equal(job.imagePrompt.parameters.场景, '雨|夜');
+  assert.equal(job.imagePrompt.parameters.道具, '金箍棒');
+  assert.equal(job.input[0].text, job.imagePrompt.text);
+  assert.match(job.input[0].text, /补充要求：水彩/);
+  assert.ok(!job.input[0].text.includes('{{'));
 });
