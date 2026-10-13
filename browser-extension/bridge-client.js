@@ -28,14 +28,12 @@ async function loadInputs(task){
  for(const image of task.images||[]){
   const response=await bridgeFetch(bridgeConfig.url+'/input?id='+encodeURIComponent(task.id)+'&i='+image.index,
    {headers:{'x-bridge-token':bridgeConfig.token},signal:AbortSignal.timeout(30000)});
-  if(!response.ok)throw Error('无法读取本机参考图片（'+response.status+'）');
   list.push({name:image.name||('image-'+image.index+'.png'),mime:image.mime||'image/png',base64:toBase64(new Uint8Array(await response.arrayBuffer()))});
  }
  inputs.set(task.id,list);return list;
 }
 async function api(route,body){
  const response=await bridgeFetch(bridgeConfig.url+route,{method:body?'POST':'GET',headers:{'x-bridge-token':bridgeConfig.token,'x-bridge-capabilities':'reasoning','Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(10000)});
- if(!response.ok)throw new Error('本机连接器返回 '+response.status);
  try{return await response.json();}catch(err){err.retryable=true;throw err;}
 }
 // Reply images travel as raw bytes: base64 inside the JSON result would inflate
@@ -44,7 +42,6 @@ async function uploadAsset(id,index,base64,mime='image/png'){
  const binary=atob(base64);
  const bytes=new Uint8Array(binary.length);
  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
- const response=await bridgeFetch(bridgeConfig.url+'/result-asset?id='+encodeURIComponent(id)+'&i='+index,
+ await bridgeFetch(bridgeConfig.url+'/result-asset?id='+encodeURIComponent(id)+'&i='+index,
   {method:'POST',headers:{'x-bridge-token':bridgeConfig.token,'Content-Type':mime},body:bytes,signal:AbortSignal.timeout(60000)});
- if(!response.ok)throw new Error('回复图片上传失败（'+response.status+'）');
 }

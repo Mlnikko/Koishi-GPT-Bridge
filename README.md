@@ -372,6 +372,7 @@ koishi-codex-image-bridge/
 
 ```bash
 npm run check     # 检查脚本语法、入口、插件与扩展版本一致
+npm run benchmark:queue # 1 万条任务的内存查询对照基准，不包含模型或网络耗时
 npm test          # 发现全部嵌套 .test.cjs 文件并运行
 npm run doctor    # 检查运行中的实例；自定义目录：npm run doctor -- "/实际/dataDir"
 ```

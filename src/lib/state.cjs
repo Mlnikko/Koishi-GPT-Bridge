@@ -6,17 +6,11 @@ const { randomUUID } = require('node:crypto');
 // Publish a complete JSON snapshot, or leave the previous snapshot intact.
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temporary = file + '.tmp';
-  try {
-    fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
-    fs.renameSync(temporary, file);
-  } finally {
-    try { fs.unlinkSync(temporary); } catch {}
-  }
+  writeAtomic(file, JSON.stringify(value, null, 2));
 }
 
-// Keep a Markdown preset's author and body together in one atomic replacement.
-function writeText(file, value) {
+// Text, JSON and media use the same exclusive staging and atomic publication.
+function writeAtomic(file, value) {
   const temporary = file + '.' + randomUUID() + '.tmp';
   let descriptor;
   try {
@@ -30,4 +24,4 @@ function writeText(file, value) {
   }
 }
 
-module.exports = { writeJson, writeText };
+module.exports = { writeJson, writeAtomic };

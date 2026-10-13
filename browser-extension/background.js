@@ -151,12 +151,15 @@ async function tick(){
  try{
   if(configurationError){await chrome.storage.local.set({status:configurationError});return;}
   const remote=await api('/state');
-  const stored=await chrome.storage.local.get(['current','draft','drafts']);
+  const stored=await chrome.storage.local.get(['current','draft','drafts','status']);
   current=stored.current;
   if(!remote.job){
    // A completed/orphaned task is never resubmitted, even after service restarts.
    if(current?.tabId&&current.sentAt)await page(current.tabId,'stop',current).catch(()=>{});
-   await store(null,'已连接本机 Koishi，等待任务');return;
+   const idleStatus='已连接本机 Koishi，等待任务';
+   if(current||stored.status!==idleStatus)await store(null,idleStatus);
+   else inputs.clear();
+   return;
   }
   const task=remote.job;
   if(task.cancelled && (!current || current.id!==task.id)){

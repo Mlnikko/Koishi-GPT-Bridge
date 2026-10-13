@@ -6,6 +6,41 @@ const path = require('node:path');
 const { JobQueue, JOB_VERSION } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, segments: [{ type: 'text', text: 'a cat' }] });
+for (const [ext, bytes] of [
+  ['png', require('../../scripts/vision-fixture.cjs').visionPng({ width: 32, height: 32 })],
+  ['gif', require('../helpers/media.cjs').animatedGif()],
+  ['jpg', Buffer.concat([Buffer.from('ffd8ff','hex'), Buffer.alloc(61)])],
+  ['webp', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP'), Buffer.alloc(52)])],
+]) test('restart recovers committed ' + ext + ' bytes with the correct MIME and no regeneration', async () => {
+  const dir=root(),q=new JobQueue(dir,()=>assert.fail('must not resubmit'));
+  const j=q.enqueue(input('media-receipt')).job;j.status='running';q.save(j);
+  fs.writeFileSync(path.join(j.dir,'result-0.'+ext),bytes);
+  fs.writeFileSync(path.join(j.dir,'result.json'),JSON.stringify({id:j.id,segments:[{type:'image',asset:0}]}));
+  const recovered=new JobQueue(dir,()=>assert.fail('must not resubmit'));
+  assert.equal(recovered.jobs[0].status,'ready');
+  assert.equal(recovered.jobs[0].output[0].mime,{'png':'image/png','gif':'image/gif','jpg':'image/jpeg','webp':'image/webp'}[ext]);
+  assert.deepEqual(fs.readFileSync(path.join(j.dir,'result-0.'+ext)),bytes);
+  await recovered.pump();recovered.close();
+});
+
+for (const fault of ['missing','wrong-format','ambiguous','symlink'])
+test('an incomplete or ambiguous media receipt remains interrupted: ' + fault, () => {
+  const dir=root(),q=new JobQueue(dir,()=>assert.fail('must not resubmit'));
+  const j=q.enqueue(input('invalid-receipt')).job;j.status='running';q.save(j);
+  const bytes=require('../helpers/media.cjs').animatedGif();
+  if(fault==='wrong-format')fs.writeFileSync(path.join(j.dir,'result-0.png'),bytes);
+  if(fault==='ambiguous'){
+    fs.writeFileSync(path.join(j.dir,'result-0.gif'),bytes);
+    fs.writeFileSync(path.join(j.dir,'result-0.png'),require('../../scripts/vision-fixture.cjs').visionPng());
+  }
+  if(fault==='symlink'){
+    fs.writeFileSync(path.join(dir,'outside.gif'),bytes);
+    fs.symlinkSync(path.join(dir,'outside.gif'),path.join(j.dir,'result-0.gif'));
+  }
+  fs.writeFileSync(path.join(j.dir,'result.json'),JSON.stringify({id:j.id,segments:[{type:'image',asset:0}]}));
+  const recovered=new JobQueue(dir,()=>assert.fail('must not resubmit'));
+  assert.equal(recovered.jobs[0].status,'interrupted');
+});
 test('local preset snapshots survive queueing, deduplication and restart; web tasks reject them', () => {
   const { Presets } = require('../../src/core/presets.cjs');
   const dir = root(), presets = new Presets(path.join(dir, 'presets'));
@@ -50,6 +85,21 @@ test('a failing notification does not prevent submission or block the next task'
   q.enqueue(input('a')); q.enqueue(input('b'));
   await q.pump(); await new Promise(setImmediate); await new Promise(setImmediate);
   assert.equal(runs, 2); assert.equal(q.active, null); q.close();
+});
+
+test('slow final delivery releases the execution slot without allowing simultaneous generation',async()=>{
+ let finishDelivery,finishSecond;
+ const held=new Promise(resolve=>{finishDelivery=resolve;}),secondHeld=new Promise(resolve=>{finishSecond=resolve;});const runs=[];
+ const q=new JobQueue(root(),async job=>{runs.push(job.messageId);if(job.messageId==='second')await secondHeld;return [{type:'text',text:'ok'}];},
+  async job=>{if(job.messageId==='first'&&job.status==='ready')await held;});
+ q.enqueue(input('first'));q.enqueue(input('second'));q.enqueue(input('third'));
+ const first=q.pump();await new Promise(setImmediate);await new Promise(setImmediate);
+ const whileDelivering=[...runs];finishDelivery();await first;await new Promise(setImmediate);
+ const secondStillActive=q.active?.job.messageId;await q.pump();const beforeRelease=[...runs];
+ finishSecond();await new Promise(setImmediate);await new Promise(setImmediate);q.close();
+ assert.deepEqual(whileDelivering,['first','second']);
+ assert.equal(secondStillActive,'second');assert.deepEqual(beforeRelease,['first','second']);
+ assert.deepEqual(runs,['first','second','third']);
 });
 
 test('a save failure releases the active slot and does not submit untracked work', async () => {
@@ -195,4 +245,24 @@ test('messages without platform IDs are not mistaken for duplicates', async () =
   q.enqueue(input(undefined));
   assert.equal(q.jobs.length, 2);
   q.close();
+});
+
+test('latest and duplicate indexes rebuild after retention pruning and preserve owner isolation',()=>{
+ const q=new JobQueue(root(),()=>assert.fail('must not run'));
+ const first=q.enqueue({...input('m1'),sessionId:'same'}).job;first.status='ready';q.save(first);
+ const second=q.enqueue({...input('m2'),sessionId:'same'}).job;second.status='ready';q.save(second);
+ assert.equal(q.find(undefined,'alice','qq:alice','same').id,second.id);
+ assert.equal(q.duplicate('bob','qq:alice','m2'),undefined);
+ second.finishedAt=Date.now()-10*86400000;q.save(second);
+ assert.equal(q.prune(7),1);assert.equal(q.find(undefined,'alice','qq:alice','same').id,first.id);
+ assert.equal(q.duplicate('alice','qq:alice','m2'),undefined);assert.equal(q.busy('same'),false);
+ assert.ok(q.enqueue({...input('m2'),sessionId:'same'}).job);assert.equal(q.busy('same'),true);
+});
+
+test('failed state writes cannot leave a false full or busy slot after disk recovery',async()=>{
+ const q=new JobQueue(root(),async()=>[]),save=q.save.bind(q);
+ const first=q.enqueue({...input('m1'),sessionId:'same'}).job;
+ q.save=()=>{throw Error('disk full');};await q.pump();q.save=save;
+ assert.equal(first.status,'failed');assert.equal(q.busy('same'),false);
+ assert.ok(q.enqueue({...input('m2'),sessionId:'same'}).job);q.close();
 });

@@ -65,6 +65,16 @@ function worker({state=null,results={},storageSeed={}}={}){
 const opsOf=(calls,op)=>calls.filter(call=>call.op===op);
 const routeOf=(calls,route)=>calls.filter(call=>call.route===route);
 
+test('idle polling keeps the heartbeat without repeating identical persistent storage writes',async()=>{
+ const {sandbox,storage,calls}=worker();await wait();
+ let writes=0;const set=sandbox.chrome.storage.local.set;
+ sandbox.chrome.storage.local.set=async value=>{writes++;return set(value);};
+ for(let i=0;i<3;i++)await sandbox.tick();
+ assert.equal(writes,0);assert.equal(routeOf(calls,'/state').length,4);
+ storage.status='等待本机连接';await sandbox.tick();assert.equal(writes,1);
+ assert.equal(storage.status,'已连接本机 Koishi，等待任务');
+});
+
 function fileReplyFixture(){
  const document=createDocument();
  const user=el('div',{'data-message-author-role':'user','data-message-id':'file-user'},['create GIF']);
@@ -133,6 +143,26 @@ test('GIF viewer returns the original animation bytes and closes before the next
  // A local transport retry can reopen the same viewer without changing bytes.
  const retried=await sandbox.pageStep('image',{imageIndex:0,reply});
  assert.equal(retried.base64,asset.base64);
+});
+
+test('Chinese download labels without a separating space resolve the owned preview and deduplicate the file',async()=>{
+ const {document,link,preview,viewer}=fileReplyFixture();
+ link.childNodes=[];link.appendChild('下载工程验收红蓝.gif');link.setAttribute('aria-label','Open 下载工程验收红蓝.gif');
+ preview.childNodes=[];preview.setAttribute('aria-label','打开 工程验收红蓝.gif 的预览');
+ link.click=()=>assert.fail('must use the matching preview button, not the download label');
+ const sandbox=sandboxOf({document,fetch:async()=>new Response(animatedGif())});
+ const reply=await sandbox.pageStep('read',{});assert.equal(reply.imageCount,1);
+ const asset=await sandbox.pageStep('image',{imageIndex:0,reply});
+ assert.equal(asset.mime,'image/gif');assert.deepEqual(Buffer.from(asset.base64,'base64'),animatedGif());
+ assert.equal(viewer.getAttribute('hidden'),'');
+});
+
+test('a real filename beginning with 下载 is kept when its exact owned preview exists',async()=>{
+ const {document,link,preview}=fileReplyFixture();
+ link.childNodes=[];link.appendChild('下载工程.gif');link.setAttribute('aria-label','Open 下载工程.gif');
+ preview.childNodes=[];preview.setAttribute('aria-label','打开 下载工程.gif 的预览');
+ const reply=await sandboxOf({document}).pageStep('read',{});
+ assert.equal(reply.imageCount,1);assert.match(reply.assetKeys[0],/\/下载工程\.gif$/);
 });
 
 test('a standalone sandbox path retrieves the exact historical assistant file, retaining GIF bytes',async()=>{

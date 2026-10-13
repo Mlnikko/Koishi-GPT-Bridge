@@ -71,10 +71,6 @@ function sessionSegments(session) {
   ];
 }
 
-function textOf(segments) {
-  return (segments || []).filter(isText).map(segment => segment.text).join('');
-}
-
 // 提交给网页的正文：文本片段按顺序用换行连接。
 // ChatGPT 的输入框把图片当作附件，无法表达「图片夹在两句文字之间」，
 // 所以这里只保证文字顺序与图片顺序各自不变。
@@ -86,13 +82,8 @@ function imagesOf(segments) {
   return (segments || []).filter(isImage);
 }
 
-// 文字长度上限按「用户实际输入的字符」计算，图片不计入。
-function textLength(segments) {
-  return textOf(segments).length;
-}
-
 function isEmpty(segments) {
   return !(segments || []).some(segment => isImage(segment) || (isText(segment) && segment.text.trim()));
 }
 
-module.exports = { toSegments, sessionSegments, submissionText, imagesOf, textOf, textLength, isEmpty };
+module.exports = { toSegments, sessionSegments, submissionText, imagesOf, isEmpty };

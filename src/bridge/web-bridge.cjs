@@ -4,15 +4,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { failureInfo, safeReason } = require('../lib/feedback.cjs');
-const { pngSize, sniffImage } = require('../lib/image.cjs');
+const { saveAsset, replyAssetPath, ASSET_LIMIT, MAX_ASSETS } = require('../lib/reply-assets.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
 const { submissionText, imagesOf } = require('../core/message.cjs');
 const { writeJson } = require('../lib/state.cjs');
 
 const PROTOCOL_VERSION = 2;
 const JSON_BODY_LIMIT = 2 * 1024 * 1024;
-const ASSET_LIMIT = 20 * 1024 * 1024;
-const MAX_ASSETS = 10;
 // A text answer can stream for a while; the extension stops waiting on its own
 // long before this, so the bridge budget is a backstop rather than the main gate.
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -48,32 +46,10 @@ function webFailure(reply) {
   if (/会话不匹配|会话与任务不一致/.test(text))
     return error('thread_mismatch', 'ChatGPT 网页没有停在任务指定的会话上，本次未提交：' + safeReason(text));
   if (/推理程度/.test(text))return error('browser_interaction','ChatGPT 网页操作未完成：'+safeReason(text));
-  if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加/.test(text))
+  if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加|回复文件|文件预览/.test(text))
     return error('browser_interaction', 'ChatGPT 网页操作未完成：' + safeReason(text));
   const info = failureInfo({ technical: text });
   return error(info.code, info.message);
-}
-
-function assetType(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 32 || bytes.length > ASSET_LIMIT)
-    throw error('image_invalid', '网页返回的图片大小异常');
-  const type = sniffImage(bytes);
-  if (type.ext === 'png') {
-    pngSize(bytes);
-  }
-  if (type.ext === 'gif' && (!/^GIF8[79]a$/.test(bytes.subarray(0, 6).toString('latin1'))
-    || !bytes.readUInt16LE(6) || !bytes.readUInt16LE(8) || bytes.at(-1) !== 0x3b))
-    throw error('image_invalid', '网页返回的 GIF 数据不完整');
-  return type;
-}
-
-function saveAsset(bytes, destination) {
-  assetType(bytes);
-  const tmp = destination + '.tmp';
-  try { fs.writeFileSync(tmp, bytes, { mode: 0o600 }); fs.renameSync(tmp, destination); }
-  catch (err) { throw error('image_invalid', '网页图片保存失败：' + (err.code || 'write')); }
-  finally { try { fs.unlinkSync(tmp); } catch {} }
-  return destination;
 }
 
 async function readBody(req, limit) {
@@ -97,7 +73,7 @@ function saveProbe(dir, filename, probe) {
 class WebBridge {
   constructor({ root, port = 5141, timeoutMs = DEFAULT_TIMEOUT_MS, pluginVersion = 'development' }) {
     this.pluginVersion=pluginVersion; this.startedAt=Date.now();
-    this.root=root; this.timeoutMs=timeoutMs; this.pending=null; this.lastSeen=0; this.lastResult=null; this.tail=Promise.resolve(); this.queued=0; this.closed=false;
+    this.root=root; this.timeoutMs=timeoutMs; this.pending=null; this.lastSeen=0; this.lastResult=null; this.tail=Promise.resolve(); this.closed=false;
     fs.mkdirSync(root,{recursive:true,mode:0o700});
     const tokenFile=path.join(root,'web-bridge-token');
     this.token=fs.existsSync(tokenFile)?fs.readFileSync(tokenFile,'utf8').trim():randomBytes(32).toString('hex');
@@ -172,12 +148,11 @@ class WebBridge {
         // A lost HTTP acknowledgement must not turn a retry into task failure.
         if(p.assets.has(index)) {
           const type=p.assets.get(index);
-          if(!fs.readFileSync(path.join(p.job.dir,`result-${index}.${type.ext}`)).equals(bytes))
+          if(!fs.readFileSync(replyAssetPath(p.job.dir,index,type.mime)).equals(bytes))
             throw error('image_invalid','同一回复图片的重试内容发生变化');
           return send(200,{ok:true,index});
         }
-        const type=assetType(bytes);
-        saveAsset(bytes,path.join(p.job.dir,`result-${index}.${type.ext}`));
+        const type=saveAsset(bytes,p.job.dir,index);
         p.assets.set(index,{mime:type.mime,ext:type.ext});
         return send(200,{ok:true,index});
       }
@@ -238,9 +213,9 @@ class WebBridge {
   }
   async run(job,options={}) {
     const previous=this.tail;
-    let release;this.tail=new Promise(resolve=>{release=resolve;});this.queued++;
+    let release;this.tail=new Promise(resolve=>{release=resolve;});
     try {await previous;if(this.closed)throw error('interrupted','网页连接器已关闭');return await this.runActive(job,options);}
-    finally {this.queued--;release();}
+    finally {release();}
   }
   async runActive(job,{threadId,onThread=()=>{},onProgress=()=>{},signal,timeoutMs=this.timeoutMs}={}) {
     try {await this.ready;}catch {throw error('bridge_unavailable','ChatGPT 网页连接器无法监听本机端口，请检查 5141 端口');}
@@ -251,11 +226,13 @@ class WebBridge {
     if(Date.now()-this.lastSeen>90000)throw error('browser_offline','ChatGPT 网页连接器未在线。请打开 Chrome 并启用扩展，等待连接后重试');
     if(job.reasoningEffort&&!this.reasoningSupported)throw error('browser_upgrade','切换推理程度需要重新加载新版 Chrome 扩展；本次未提交网页');
     if(threadId)bindThread({onThread},threadId);
+    if(this.closed)throw error('interrupted','网页连接器已关闭，任务未提交');
+    if(signal?.aborted)throw error('cancelled','任务已取消');
     const report=onProgress;
     onProgress=phase=>{try{report(phase);}catch{}};
     return new Promise((resolve,reject)=>{
       let done=false,timer,grace;
-      const cancel=reason=>{if(p.cancelled)return;p.cancelled=reason;onProgress('正在请求网页停止生成');grace=setTimeout(()=>p.finish(reason),15000);};
+      const cancel=reason=>{if(done||p.cancelled)return;p.cancelled=reason;grace=setTimeout(()=>p.finish(reason),15000);onProgress('正在请求网页停止生成');};
       const abort=()=>cancel(error('cancelled','任务已取消；网页生成是否停止取决于浏览器连接状态'));
       const p={job,threadId,onThread,onProgress,assets:new Map(),finish:(err,segments)=>{
         if(done)return;done=true;clearTimeout(timer);clearTimeout(grace);signal?.removeEventListener('abort',abort);
@@ -265,11 +242,13 @@ class WebBridge {
           reject(err);
         }else resolve(segments);
       }};
-      this.pending=p;onProgress('等待 ChatGPT 网页接收任务');
+      this.pending=p;
       signal?.addEventListener('abort',abort,{once:true});
       timer=setTimeout(()=>cancel(error('execution_stopped','ChatGPT 网页处理超时，请稍后重试')),timeoutMs);
+      if(signal?.aborted)abort();
+      else onProgress('等待 ChatGPT 网页接收任务');
     });
   }
   close(){this.closed=true;this.pending?.finish(error('interrupted','网页连接器已关闭，任务未自动重试'));this.server.close();}
 }
-module.exports={WebBridge,saveAsset,webFailure,validThread,PROTOCOL_VERSION};
+module.exports={WebBridge,webFailure,validThread,PROTOCOL_VERSION};

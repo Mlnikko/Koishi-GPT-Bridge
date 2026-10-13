@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { writeText } = require('../lib/state.cjs');
+const { writeAtomic } = require('../lib/state.cjs');
 
 const MAX_PRESET_CHARS = 8000;
 const OWNER_PREFIX = '<!-- koishi-preset ';
@@ -112,7 +112,7 @@ class Presets {
   }
   edit(name, prompt, owner) {
     const preset = this.requireCreator(name, owner);
-    writeText(path.join(this.dir, preset.name + '.md'), this.document(prompt, preset.owner));
+    writeAtomic(path.join(this.dir, preset.name + '.md'), this.document(prompt, preset.owner));
     return this.read(preset.name);
   }
   delete(name, owner) {

@@ -7,18 +7,18 @@
 ```
 index.cjs            插件入口，可用全部
    │
-   ├── bridge/       传输层：网页、本机模型
+   ├── bridge/       传输层：网页、本机模型、QQ 回传
    │      │
    ├── core/         领域层：消息片段、会话、队列
    │      │
-   └── lib/          通用工具层：不依赖项目内任何模块
+   └── lib/          通用工具层：不依赖其他分层
 ```
 
 | 分层 | 允许依赖 | 模块 |
 | --- | --- | --- |
-| `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`feedback.cjs`、`state.cjs` |
-| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`preferences.cjs`、`presets.cjs`、`queue.cjs` |
-| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`lmstudio-bridge.cjs` |
+| `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`reply-assets.cjs`、`feedback.cjs`、`state.cjs` |
+| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`reasoning.cjs`、`preferences.cjs`、`presets.cjs`、`queue.cjs` |
+| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`lmstudio-bridge.cjs`、`qq-delivery.cjs` |
 | `src/index.cjs` | 全部 | 入口 |
 
 `test/architecture.test.cjs` 会把这张表变成可执行约束，检查四件事：
@@ -35,19 +35,22 @@ index.cjs            插件入口，可用全部
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.cjs` | Koishi 插件入口。校验配置、装配各模块、注册管理命令与**兜底转发中间件**、把回复发回 QQ。 |
+| `src/index.cjs` | Koishi 插件入口。校验配置、装配各模块、注册管理命令与**兜底转发中间件**，将任务回传交给 QQ 传输模块。 |
 | `src/lib/image.cjs` | 参考图安全下载（协议白名单、SSRF 防护、体积与超时限制、文件头嗅探）与 PNG 文件头解析。 |
 | `src/lib/reply.cjs` | 回复片段校验、Markdown 围栏还原、按段落拆分、总量截断。**纯函数。** |
 | `src/lib/feedback.cjs` | 面向用户的文案、失败分类、本机路径与凭据脱敏、模型文本转义。 |
-| `src/lib/state.cjs` | 原子发布 JSON 状态及 Markdown 文本；失败保留原记录并清理暂存文件。 |
+| `src/lib/state.cjs` | 原子发布 JSON、文本及二进制文件；失败保留原记录并清理唯一暂存文件。 |
+| `src/lib/reply-assets.cjs` | 共用回复媒体类型、文件名、字节校验、落盘及重启恢复；支持 PNG/GIF/JPEG/WebP。 |
 | `src/core/config.cjs` | 集中归一化配置并校验用户名单、布尔项、端口、计时器和各输入/输出限制；校验完成后才装配服务。 |
 | `src/core/message.cjs` | QQ 消息元素 → 有序片段（文本/图片），剥掉开头的 @ 机器人。**纯函数。** |
+| `src/core/reasoning.cjs` | 推理程度名称、别名与取值校验，供配置及命令共用。 |
 | `src/core/conversations.cjs` | 会话的持久化（名称、归属用户、选中状态、网页编号、本地模型与预设名称）；原子保存选择，`/new` 显式继承本地配置。 |
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
 | `src/core/presets.cjs` | 公共 UTF-8 Markdown 预设发现、创建、编辑与删除；单文件保存创建者和正文，编辑/删除验证创建者，剥离文件头并校验模型任务快照。 |
-| `src/core/queue.cjs` | 任务队列的持久化与串行执行；参考图从暂存目录移入任务目录；终态任务的保留期清理。 |
+| `src/core/queue.cjs` | 任务持久化、查询索引、串行生成与终态恢复；参考图移入任务目录；保留期清理。结果落盘后释放生成槽。 |
 | `src/bridge/web-bridge.cjs` | 本机 HTTP 桥接服务（默认 127.0.0.1:5141）。管理当前网页任务、令牌校验、进度与结果回传、参考图字节按需下发、回复图片二进制上传。 |
 | `src/bridge/lmstudio-bridge.cjs` | 本地模型 HTTP 请求、独立文字/图片历史及结果保存；在历史前注入任务的预设快照，并为系统提示词预留字数预算。 |
+| `src/bridge/qq-delivery.cjs` | QQ 发送确认期限、媒体编码、发送游标、重发及按聊天串行的成功回复流；持久化和状态文案由入口注入。 |
 
 ## 数据模型
 
@@ -71,7 +74,7 @@ index.cjs            插件入口，可用全部
 ```js
 { type: 'text',  text }                    // Markdown 结构以纯文本保留
 { type: 'code',  language, text }          // 单独成段
-{ type: 'image', asset, mime }             // 指向任务目录 result-<asset>.png
+{ type: 'image', asset, mime }             // 指向 result-<asset>.<ext>，扩展名由 MIME 确定
 ```
 
 片段顺序即阅读顺序。`lib/reply.cjs` 把连续的文本与代码合并成一个文本批次（代码加围栏），
@@ -85,7 +88,7 @@ index.cjs            插件入口，可用全部
 | `data/presets/<名称>.md` | 实例共享预设正文，QQ 创建的文件首行注释保存创建者；按消息读取最新正文，创建者信息不进入模型任务快照，Git 忽略。 |
 | `data/jobs/<id>/job.json` | 任务状态、入站片段、网页编号及本地任务的 `preset: { name, prompt, revision }` 快照（`version: 2`）。 |
 | `data/jobs/<id>/input-<序号>.<扩展名>` | 该任务下载的参考图片。 |
-| `data/jobs/<id>/result-<序号>.png` | 回复中的第 n 张图片。 |
+| `data/jobs/<id>/result-<序号>.<扩展名>` | 回复中的第 n 张图片，扩展名为 png/gif/jpg/webp。 |
 | `data/jobs/<id>/reply.md` | 完整回复文本（含代码围栏），供重发与排查。 |
 | `data/jobs/<id>/failure.json` | 失败详情（仅在失败时产生）。 |
 | `data/jobs/<id>/dom-probe.json` | 读不到回复时的页面结构快照（仅在失败时产生）。 |
@@ -113,7 +116,7 @@ QQ 消息（私聊；群聊需 @ 机器人）
   → 扩展读回回复：DOM → 有序片段
   → 回复中的图片经 POST /result-asset 以原始字节上传
   → POST /result 提交片段，桥接校验后落盘并置 ready
-  → index.cjs 按片段顺序发回 QQ；超出消息窗口时改为 /retry
+  → qq-delivery.cjs 按片段顺序发回 QQ；超出消息窗口时改为 /retry
 ```
 
 参考图上传是**闭环**的：45 秒内无法确认附件就明确失败，绝不退化成纯文字请求，
@@ -137,6 +140,12 @@ scope.middleware((session, next) => next(() => forward(session)));
 仅当请求 Pro 且实际滑块已到最高档仍没有 Pro 时，使用该最高档并持久化降级记录；
 菜单关闭后重新读回档位和最高档边界，确认后才上传或提交。会话请求不变，下一条任务重新检查 Pro 是否恢复。
 提交证据同时保存请求档位、实际档位与降级原因。
+
+生成与 QQ 回传使用不同的生命周期：队列先原子保存终态结果，再释放生成槽；回传期间下一条任务可以开始生成。
+`bridge/qq-delivery.cjs` 按聊天串行发送成功回复，维护任务发送锁、确认超时和游标，通过回调请求队列持久化。
+进度和失败提示仍即时发送，不纳入成功回复流的排序。
+队列使用任务编号、平台消息和最近任务索引，待处理集合只含排队/运行任务；清理历史后重建索引。
+`lib/reply-assets.cjs` 统一媒体类型、文件名、上传与重启恢复，JSON、文本和媒体共用 `lib/state.cjs` 的原子写入。
 
 ## 授权与群聊
 

@@ -151,6 +151,14 @@ async function downloadImage(source, dir, options = {}) {
     lookup = dns.promises.lookup, fetchImpl, allowPrivate = false } = options;
   const value = String(source || '').trim();
   if (!value) throw imageError('image_invalid', '消息中没有可用的图片地址');
+  // DNS, redirects, connection and body share one budget. Resetting it for
+  // every hop can consume the QQ reply window before a job even enters the queue.
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => {
+    const ms = deadline - Date.now();
+    if (ms <= 0) throw imageError('image_download', '图片下载超时，请稍后重试');
+    return ms;
+  };
   let bytes;
   // Reject oversized inline payloads before allocating their decoded buffer.
   if (/^(?:data:[^,]*;base64,|base64:\/\/)/i.test(value) && value.length > maxBytes * 4 / 3 + 1024)
@@ -162,11 +170,13 @@ async function downloadImage(source, dir, options = {}) {
     try { url = new URL(value); } catch { throw imageError('image_invalid', '图片地址无效，未下载'); }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw imageError('image_invalid', '出于安全考虑，仅支持下载 http(s) 图片');
     for (let hop = 0; ; hop++) {
-      const addresses = await assertPublicHost(url, { lookup, allowPrivate, timeoutMs });
+      const addresses = await assertPublicHost(url, { lookup, allowPrivate, timeoutMs: remaining() });
       let response;
-      try { response = fetchImpl
-        ? await fetchImpl(url.href, { redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) })
-        : await pinnedFetch(url, { addresses, signal: AbortSignal.timeout(timeoutMs) }); }
+      try {
+        const signal = AbortSignal.timeout(remaining());
+        response = fetchImpl ? await fetchImpl(url.href, { redirect: 'manual', signal })
+          : await pinnedFetch(url, { addresses, signal });
+      }
       catch { throw imageError('image_download', '图片下载失败，请稍后重试'); }
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         response.body?.destroy?.();
@@ -178,7 +188,11 @@ async function downloadImage(source, dir, options = {}) {
         continue;
       }
       if (!response.ok) { response.body?.destroy?.(); throw imageError('image_download', `图片下载失败（HTTP ${response.status}）`); }
-      bytes = await readCapped(response, maxBytes);
+      try { bytes = await readCapped(response, maxBytes); remaining(); }
+      catch (err) {
+        if (err.code?.startsWith('image_')) throw err;
+        throw imageError('image_download', Date.now() >= deadline ? '图片下载超时，请稍后重试' : '图片下载失败，请稍后重试');
+      }
       break;
     }
   }

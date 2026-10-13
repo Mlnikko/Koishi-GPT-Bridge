@@ -677,6 +677,20 @@ test('partial QQ delivery resumes at the first unconfirmed segment across repeat
  assert.deepEqual(replay.sent,['a'.repeat(20),'b'.repeat(20),'c'.repeat(20)]);
 });
 
+test('disposing the plugin stops after the in-flight QQ segment and retains the replay cursor',async()=>{
+ const app=apply({notifyProgress:false,maxTextChars:20});
+ const {port,token}=await bridgeOf(app.root),headers={'x-bridge-token':token,'Content-Type':'application/json'};
+ await fetch(`http://127.0.0.1:${port}/state`,{headers});
+ const s=session({elements:[{type:'text',attrs:{content:'hello'}}]});
+ s.send=async content=>{s.sent.push(content);if(s.sent.length===1)for(const dispose of app.disposes)dispose();return ['ok'];};
+ await dispatch(app,s);const [job]=jobFiles(app.root);
+ await fetch(`http://127.0.0.1:${port}/result`,{method:'POST',headers,
+  body:JSON.stringify({id:job.id,threadId:THREAD,segments:[{type:'text',text:'a'.repeat(20)+'b'.repeat(20)+'c'.repeat(20)}]})});
+ await settle(app.root);await wait();
+ assert.deepEqual(s.sent,['a'.repeat(20)]);
+ const [done]=jobFiles(app.root);assert.equal(done.deliveryCursor,1);assert.equal(done.delivery,'failed');
+});
+
 test('a stuck QQ acknowledgement times out and the job still reaches the browser', async()=>{
  const app=apply({sendTimeoutMs:15});
  const {port,token}=await bridgeOf(app.root);

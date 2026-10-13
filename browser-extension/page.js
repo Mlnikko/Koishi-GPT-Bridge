@@ -233,6 +233,7 @@ const replyImages=()=>[...new Set(replyRoots.flatMap(root=>Array.from(root.query
 // Generated files can be anchors, or the new renderer's span[role=link]
 // without an href. Only raster files inside this reply are eligible.
 const referencedFiles=new Set();
+const rasterName=value=>(String(value||'').match(/[^\s/\\<>:"?*|]+\.(?:gif|png|jpe?g|webp)\b/i)||[])[0];
 const fileInfo=(node,allowHistory=false)=>{
  const historical=allowHistory===true,referenced=referencedFiles.has(node);
  if(!node||!visible(node)||insideUser(node))return null;
@@ -245,7 +246,7 @@ const fileInfo=(node,allowHistory=false)=>{
  if(tag==='BUTTON'&&!/预览|preview/i.test(label))return null;
  const href=String(node.getAttribute?.('href')||'');
  const text=String(node.getAttribute?.('download')||node.textContent||label).trim();
- const name=(text.match(/[^\s/\\<>:"?*|]+\.(?:gif|png|jpe?g|webp)\b/i)||label.match(/[^\s/\\<>:"?*|]+\.(?:gif|png|jpe?g|webp)\b/i)||[])[0];
+ const name=rasterName(text)||rasterName(label);
  let url;
  try{url=new URL(href,location.href);}catch{}
  const rasterPath=url&&/\.(gif|png|jpe?g|webp)$/i.test(url.pathname);
@@ -255,7 +256,19 @@ const fileInfo=(node,allowHistory=false)=>{
  // to local services or handing a remote page the user's ChatGPT credentials.
  if(href&&!generated)return null;
  if(!name&&!rasterPath)return null;
- const filename=name||decodeURIComponent(url.pathname.split('/').at(-1));
+ let filename=name||decodeURIComponent(url.pathname.split('/').at(-1));
+ // A prose link can say 下载file.gif without a space. Resolve that UI prefix
+ // only against a unique preview in the same assistant turn; a real filename
+ // beginning with 下载/Download keeps its exact preview match.
+ if(tag!=='BUTTON'&&!node.getAttribute?.('download')&&!rasterPath){
+  const names=Array.from(turn(node)?.querySelectorAll?.('button')||[])
+   .filter(button=>visible(button)&&!insideUser(button)&&/预览|preview/i.test(button.getAttribute('aria-label')||''))
+   .map(button=>rasterName(button.getAttribute('download')||button.textContent||button.getAttribute('aria-label')));
+  if(!names.includes(filename)){
+   const candidate=filename.replace(/^(?:下载|Download)\s*/i,'');
+   if(candidate!==filename&&names.filter(name=>name===candidate).length===1)filename=candidate;
+  }
+ }
  return {name:filename,href,key:(messageId(node)||assistantId||'')+'/'+filename};
 };
 // The live resource row has a transparent preview button and separate filename,

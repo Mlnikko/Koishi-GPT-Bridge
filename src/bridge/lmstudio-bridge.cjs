@@ -2,7 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
-const { writeJson } = require('../lib/state.cjs');
+const { writeJson, writeAtomic } = require('../lib/state.cjs');
 const { submissionText } = require('../core/message.cjs');
 const { validatePresetSnapshot } = require('../core/presets.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
@@ -41,12 +41,12 @@ class LMStudioBridge {
         if (size > 1024 * 1024) throw fail('lmstudio_reply_large', 'LM Studio 返回内容过大');
         chunks.push(chunk);
       }
+      if (response.status === 401 || response.status === 403)
+        throw fail('lmstudio_auth', 'LM Studio 需要认证，请配置 lmStudioApiKey');
       let value;
       try { value = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
       catch { throw fail('lmstudio_protocol', 'LM Studio 未返回有效 JSON，请检查服务地址'); }
       if (!response.ok) {
-        if (response.status === 401 || response.status === 403)
-          throw fail('lmstudio_auth', 'LM Studio 需要认证，请配置 lmStudioApiKey');
         const message = typeof value.error?.message === 'string' ? value.error.message.slice(0, 400) : '';
         throw fail('lmstudio_http', `LM Studio 请求失败（HTTP ${response.status}）${message ? '：' + message : ''}`);
       }
@@ -139,12 +139,19 @@ class LMStudioBridge {
       throw fail('lmstudio_image', '本次图片超过本地会话图片上限，请减少图片或调整本地历史配置');
     return { input, pending, ...stats };
   }
-  content(turn, history, pending = new Map()) {
+  content(turn, history, pending = new Map(), encoded = new Map()) {
     if (!turn.input?.some(s => s.type === 'image')) return turn.user;
     return turn.input.map(s => {
       if (s.type === 'text') return { type: 'text', text: s.text };
-      const bytes = pending.get(s.asset) || this.readImage(path.join(history.assets, s.asset), s).bytes;
-      return { type: 'image_url', image_url: { url: `data:${s.mime};base64,${bytes.toString('base64')}` } };
+      let cached = encoded.get(s.asset);
+      if (cached && (cached.mime !== s.mime || cached.size !== s.size))
+        throw fail('lmstudio_image', '会话图片校验失败，请重新发送原图或用 /new 开启新话题');
+      if (!cached) {
+        const bytes = pending.get(s.asset) || this.readImage(path.join(history.assets, s.asset), s).bytes;
+        cached = { mime: s.mime, size: s.size, url: `data:${s.mime};base64,${bytes.toString('base64')}` };
+        encoded.set(s.asset, cached);
+      }
+      return { type: 'image_url', image_url: { url: cached.url } };
     });
   }
   saveHistory(history, retained, pending) {
@@ -155,8 +162,7 @@ class LMStudioBridge {
       const file = path.join(history.assets, asset);
       // Each complete content-addressed file is published before the JSON
       // references it. Cancelled/failed inference never gets this far.
-      fs.writeFileSync(file + '.tmp', bytes, { mode: 0o600 });
-      fs.renameSync(file + '.tmp', file);
+      writeAtomic(file, bytes);
     }
     writeJson(history.file, { version: 1, identity: history.identity, turns: retained });
     // Only remove assets after the replacement history has committed. A crash
@@ -186,9 +192,12 @@ class LMStudioBridge {
       const turns = this.trim(history.turns, { chars: promptChars + text.length, images: prepared.images, bytes: prepared.bytes });
       if (prepared.images || turns.some(t => imageStats(t.input).images))
         await this.ensureVision(job.model, { signal, timeoutMs: Math.min(5000, timeoutMs) });
-      const messages = turns.flatMap(t => [{ role: 'user', content: this.content(t, history) }, { role: 'assistant', content: t.assistant }]);
+      // Reuse verified bytes/encoding only within this request. Later messages
+      // must still detect a changed or missing historical image on disk.
+      const encoded = new Map();
+      const messages = turns.flatMap(t => [{ role: 'user', content: this.content(t, history, undefined, encoded) }, { role: 'assistant', content: t.assistant }]);
       if (preset) messages.unshift({ role: 'system', content: preset.prompt });
-      messages.push({ role: 'user', content: this.content({ user: text, input: prepared.input }, history, prepared.pending) });
+      messages.push({ role: 'user', content: this.content({ user: text, input: prepared.input }, history, prepared.pending, encoded) });
       onProgress(`本地模型 ${job.model} 正在生成回复`);
       const remaining = timeoutMs - (Date.now() - started);
       if (remaining <= 0) throw fail('execution_stopped', 'LM Studio 图片准备超时，本任务未自动重发');
@@ -208,7 +217,7 @@ class LMStudioBridge {
     }
     const output = validateSegments([{ type: 'text', text: turn.assistant
       + (turn.truncated ? '\n\n（本地模型回复达到生成上限；可继续提问或调整 lmStudioMaxTokens。）' : '') }]);
-    fs.writeFileSync(path.join(job.dir, 'reply.md'), replyText(output), { mode: 0o600 });
+    writeAtomic(path.join(job.dir, 'reply.md'), replyText(output));
     writeJson(path.join(job.dir, 'result.json'), { id: job.id, segments: output });
     return output;
   }

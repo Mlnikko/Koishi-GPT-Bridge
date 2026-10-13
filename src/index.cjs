@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { WebBridge } = require('./bridge/web-bridge.cjs');
 const { LMStudioBridge } = require('./bridge/lmstudio-bridge.cjs');
+const { QQDelivery, isFresh } = require('./bridge/qq-delivery.cjs');
 const { Conversations } = require('./core/conversations.cjs');
 const { Preferences } = require('./core/preferences.cjs');
 const { Presets } = require('./core/presets.cjs');
@@ -11,7 +12,7 @@ const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('./core/
 const { JobQueue } = require('./core/queue.cjs');
 const { normalizeConfig } = require('./core/config.cjs');
 const { toSegments, sessionSegments, submissionText, imagesOf } = require('./core/message.cjs');
-const { toMessages, splitText } = require('./lib/reply.cjs');
+const { splitText } = require('./lib/reply.cjs');
 const { textMessage, safeReason } = require('./lib/feedback.cjs');
 const { downloadImage } = require('./lib/image.cjs');
 const { version } = require('../package.json');
@@ -25,7 +26,7 @@ exports.apply = (ctx, config) => {
   const { dataDir: root, maxTextChars, maxReplyChars, maxInputImages,
     sendTimeoutMs, mediaSendTimeoutMs, maxInputBytes, replyTimeoutMs } = config;
   // The web backend remains the default; neither backend spawns a local CLI.
-  const sessions = new Map(), locks = new Set();
+  const sessions = new Map();
   const chats = new Conversations(path.join(root, 'conversations.json'));
   const presets = new Presets(path.join(root, 'presets'));
   const preferences = new Preferences(path.join(root, 'preferences.json'), config.notifyProgress !== false);
@@ -36,7 +37,7 @@ exports.apply = (ctx, config) => {
     historyChars: config.lmStudioHistoryChars, historyImages: config.lmStudioHistoryImages,
     historyImageBytes: config.lmStudioHistoryImageBytes, maxImageBytes: maxInputBytes, timeoutMs: replyTimeoutMs });
   const backendLabel = backend => backend === 'lmstudio' ? 'LM Studio' : 'ChatGPT 网页';
-  const busy = id => q.jobs.some(j => j.sessionId === id && ['queued', 'running'].includes(j.status));
+  const busy = id => q.busy(id);
   const labels = { queued: '排队中', running: 'ChatGPT 网页处理中', ready: '回复已取回', failed: '处理失败', cancelled: '已取消', interrupted: '服务重启，状态待确认' };
   const q = new JobQueue(path.join(root, 'jobs'), (j, signal, onThread) => {
     const chat = j.sessionId && chats.get(j.sessionId, j.owner, j.conversation);
@@ -83,17 +84,8 @@ exports.apply = (ctx, config) => {
       q.save(j);
     }
   }, { maxImages: maxInputImages, maxChars: maxTextChars });
-  const fresh = s => Date.now() - s.timestamp < 298000;
-  const send = async (s, content, timeoutMs = sendTimeoutMs) => {
-    let timer;
-    try {
-      const ids = await Promise.race([
-        Promise.resolve().then(() => s.send(content)),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('QQ 发送确认超时，送达状态不确定')), timeoutMs); }),
-      ]);
-      if (!ids?.length) throw new Error('QQ 未确认发送成功');
-    } finally { clearTimeout(timer); }
-  };
+  const fresh = isFresh;
+  const send = (...args) => delivery.send(...args);
   const allowedUsers = new Set(config.allowedUsers);
   // Group access is opt-in and, once enabled, open to every member of the group.
   // Koishi already refuses to route a guild message at all unless the bot was
@@ -119,38 +111,9 @@ exports.apply = (ctx, config) => {
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
     + (j.deliveryError ? `\n发送详情：${textMessage(j.deliveryError)}` : '')
     + (j.error ? `\n${textMessage(j.error)}` : '');
-  // 回复按片段顺序发出：文本批次与图片交替，图片在回复里的位置不会丢。
-  async function deliver(j, s) {
-    if (locks.has(j.id)) return '正在发送，请稍候';
-    if (j.status !== 'ready') return status(j);
-    locks.add(j.id);
-    try {
-      // Freeze the plan so a config change or restart cannot shift the cursor.
-      const messages = j.deliveryPlan || toMessages(j.output || [], { maxChars: maxTextChars, maxTotal: maxReplyChars }).messages;
-      if (!messages.length) throw new Error('回复内容为空');
-      if (j.delivery === 'sent') j.deliveryCursor = 0;
-      j.deliveryPlan = messages; j.delivery = 'sending'; q.save(j);
-      for (let index = j.deliveryCursor || 0; index < messages.length; index++) {
-        if (!fresh(s)) throw Error('QQ 回复窗口已过期，请用「/retry」取回回复');
-        const item = messages[index];
-        // Image bytes are uploaded by the QQ adapter; local paths never leave the machine.
-        if (item.type === 'image') {
-          const mime = item.mime || 'image/png';
-          const ext = { 'image/png': 'png', 'image/gif': 'gif', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime];
-          if (!ext || !Number.isInteger(item.asset) || item.asset < 0) throw Error('回复图片格式或序号无效');
-          const bytes = fs.readFileSync(path.join(j.dir, `result-${item.asset}.${ext}`));
-          await send(s, `<img src="data:${mime};base64,${bytes.toString('base64')}"/>`, mediaSendTimeoutMs);
-        } else {
-          await send(s, textMessage(item.text));
-        }
-        j.deliveryCursor = index + 1; q.save(j);
-      }
-      j.delivery = 'sent'; j.deliveredAt = Date.now(); delete j.deliveryError; q.save(j);
-    } catch (err) {
-      j.delivery = 'failed'; j.deliveryError = safeReason(err.message).slice(0, 300); q.save(j);
-      return `任务 ${j.id} 的回复已取回，但 QQ 发送失败：${textMessage(j.deliveryError)}\n已确认 ${j.deliveryCursor || 0} 段；可发送「/retry ${j.id}」继续，未确认的一段可能重复。`;
-    } finally { locks.delete(j.id); }
-  }
+  const delivery = new QQDelivery({ save: job => q.save(job), status, maxChars: maxTextChars,
+    maxTotal: maxReplyChars, sendTimeoutMs, mediaSendTimeoutMs });
+  const deliver = (job, session) => delivery.deliver(job, session);
   // 普通消息按原顺序转发；引用回复先附上有明确边界的引用内容，图片依次作为附件。
   async function forward(session) {
     let segments;
@@ -167,7 +130,7 @@ exports.apply = (ctx, config) => {
     let chat;
     try { chat = chats.ensure(session.userId, conversation(session)); }
     catch (err) { return textMessage(safeReason(err.message)); }
-    const duplicate = session.messageId && q.jobs.find(j => j.owner === session.userId && j.conversation === conversation(session) && j.messageId === session.messageId);
+    const duplicate = q.duplicate(session.userId, conversation(session), session.messageId);
     if (duplicate) return notifications(session) ? status(duplicate) : undefined;
     if (busy(chat.id)) return '当前会话仍在处理上一条消息，请等待完成，或发送「/stop」停止后再试。';
     let staging;
@@ -405,5 +368,5 @@ exports.apply = (ctx, config) => {
     j.progressNotified = true;
     await send(s, `任务 ${j.id} 仍在 ${backendLabel(j.backend)}处理中，已等待 ${Math.floor((Date.now()-j.startedAt)/1000)} 秒。\n/status 查看进度，/retry 取回回复。`).catch(() => {});
   }, 10000);
-  ctx.on('dispose', () => { q.close(); web?.close(); });
+  ctx.on('dispose', () => { delivery.close(); q.close(); web.close(); });
 };

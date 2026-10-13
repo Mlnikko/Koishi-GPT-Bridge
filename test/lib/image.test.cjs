@@ -23,6 +23,16 @@ const body = (bytes, headers = {}) => ({ ok: true, status: 200,
   arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
 const redirect = location => ({ ok: false, status: 302, headers: { get: key => key.toLowerCase() === 'location' ? location : null } });
 
+test('redirects and response reads share the original download deadline',async t=>{
+ let now=1000,calls=0;t.mock.method(Date,'now',()=>now);
+ const dir=temp();
+ await assert.rejects(downloadImage('https://example.com/start.png',dir,{
+  timeoutMs:30,lookup:async()=>[{address:'8.8.8.8'}],
+  fetchImpl:async()=>{now+=20;return ++calls===1?redirect('/next.png'):body(png());},
+ }),err=>err.code==='image_download'&&/超时/.test(err.message));
+ assert.equal(calls,2);assert.deepEqual(fs.readdirSync(dir),[]);
+});
+
 test('png header is parsed in pure JavaScript so no host image tool is required', () => {
   assert.deepEqual(pngSize(png(1254, 900)), { width: 1254, height: 900 });
   assert.throws(() => pngSize(Buffer.from('not a png, definitely not')), /PNG/);

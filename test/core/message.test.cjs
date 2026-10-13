@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { toSegments, submissionText, imagesOf, textOf, textLength, isEmpty } = require('../../src/core/message.cjs');
+const { toSegments, submissionText, imagesOf, isEmpty } = require('../../src/core/message.cjs');
 
 const text = value => ({ type: 'text', attrs: { content: value } });
 const img = source => ({ type: 'img', attrs: { src: source } });
@@ -17,7 +17,6 @@ test('text and images keep their original order', () => {
   ]);
   assert.equal(submissionText(segments), '看看这张\n和这张\n哪张更好');
   assert.deepEqual(imagesOf(segments).map(segment => segment.source), ['http://a/1.png', 'http://a/2.png']);
-  assert.equal(textLength(segments), '看看这张和这张哪张更好'.length);
 });
 
 test('the leading bot mention is dropped so no QQ openid reaches the web page', () => {
@@ -75,7 +74,7 @@ test('an empty or unusable message produces no segments', () => {
   assert.deepEqual(toSegments([at('bot')]), []);
   assert.deepEqual(toSegments([img('')]), []);
   assert.equal(isEmpty(toSegments([text('  ')])), true);
-  assert.equal(textOf([]), '');
+  assert.equal(submissionText([]), '');
 });
 
 const { sessionSegments } = require('../../src/core/message.cjs');

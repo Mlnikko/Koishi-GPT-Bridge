@@ -1,10 +1,27 @@
 const { test }=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
-const {WebBridge,webFailure,saveAsset,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
+const {WebBridge,webFailure,PROTOCOL_VERSION}=require('../../src/bridge/web-bridge.cjs');
+const {saveAsset}=require('../../src/lib/reply-assets.cjs');
 const {animatedGif}=require('../helpers/media.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
 const id='11111111-2222-3333-4444-555555555555';
+test('cancellation inside the initial progress callback is registered before notification',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');const controller=new AbortController();
+ const result=b.run(job,{signal:controller.signal,onProgress:()=>controller.abort()}).catch(e=>e);
+ await new Promise(setImmediate);
+ const wasCancelled=!!b.pending?.cancelled;
+ await call('/failure',{id:job.id,message:'结束验收'});
+ assert.equal(wasCancelled,true);assert.equal((await result).code,'cancelled');
+});
+
+test('closing inside the thread callback cannot create a task on the closed connector',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ const result=b.run(job,{threadId:id,onThread:()=>b.close()}).catch(e=>e);
+ await new Promise(setImmediate);const late=b.pending;
+ if(late)late.finish(Object.assign(Error('cleanup'),{code:'test_cleanup'}));
+ assert.equal((await result).code,'interrupted');assert.equal(late,null);
+});
 test('explicit reasoning requires a capable extension and is advertised in the task', async t=>{
  const {b,job,call}=await setup(t);
  job.reasoningEffort='high';
@@ -247,7 +264,7 @@ test('GIF upload retries cannot replace the original animation with a different 
 test('truncated GIF and HTML error pages are refused without saving an asset',()=>{
  const dir=temp(),destination=path.join(dir,'result-0.gif');
  for(const bytes of [animatedGif().subarray(0,-1),Buffer.from('<html>'+ 'not a gif'.repeat(10)+'</html>')])
-  assert.throws(()=>saveAsset(bytes,destination),err=>err.code==='image_invalid');
+  assert.throws(()=>saveAsset(bytes,dir,0),err=>err.code==='image_invalid');
  assert.equal(fs.existsSync(destination),false);
 });
 test('a reply that references an image the page never uploaded is refused whole',async t=>{
@@ -278,9 +295,9 @@ test('unknown or empty reply segments are refused',async t=>{
 });
 test('reply images are validated from their PNG header without external tools',()=>{
  const dir=temp(),destination=path.join(dir,'result-0.png');
- assert.throws(()=>saveAsset(Buffer.from('not an image at all, definitely not a png'),destination),err=>err.code==='image_invalid');
- assert.throws(()=>saveAsset(png(8,8).subarray(0,20),destination),err=>err.code==='image_invalid');
- assert.equal(saveAsset(png(1254,1254),destination),destination);
+ assert.throws(()=>saveAsset(Buffer.from('not an image at all, definitely not a png'),dir,0),err=>err.code==='image_invalid');
+ assert.throws(()=>saveAsset(png(8,8).subarray(0,20),dir,0),err=>err.code==='image_invalid');
+ assert.deepEqual(saveAsset(png(1254,1254),dir,0),{mime:'image/png',ext:'png'});
  assert.equal(fs.existsSync(destination),true);
  if(process.platform!=='win32')assert.equal(fs.statSync(destination).mode & 0o777,0o600);
 });

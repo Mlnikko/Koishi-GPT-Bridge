@@ -86,8 +86,13 @@ test('cancellation and timeout leave no successful history or receipt and never 
   await assert.rejects(running, err => err.code === 'cancelled');
   assert.equal(fs.existsSync(bridge.historyFile(first).file), false);
   assert.equal(fs.existsSync(path.join(first.dir, 'result.json')), false);
-  await assert.rejects(bridge.run(job('bbbbbbbbbbbb'), { timeoutMs: 25 }), err => err.code === 'execution_stopped');
-  assert.equal(requests.length, 2);
+  const second = job('bbbbbbbbbbbb');
+  await assert.rejects(bridge.run(second, { timeoutMs: 25 }), err => err.code === 'execution_stopped');
+  // A short deadline can expire before the server receives the second request
+  // on a loaded CI host. Either outcome must remain a single attempt.
+  assert.ok(requests.length >= 1 && requests.length <= 2);
+  assert.equal(fs.existsSync(bridge.historyFile(second).file), false);
+  assert.equal(fs.existsSync(path.join(second.dir, 'result.json')), false);
 });
 
 test('HTTP/model failures and empty replies remain failures without committing context', async t => {
@@ -102,6 +107,27 @@ test('HTTP/model failures and empty replies remain failures without committing c
   mode = 'http'; await assert.rejects(bridge.run(first), /context window exceeded/);
   mode = 'empty'; await assert.rejects(bridge.run(first), /未返回可用/);
   assert.equal(fs.existsSync(bridge.historyFile(first).file), false);
+});
+
+test('non-JSON authentication responses still identify the actionable authentication failure',async t=>{
+ const {bridge,job}=await fixture(t,(_req,res)=>{res.statusCode=401;res.end('<html>authentication required</html>');});
+ await assert.rejects(bridge.run(job('html-auth')),err=>err.code==='lmstudio_auth');
+});
+
+test('repeated historical images are read and encoded once per request but revalidated on the next message',async t=>{
+ const {bridge,job,requests}=await fixture(t);
+ const first=imageJob(job,'cache-first',[{type:'image',file:'input-0.png'}]);await bridge.run(first);
+ await bridge.run(imageJob(job,'cache-second',[{type:'image',file:'input-0.png'}]));
+ const original=bridge.readImage.bind(bridge);
+ const read=t.mock.method(bridge,'readImage',(...args)=>original(...args));
+ await bridge.run(job('cache-followup'));
+ assert.equal(read.mock.calls.length,1);
+ const images=chats(requests).at(-1).body.messages.filter(m=>m.role==='user'&&Array.isArray(m.content));
+ assert.equal(images.length,2);assert.deepEqual(images[0].content,images[1].content);
+ const history=bridge.history(first),asset=history.turns[0].input[0].asset;
+ fs.writeFileSync(path.join(history.assets,asset),visionPng({width:64,height:40,variant:1}));
+ await assert.rejects(bridge.run(job('cache-tampered')),/校验失败/);
+ assert.equal(chats(requests).length,3);
 });
 
 test('length-limited responses disclose truncation and invalid image paths are never submitted', async t => {
