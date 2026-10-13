@@ -14,7 +14,7 @@ function fixture({ levels = ['instant', 'medium', 'high', 'xhigh', 'pro'], selec
   const thumb = el('span', { role: 'slider', 'aria-hidden': 'true', 'aria-valuemin': '0', 'aria-valuemax': String(levels.length - 1) });
   const control = el('div', { role: 'menuitem', 'data-reasoning-slider': 'true', 'aria-describedby': 'selected-level' }, [thumb]);
   const menu = el('div', { role: 'menu', 'aria-labelledby': 'model-trigger', hidden: '' }, [description, control]);
-  let index = levels.indexOf(selected), opened = 0, verifying = false;
+  let index = levels.indexOf(selected), opened = 0, verifying = false, fallback;
   const render = () => {
     description.childNodes = []; description.appendChild(`${labelNames[levels[index]]}，第 ${index + 1} 项，共 ${levels.length} 项。`);
     thumb.setAttribute('aria-valuenow', String(index));
@@ -42,8 +42,9 @@ function fixture({ levels = ['instant', 'medium', 'high', 'xhigh', 'pro'], selec
     KeyboardEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } } };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
   const step = async (target, extra = {}) => {
-    const result = await sandbox.pageStep('reasoning', { reasoningEffort: target, reasoningVerify: verifying, ...extra });
+    const result = await sandbox.pageStep('reasoning', { reasoningEffort: target, reasoningVerify: verifying, reasoningFallback: fallback, ...extra });
     verifying = !result.applied && (verifying || !!result.verify);
+    fallback = result.applied ? undefined : result.fallback || fallback;
     return result;
   };
   return { document, editor, trigger, menu, description, thumb, control, events, step, selected: () => levels[index], opened: () => opened };
@@ -71,11 +72,65 @@ test('all five levels can be selected in either direction and confirmed before c
   assert.ok(f.events.includes('ArrowLeft')); assert.ok(f.events.includes('ArrowRight'));
 });
 
-test('an unavailable level fails at the actual slider limit without guessing a numeric mapping', async () => {
+for (const highest of ['instant', 'medium', 'high', 'xhigh'])
+test('missing Pro uses the actual highest available level after closed-menu readback: ' + highest, async () => {
+  const levels = ['instant', 'medium', 'high', 'xhigh'].slice(0, ['instant', 'medium', 'high', 'xhigh'].indexOf(highest) + 1);
+  const f = fixture({ levels, selected: 'instant', labelNames: { ...labels, xhigh: '极高' } });
+  let result, verification;
+  for (let i = 0; i < 12; i++) {
+    result = await f.step('pro');
+    if (result.verify) { verification = result; assert.equal(f.trigger.getAttribute('aria-expanded'), 'false'); }
+    if (!result.pending) break;
+  }
+  assert.equal(verification.verify, true);
+  assert.equal(result.applied, true); assert.equal(result.level, highest); assert.equal(f.selected(), highest);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.fallback)), { requested: 'pro', level: highest, reason: 'pro-unavailable' });
+  assert.equal(f.opened(), 2); assert.equal(f.trigger.getAttribute('aria-expanded'), 'false');
+});
+
+test('a missing non-Pro level still fails at the actual slider limit', async () => {
   const f = fixture({ levels: ['instant', 'medium', 'high'], selected: 'medium' });
-  await f.step('pro'); await f.step('pro');
-  assert.match((await f.step('pro')).error, /不支持推理程度 pro/);
+  await f.step('xhigh'); await f.step('xhigh');
+  assert.match((await f.step('xhigh')).error, /不支持推理程度 xhigh/);
   assert.equal(f.selected(), 'high');
+});
+
+test('removing Pro does not prevent selecting the remaining four levels in either direction', async () => {
+  const f = fixture({ levels: ['instant', 'medium', 'high', 'xhigh'], selected: 'xhigh',
+    labelNames: { instant: '即时', medium: '中', high: '高', xhigh: '极高' } });
+  for (const level of ['instant', 'high', 'medium', 'xhigh']) {
+    let result;
+    for (let i = 0; i < 12; i++) { result = await f.step(level); if (!result.pending) break; }
+    assert.equal(result.applied, true); assert.equal(result.level, level); assert.equal(result.fallback, undefined);
+  }
+});
+
+test('a fallback preview discarded when the menu closes cannot be submitted', async () => {
+  const f = fixture({ levels: ['instant', 'medium', 'high', 'xhigh'], selected: 'medium', discardOnClose: true });
+  let result;
+  for (let i = 0; i < 12; i++) { result = await f.step('pro'); if (!result.pending) break; }
+  assert.match(result.error, /关闭菜单后发生变化/);
+  assert.equal(result.applied, undefined); assert.equal(f.selected(), 'medium');
+});
+
+test('each new Pro request checks availability again after the allowance recovers', async () => {
+  const levels = ['instant', 'medium', 'high', 'xhigh'];
+  const f = fixture({ levels, selected: 'xhigh' });
+  let result;
+  for (let i = 0; i < 12; i++) { result = await f.step('pro'); if (!result.pending) break; }
+  assert.equal(result.level, 'xhigh');
+  levels.push('pro'); f.thumb.setAttribute('aria-valuemax', '4');
+  for (let i = 0; i < 12; i++) { result = await f.step('pro'); if (!result.pending) break; }
+  assert.equal(result.applied, true); assert.equal(result.level, 'pro'); assert.equal(result.fallback, undefined);
+});
+
+test('a fallback must still be the highest level when the menu is reopened', async () => {
+  const levels = ['instant', 'medium', 'high', 'xhigh'];
+  const f = fixture({ levels, selected: 'xhigh' });
+  await f.step('pro'); assert.equal((await f.step('pro')).verify, true);
+  levels.push('pro'); f.thumb.setAttribute('aria-valuemax', '4');
+  await f.step('pro');
+  assert.match((await f.step('pro')).error, /关闭菜单后发生变化/);
 });
 
 test('foreign menus and hidden history controls cannot be used to change reasoning', async () => {

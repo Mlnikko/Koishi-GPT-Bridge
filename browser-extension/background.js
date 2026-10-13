@@ -68,6 +68,7 @@ async function waitForComposer(current,info){
   current.recoveryCount=1;current.openedAt=now;delete current.composerWaitAt;
   delete current.historySeen;delete current.historyStreak;
   delete current.reasoningApplied;delete current.reasoningAttempts;delete current.reasoningVerify;
+  delete current.reasoningFallback;
   await store(current,'输入框未就绪，正在重新加载原网页会话（仅一次）');
   await chrome.tabs.reload(current.tabId);return;
  }
@@ -113,16 +114,36 @@ async function returnFailure(current){
  await api('/failure',{id:current.id,...current.failure});
  await store(null,'任务失败：'+current.failure.message);
 }
+function validReasoningFallback(current,fallback){
+ return current.reasoningEffort==='pro'&&fallback?.requested==='pro'&&fallback.reason==='pro-unavailable'
+  &&['instant','medium','high','xhigh'].includes(fallback.level);
+}
+function reasoningConfirmed(current){
+ return !current.reasoningEffort||current.reasoningApplied===current.reasoningEffort
+  ||(current.reasoningVerify&&validReasoningFallback(current,current.reasoningFallback)
+   &&current.reasoningApplied===current.reasoningFallback.level);
+}
 async function applyReasoning(current){
  current.phase='reasoning';current.reasoningAttempts=(current.reasoningAttempts||0)+1;
  if(current.reasoningAttempts>12)throw Error('网页推理程度切换超时，无法确认所选程度；本次未提交');
  await store(current,'正在切换网页推理程度：'+current.reasoningEffort);
+ const verifying=current.reasoningVerify,fallback=current.reasoningFallback;
  const reasoning=await page(current.tabId,'reasoning',current);
- if(reasoning.verify){current.reasoningVerify=true;await store(current,'正在读回菜单关闭后的推理程度');}
+ if(reasoning.verify){
+  if(reasoning.fallback){
+   if(!validReasoningFallback(current,reasoning.fallback))throw Error('网页推理程度降级信息无效；本次未提交');
+   current.reasoningFallback=reasoning.fallback;
+  }
+  current.reasoningVerify=true;await store(current,'正在读回菜单关闭后的推理程度');
+ }
  if(!reasoning.applied)return;
- if(reasoning.level!==current.reasoningEffort)throw Error('网页推理程度与任务不一致；本次未提交');
+ if(reasoning.level!==current.reasoningEffort&&!(verifying&&validReasoningFallback(current,fallback)
+  &&validReasoningFallback(current,reasoning.fallback)&&reasoning.fallback.level===fallback.level
+  &&reasoning.level===fallback.level))throw Error('网页推理程度与任务不一致；本次未提交');
+ if(reasoning.level===current.reasoningEffort)delete current.reasoningFallback;
  current.reasoningApplied=reasoning.level;current.phase='opening';
- await store(current,'网页推理程度已确认：'+reasoning.level);
+ await store(current,current.reasoningFallback?'网页 Pro 暂不可用，已确认使用当前最高推理程度：'+reasoning.level:
+  '网页推理程度已确认：'+reasoning.level);
 }
 async function tick(){
  if(ticking)return;ticking=true;
@@ -207,7 +228,7 @@ async function tick(){
     if(current.historyStreak<2)return;
     if(Date.now()-current.openedAt<(info.assistants?8000:15000))return;
    }
-   if(current.reasoningEffort&&current.reasoningApplied!==current.reasoningEffort){await applyReasoning(current);return;}
+   if(!reasoningConfirmed(current)){await applyReasoning(current);return;}
    current.baseline=info.assistants;
    current.assistantId=info.assistantId;
    // Count the user's turns before submitting: the new turn is what proves the
@@ -263,7 +284,7 @@ async function tick(){
    current.phase='filled';current.filledAt=Date.now();await store(current,'消息已填写，等待输入框完成更新');return;
   }
   if(current.phase==='filled'){
-   if(current.reasoningEffort&&current.reasoningApplied!==current.reasoningEffort)
+   if(!reasoningConfirmed(current))
     throw Error('网页推理程度未经确认；本次未提交，请重新发送');
    // Wait a separate polling turn for the editor to commit React state.
    // Persist before clicking: crashes in this gap fail closed, never duplicate.
@@ -312,6 +333,7 @@ async function tick(){
     userBaseline:current.userBaseline,users:info.users,assistantBaseline:current.baseline,assistants:info.assistants,
     assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
     ...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort,reasoningApplied:current.reasoningApplied}:{}),
+    ...(current.reasoningFallback?{reasoningFallback:current.reasoningFallback}:{}),
    },timing:current.timing});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
   }

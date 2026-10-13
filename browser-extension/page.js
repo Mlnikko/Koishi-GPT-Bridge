@@ -157,11 +157,19 @@ async function pageStep(operation,job){
    throw Error('无法确认网页当前推理程度；本次未提交');
   // Closing the menu can discard a preview or reveal a late account setting.
   // Reopen and read it back on later worker ticks before allowing a submission.
-  if(job.reasoningVerify&&selected!==target)
+  const fallback=job.reasoningFallback;
+  const fallbackTarget=target==='pro'&&fallback?.requested==='pro'&&fallback.reason==='pro-unavailable'
+   &&levels.includes(fallback.level)&&fallback.level!=='pro'?fallback.level:null;
+  if(job.reasoningVerify&&(selected!==(fallbackTarget||target)||(fallbackTarget&&value!==max)))
    throw Error('网页推理程度在关闭菜单后发生变化；本次未提交');
-  if(selected===target){
+  // Pro may disappear when the account runs out of its allowance. The actual
+  // slider endpoint proves the highest available level; do not assume indexes.
+  const proUnavailable=target==='pro'&&selected!=='pro'&&value===max;
+  if(selected===target||proUnavailable){
+   const reasoningFallback=proUnavailable?{requested:target,level:selected,reason:'pro-unavailable'}:null;
    trigger.click();
-   return job.reasoningVerify?{applied:true,level:selected}:{pending:true,verify:true};
+   return {...(job.reasoningVerify?{applied:true,level:selected}:{pending:true,verify:true}),
+    ...(reasoningFallback?{fallback:reasoningFallback}:{})};
   }
   const direction=levels.indexOf(target)<levels.indexOf(selected)?-1:1;
   if((direction<0&&value===min)||(direction>0&&value===max))

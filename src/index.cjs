@@ -367,7 +367,8 @@ exports.apply = (ctx, config) => {
     const s = chats.ensure(owner, chat);
     chats.setReasoning(s.id, owner, chat, level);
     return `会话「${s.name}」推理程度已设为：${reasoningLabel(level)}。下一条消息起生效，已排队或运行中的任务保持原设置。`
-      + (level === 'default' ? '' : '\n发送前会应用网页选项；账号不支持时会报错。');
+      + (level === 'default' ? '' : level === 'pro' ? '\nPro 暂不可用时使用当前最高可用档，恢复后自动使用 Pro。'
+        : '\n发送前会应用网页选项；账号不支持时会报错。');
   }));
   // Route exact slash commands ourselves: Koishi strips a leading slash from
   // command definitions, which would register bare words and collide with help.

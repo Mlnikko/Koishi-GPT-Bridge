@@ -1476,7 +1476,39 @@ test('closed-menu reasoning verification is durable and cannot fill before readb
  assert.equal(opsOf(next.calls,'submit').length,0);assert.equal(opsOf(next.calls,'send').length,0);
 });
 
-for(const result of [{error:'当前账号不支持推理程度 pro；本次未提交'},{applied:true,level:'medium'}])
+for(const hasImages of [false,true])test('verified Pro fallback survives a restart without retrying Pro or changing the requested effort; images='+hasImages,async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'pro'};
+ const fallback={requested:'pro',level:'xhigh',reason:'pro-unavailable'};
+ const info={editor:true,threadId:THREAD,assistants:1,users:1};
+ const first=worker({state:task,results:{reasoning:{pending:true,verify:true,fallback}}});
+ await wait();first.storage.current=openingJob({phase:'reasoning',reasoningEffort:'pro',hasImages,images:hasImages?[{index:0}]:[]});
+ await first.sandbox.tick();
+ assert.deepEqual(first.storage.current.reasoningFallback,fallback);assert.equal(first.storage.current.reasoningVerify,true);
+ assert.equal(opsOf(first.calls,'submit').length,0);assert.equal(opsOf(first.calls,'attach').length,0);
+ const next=worker({state:task,storageSeed:first.storage,results:(op,job)=>{
+  if(op==='reasoning'){
+   assert.equal(job.reasoningVerify,true);assert.deepEqual(plain(job.reasoningFallback),fallback);
+   return {applied:true,level:'xhigh',fallback};
+  }
+  return op==='inspect'?info:op==='submit'?{filled:true}:op==='send'?{clicked:true}:{};
+ }});
+ await wait();assert.equal(next.storage.current.reasoningApplied,'xhigh');assert.equal(next.storage.current.reasoningEffort,'pro');
+ assert.match(next.storage.status,/Pro 暂不可用/);
+ await next.sandbox.tick();
+ assert.equal(next.storage.current.phase,hasImages?'attaching':'filled');
+ assert.equal(opsOf(next.calls,'reasoning').length,1);
+ if(!hasImages){
+  await next.sandbox.tick();assert.equal(opsOf(next.calls,'send').length,1);
+  info.submitted=true;info.users=2;
+  await next.sandbox.tick();
+  const evidence=routeOf(next.calls,'/progress').find(call=>call.body.phase==='submitted').body.evidence;
+  assert.equal(evidence.reasoningEffort,'pro');assert.equal(evidence.reasoningApplied,'xhigh');
+  assert.deepEqual(evidence.reasoningFallback,fallback);
+ }
+});
+
+for(const result of [{error:'当前账号不支持推理程度 pro；本次未提交'},{applied:true,level:'medium'},
+ {applied:true,level:'xhigh',fallback:{requested:'pro',level:'xhigh',reason:'pro-unavailable'}}])
 test('unsupported or mismatched reasoning cannot submit a prompt '+JSON.stringify(result),async()=>{
  const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'pro'};
  const {sandbox,storage,calls}=worker({state:task,results:{inspect:{editor:true,threadId:THREAD,assistants:1,users:1},reasoning:result,probe:{}}});
@@ -1484,6 +1516,16 @@ test('unsupported or mismatched reasoning cannot submit a prompt '+JSON.stringif
  await sandbox.tick();
  assert.equal(routeOf(calls,'/failure').length,1);
  assert.match(routeOf(calls,'/failure')[0].body.message,/推理程度/);
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
+});
+
+test('a changed fallback level cannot pass the durable closed-menu verification',async()=>{
+ const task={id:'session-management',threadId:THREAD,text:'hello',reasoningEffort:'pro'};
+ const {sandbox,storage,calls}=worker({state:task,results:{reasoning:{applied:true,level:'high',
+  fallback:{requested:'pro',level:'high',reason:'pro-unavailable'}},probe:{}}});
+ await wait();storage.current=openingJob({phase:'reasoning',reasoningEffort:'pro',reasoningVerify:true,
+  reasoningFallback:{requested:'pro',level:'xhigh',reason:'pro-unavailable'}});
+ await sandbox.tick();assert.equal(routeOf(calls,'/failure').length,1);
  assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
 });
 
