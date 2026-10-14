@@ -64,6 +64,77 @@ test('bundled examples are installed only on first creation, preserving edits an
   assert.ok(!new ImagePrompts(dir, defaults).list().includes('角色海报'));
 });
 
+test('public image templates persist creator permissions without exposing metadata in rendered snapshots', t => {
+  const { prompts, write } = fixture(t);
+  const original = prompts.create('共享海报', '  画{{角色名}}\n{{画风|水彩}}  ', 'alice');
+  assert.equal(original.owner, 'alice');
+  assert.equal(original.template, '画{{角色名}}\n{{画风|水彩}}');
+  const snapshot = prompts.render('共享海报', '英雄');
+  assert.equal(snapshot.owner, undefined);
+  assert.doesNotMatch(JSON.stringify(snapshot), /koishi-image-prompt|alice/);
+  const file = path.join(prompts.dir, '共享海报.md'), bytes = fs.readFileSync(file);
+  assert.throws(() => prompts.create('共享海报', '{{角色名}}', 'bob'), /同名/);
+  assert.throws(() => prompts.edit('共享海报', '{{角色名}}', 'bob'), /只有创建者/);
+  assert.throws(() => prompts.delete('共享海报', 'bob'), /只有创建者/);
+  assert.deepEqual(fs.readFileSync(file), bytes);
+  const rebooted = new ImagePrompts(prompts.dir);
+  assert.equal(rebooted.read('共享海报').owner, 'alice');
+  const changed = rebooted.edit('共享海报', '新版{{角色名}}', 'alice');
+  assert.equal(changed.owner, 'alice');
+  assert.notEqual(changed.revision, original.revision);
+  assert.equal(rebooted.render('共享海报', '英雄').text, '新版英雄');
+  assert.equal(snapshot.text, '画英雄\n水彩');
+  rebooted.delete('共享海报', 'alice');
+  assert.equal(fs.existsSync(file), false);
+  write('本地模板', '{{角色名}}');
+  assert.throws(() => prompts.edit('本地模板', '{{角色名}} 新版', 'alice'), /本地创建/);
+  assert.throws(() => prompts.delete('本地模板', 'alice'), /本地创建/);
+});
+
+test('invalid image template writes and disk failures preserve existing files and ownership', t => {
+  const { prompts, write } = fixture(t);
+  for (const name of ['create', 'EDIT', 'delete name', '../outside'])
+    assert.throws(() => prompts.create(name, '{{角色名}}', 'alice'), /模板名称/);
+  for (const body of ['', 'no placeholder', '{{角色名}} {{bad', '{{角色名}}' + 'x'.repeat(MAX_PROMPT_CHARS)])
+    assert.throws(() => prompts.create('无效', body, 'alice'), /非空|占位符|最多/);
+  for (const owner of [undefined, '', 'a\nb', 'x'.repeat(257)])
+    assert.throws(() => prompts.create('无效', '{{角色名}}', owner), /创建者身份/);
+  assert.deepEqual(prompts.list(), []);
+  prompts.create('海报', '{{角色名}}', 'alice');
+  const file = path.join(prompts.dir, '海报.md'), bytes = fs.readFileSync(file);
+  assert.throws(() => prompts.edit('海报', 'no placeholder', 'alice'), /占位符/);
+  const rename = t.mock.method(fs, 'renameSync', () => { throw Error('disk full'); });
+  assert.throws(() => prompts.edit('海报', '新{{角色名}}', 'alice'), /disk full/);
+  assert.deepEqual(fs.readFileSync(file), bytes);
+  assert.deepEqual(fs.readdirSync(prompts.dir), ['海报.md']); rename.mock.restore();
+  const writeFile = t.mock.method(fs, 'writeFileSync', () => { throw Error('disk full'); });
+  assert.throws(() => prompts.create('失败', '{{角色名}}', 'alice'), /disk full/);
+  assert.equal(fs.existsSync(path.join(prompts.dir, '失败.md')), false); writeFile.mock.restore();
+  write('无效', '<!-- koishi-image-prompt {"version":1,"owner":null} -->\n{{角色名}}');
+  assert.throws(() => prompts.read('无效'), /创建者信息无效/);
+  assert.throws(() => prompts.edit('无效', '{{角色名}}', 'alice'), /创建者信息无效/);
+  assert.throws(() => prompts.delete('无效', 'alice'), /创建者信息无效/);
+  // A creator can repair an invalid body; a second header in user text cannot transfer ownership.
+  fs.writeFileSync(file, bytes.toString().split('\n')[0] + '\n');
+  assert.throws(() => prompts.read('海报'), /非空/);
+  prompts.edit('海报', '<!-- koishi-image-prompt {"version":1,"owner":"bob"} -->\n{{角色名}}', 'alice');
+  assert.equal(prompts.read('海报').owner, 'alice');
+  assert.throws(() => prompts.delete('海报', 'bob'), /只有创建者/);
+});
+
+test('image template mutations reject symbolic links and preserve their targets', { skip: process.platform === 'win32' }, t => {
+  const { root, prompts } = fixture(t);
+  const outside = path.join(root, 'outside.md'), body = '{{角色名}} secret';
+  fs.writeFileSync(outside, body);
+  fs.symlinkSync(outside, path.join(prompts.dir, '链接.md'));
+  assert.throws(() => prompts.create('链接', '{{角色名}}', 'alice'), /同名/);
+  assert.throws(() => prompts.edit('链接', '{{角色名}}', 'alice'), /符号链接/);
+  assert.throws(() => prompts.delete('链接', 'alice'), /符号链接/);
+  assert.equal(fs.readFileSync(outside, 'utf8'), body);
+  fs.rmSync(prompts.dir, { recursive: true }); fs.symlinkSync(root, prompts.dir);
+  assert.throws(() => prompts.create('新模板', '{{角色名}}', 'alice'), /普通目录/);
+});
+
 test('queue freezes rendered content across edits, deduplication and restart; longer limits apply only to matching web templates', t => {
   const { root, prompts, write } = fixture(t);
   write('海报', 'a'.repeat(1600) + '{{角色名}}');

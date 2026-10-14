@@ -1108,15 +1108,93 @@ test('image template selection, preview and paging are local and persist per con
   assert.match(await slash(restarted, '/prompt show'), /长/);
 });
 
-test('/draw submits the expanded text to the web bridge and returns image bytes through existing delivery', async () => {
+test('QQ image templates are public, creator-managed and retain independent selection after restart', async () => {
+  const app = apply();
+  const bob = { userId: 'bob' };
+  assert.match(await slash(app, '/prompt create 共享海报\n画{{角色名}}，{{画风|水彩}}'), /已创建公共图片模板/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.match(await slash(app, '/prompt'), /共享海报 \[我创建\]/);
+  assert.match(await slash(app, '/prompt', bob), /共享海报 \[公共\]/);
+  const show = await slash(app, '/prompt show 共享海报', bob);
+  assert.match(show, /仅创建者可管理[\s\S]*画\{\{角色名\}\}/);
+  assert.doesNotMatch(show, /koishi-image-prompt|alice/);
+  assert.match(await slash(app, '/prompt create 共享海报\n{{角色名}}', bob), /同名/);
+  assert.match(await slash(app, '/prompt edit 共享海报\n{{角色名}}', bob), /只有创建者/);
+  assert.match(await slash(app, '/prompt delete 共享海报', bob), /只有创建者/);
+  assert.match(await slash(app, '/prompt edit 角色海报\n{{角色名}}'), /本地创建/);
+  assert.match(await slash(app, '/prompt delete 角色海报'), /本地创建/);
+  await slash(app, '/prompt 共享海报', bob);
+  await slash(app, '/prompt 角色海报');
+  await slash(app, '/new 新图', bob);
+  assert.match(await slash(app, '/prompt', bob), /当前图片模板：共享海报/);
+  assert.match(await slash(app, '/prompt'), /当前图片模板：角色海报/);
+  for (const dispose of app.disposes) dispose();
+  const rebooted = apply({ dataDir: app.root });
+  assert.match(await slash(rebooted, '/prompt', bob), /当前图片模板：共享海报/);
+  assert.match(await slash(rebooted, '/prompt edit 共享海报\n{{角色名}}', bob), /只有创建者/);
+  assert.match(await slash(rebooted, '/prompt edit 共享海报\n新版{{角色名}}'), /已更新/);
+  assert.match(await slash(rebooted, '/prompt preview 英雄', bob), /新版英雄/);
+  assert.match(await slash(rebooted, '/prompt delete 共享海报'), /已删除/);
+  assert.match(await slash(rebooted, '/draw 英雄', bob), /未找到模板/);
+  assert.match(await slash(rebooted, '/prompt off', bob), /已取消/);
+  assert.match(await slash(rebooted, '/prompt'), /当前图片模板：角色海报/);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('image template management validates multiline syntax, paginates safely and never generates', async () => {
+  const app = apply();
+  const name = '带 空格的模板';
+  const body = '{{角色名}}\n' + '😀'.repeat(3200) + '\n末尾<at id="bot"/> &内容';
+  assert.match(await slash(app, `/PROMPT CREATE ${name}\r\n${body}`), /已创建/);
+  const first = await slash(app, `/prompt show ${name}`);
+  const pages = Number(/第 1\/(\d+) 页/.exec(first)[1]); assert.ok(pages > 1);
+  for (let page = 1; page <= pages; page++) {
+    const result = await slash(app, `/prompt show --page ${page} ${name}`);
+    assert.ok(result.length <= 1500);
+    assert.doesNotMatch(result, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    if (page === pages) assert.match(result, /末尾&lt;at id="bot"\/&gt; &amp;内容/);
+  }
+  for (let i = 0; i < 16; i++) await slash(app, `/prompt create 模板${i}\n{{角色名}}`);
+  assert.match(await slash(app, '/prompt list 2'), /第 2\//);
+  for (const value of ['create 名称', 'create 名称\n', 'edit 名称', 'delete', 'delete 名称\n正文',
+    'show 名称\n正文', 'preview 英雄\n正文', 'list\n正文', 'off\n正文', 'off extra'])
+    assert.match(await slash(app, '/prompt ' + value), /用法/);
+  assert.match(await slash(app, '/prompt create 无效\n没有角色占位符'), /占位符/);
+  assert.match(await slash(app, '/prompt create 超长\n{{角色名}}' + '字'.repeat(8000)), /最多 8000/);
+  assert.match(await slash(app, `/prompt edit ${name}\n没有角色占位符`), /占位符/);
+  assert.match(await slash(app, `/prompt show ${name}`), /\{\{角色名\}\}/);
+  assert.equal(fs.existsSync(path.join(app.root, 'prompts', '无效.md')), false);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('image template management follows private access and group mention gates with creator-only mutations', async () => {
+  const app = apply({ allowedUsers: ['alice'], groupChat: true });
+  const member = { userId: 'group-bob', isDirect: false, channelId: 'group', stripped: { appel: true } };
+  const command = '/prompt create 群模板\n画{{角色名}}';
+  const file = path.join(app.root, 'prompts', '群模板.md');
+  assert.equal(await slash(app, command, { userId: 'group-bob' }), undefined);
+  assert.equal(await slash(app, command, { ...member, stripped: { appel: false } }), undefined);
+  assert.equal(fs.existsSync(file), false);
+  assert.match(await slash(app, command, member), /已创建/);
+  assert.match(await slash(app, '/prompt show 群模板'), /画\{\{角色名\}\}/);
+  assert.match(await slash(app, '/prompt edit 群模板\n新{{角色名}}'), /只有创建者/);
+  assert.match(await slash(app, '/prompt delete 群模板'), /只有创建者/);
+  assert.equal(await slash(app, '/prompt delete 群模板', { ...member, stripped: { appel: false } }), undefined);
+  assert.match(await slash(app, '/prompt edit 群模板\n新{{角色名}}', member), /已更新/);
+  assert.match(await slash(app, '/prompt delete 群模板', member), /已删除/);
+  assert.equal(fs.existsSync(file), false);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('QQ image template edits and deletion preserve the submitted web request and image delivery', async () => {
   const app = apply({ notifyProgress: false });
   const { port, token } = await bridgeOf(app.root);
   const headers = { 'x-bridge-token': token, 'Content-Type': 'application/json' };
   const beat = () => fetch(`http://127.0.0.1:${port}/state`, { headers });
   await beat();
-  const file = path.join(app.root, 'prompts', '测试海报.md');
   const body = '生成{{角色名}}的图片。' + '细节'.repeat(850) + '\n主角：{{角色名}}';
-  fs.writeFileSync(file, body);
+  assert.match(await slash(app, '/prompt create 测试海报\n' + body), /已创建公共图片模板/);
   await slash(app, '/prompt 测试海报');
   const s = session({ messageId: 'draw-test' });
   await dispatch(app, s, '/draw 黑衣剑士');
@@ -1128,8 +1206,12 @@ test('/draw submits the expanded text to the web bridge and returns image bytes 
   assert.ok(request);
   assert.equal(request.text, body.replaceAll('{{角色名}}', '黑衣剑士'));
   assert.ok(!request.text.includes('/draw'));
-  fs.writeFileSync(file, '新版{{角色名}}');
+  assert.equal(jobFiles(app.root)[0].imagePrompt.owner, undefined);
+  assert.match(await slash(app, '/prompt edit 测试海报\n新版{{角色名}}'), /已更新/);
+  assert.match(await slash(app, '/prompt preview 第二人'), /新版第二人/);
   assert.match(await slash(app, '/draw 第二人', { messageId: 'busy-draw' }), /当前会话仍在处理/);
+  assert.match(await slash(app, '/prompt delete 测试海报'), /已删除公共图片模板/);
+  assert.match(await slash(app, '/draw 第二人', { messageId: 'deleted-draw' }), /未找到模板/);
   await dispatch(app, s, '/draw 黑衣剑士');
   assert.equal(jobFiles(app.root).length, 1, 'duplicate draw never submits twice');
   assert.equal(jobFiles(app.root)[0].imagePrompt.template, body);
