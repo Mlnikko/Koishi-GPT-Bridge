@@ -2,15 +2,18 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { writeAtomic } = require('../lib/state.cjs');
 
 const MAX_PROMPT_CHARS = 8000;
+const OWNER_PREFIX = '<!-- koishi-image-prompt ';
+const validOwner = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
 const MAX_REQUEST_CHARS = 1000;
 const FIELD_PATTERN = /\{\{([^{}]+)\}\}/g;
 function promptName(value) {
   if (typeof value !== 'string' || !value.trim() || value !== value.trim() || value.length > 64
     || /[<>:"/\\|?*\x00-\x1f\x7f]/.test(value) || /^[.]/.test(value) || /[. ]$/.test(value)
-    || /^(?:list|show|preview|off|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:[.\s]|$)/i.test(value)
-    || value.startsWith('--')) throw Error('模板名称最多 64 字，不可含路径、特殊字符或 list/show/preview/off 等保留名称');
+    || /^(?:list|show|preview|off|create|edit|delete|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:[.\s]|$)/i.test(value)
+    || value.startsWith('--')) throw Error('模板名称最多 64 字，不可含路径、特殊字符或 list/show/preview/off/create/edit/delete 等保留名称');
   return value;
 }
 // Inline declarations keep ordinary Markdown templates editable without a parser dependency.
@@ -126,22 +129,75 @@ class ImagePrompts {
       try { return [promptName(entry.name.slice(0, -3))]; } catch { return []; }
     }).sort((a, b) => a.localeCompare(b, 'zh-CN'));
   }
-  read(name) {
+  readFile(name) {
     name = promptName(name); this.checkDirectory();
     const file = path.join(this.dir, name + '.md');
     let template;
     try {
       const stat = fs.lstatSync(file);
       if (!stat.isFile() || stat.isSymbolicLink()) throw Error('模板必须是普通 Markdown 文件，不支持符号链接');
-      if (stat.size > MAX_PROMPT_CHARS * 4 + 4) throw Error(`图片提示词最多 ${MAX_PROMPT_CHARS} 字`);
-      try { template = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file)).trim(); }
+      if (stat.size > MAX_PROMPT_CHARS * 4 + 2048) throw Error(`图片提示词最多 ${MAX_PROMPT_CHARS} 字`);
+      try { template = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file)); }
       catch { throw Error('模板必须保存为 UTF-8 文本'); }
     } catch (err) {
-      if (err.code === 'ENOENT') throw Error('未找到模板「' + name + '」，用 /prompt 查看列表');
+      if (err.code === 'ENOENT') throw Error('未找到模板「' + name + '」，用 /prompt 查看列表，或用 /prompt create 名称 后换行填写正文创建');
       throw err;
     }
+    let owner;
+    if (template.startsWith(OWNER_PREFIX)) {
+      const end = template.indexOf('\n');
+      const header = (end < 0 ? template : template.slice(0, end)).replace(/\r$/, '');
+      try {
+        if (!header.endsWith(' -->')) throw Error('invalid header');
+        const meta = JSON.parse(header.slice(OWNER_PREFIX.length, -4));
+        if (meta.version !== 1 || !validOwner(meta.owner)) throw Error('invalid owner');
+        owner = meta.owner; template = end < 0 ? '' : template.slice(end + 1);
+      } catch { throw Error('模板创建者信息无效，请在本地修复文件头'); }
+    }
+    return { name, template: template.trim(), owner };
+  }
+  read(name) {
+    const { template, owner } = this.readFile(name);
     const fields = parseTemplate(template);
-    return { name, template, revision: revisionOf(template), fields };
+    return { name, template, revision: revisionOf(template), fields, ...(owner ? { owner } : {}) };
+  }
+  document(template, owner) {
+    if (!validOwner(owner)) throw Error('无法确认模板创建者身份');
+    if (typeof template === 'string') template = template.trim();
+    parseTemplate(template);
+    return OWNER_PREFIX + JSON.stringify({ version: 1, owner }) + ' -->\n' + template + '\n';
+  }
+  create(name, template, owner) {
+    name = promptName(name); this.checkDirectory();
+    const document = this.document(template, owner), file = path.join(this.dir, name + '.md');
+    let descriptor;
+    try {
+      descriptor = fs.openSync(file, 'wx', 0o600);
+      fs.writeFileSync(descriptor, document);
+    } catch (err) {
+      if (descriptor !== undefined) {
+        fs.closeSync(descriptor); descriptor = undefined;
+        try { fs.unlinkSync(file); } catch {}
+      }
+      if (err.code === 'EEXIST') throw Error('已有同名公共图片模板，请使用其他名称；修改自己的模板请用 /prompt edit');
+      throw err;
+    } finally { if (descriptor !== undefined) fs.closeSync(descriptor); }
+    return this.read(name);
+  }
+  requireCreator(name, owner) {
+    const template = this.readFile(name);
+    if (!template.owner) throw Error('这是本地创建的公共模板，只能在本机编辑或删除；可以用新名称在 QQ 创建自己的模板');
+    if (!validOwner(owner) || template.owner !== owner) throw Error('只有创建者可以编辑或删除此公共图片模板；你仍可查看和选择');
+    return template;
+  }
+  edit(name, template, owner) {
+    const original = this.requireCreator(name, owner);
+    writeAtomic(path.join(this.dir, original.name + '.md'), this.document(template, original.owner));
+    return this.read(original.name);
+  }
+  delete(name, owner) {
+    const template = this.requireCreator(name, owner);
+    fs.unlinkSync(path.join(this.dir, template.name + '.md'));
   }
   render(name, request) { return validateImagePrompt({ ...this.read(name), request }); }
 }
