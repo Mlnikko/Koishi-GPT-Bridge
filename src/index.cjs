@@ -101,6 +101,11 @@ exports.apply = (ctx, config) => {
     return groupChat && !!s.stripped?.appel;
   };
   const conversation = s => `${s.platform}:${s.channelId}`;
+  const defaultChatName = s => {
+    const name = [s.username, s.event?.user?.name, s.userId]
+      .find(value => typeof value === 'string' && value.trim()) || '默认会话';
+    return name.trim().slice(0, 40);
+  };
   const notifications = s => preferences.enabled(s.userId, conversation(s));
   const imagesIn = j => imagesOf(j.input);
   const status = j => `任务 ${j.id}：${j.status === 'running' ? backendLabel(j.backend) + '处理中' : labels[j.status] || j.status}，已等待 ${Math.floor((Date.now()-j.createdAt)/1000)} 秒。`
@@ -132,7 +137,7 @@ exports.apply = (ctx, config) => {
     // 网页会话里，所以「把刚才那张图改成蓝色」这类续聊不需要任何命令。
     // 会话数达到上限时 ensure 会抛错，必须在这里拦住 —— 它发生在下面那个 try 之外。
     let chat;
-    try { chat = chats.ensure(session.userId, conversation(session)); }
+    try { chat = chats.ensure(session.userId, conversation(session), defaultChatName(session)); }
     catch (err) { return textMessage(safeReason(err.message)); }
     if (imagePrompt && chat.backend === 'lmstudio') return '图片模板通过 ChatGPT 网页生成图片，请先发送 /backend web，再用 /draw 角色名。';
     const duplicate = q.duplicate(session.userId, conversation(session), session.messageId);
@@ -181,16 +186,16 @@ exports.apply = (ctx, config) => {
     }
     return `过程通知已${notifications(session) ? '开启' : '关闭，仅接收最终回复或失败原因'}。`;
   };
-  const manage = fn => ({ session }, ...args) => {
-    try { return textMessage(fn(session.userId, conversation(session), ...args)); }
+  const manage = fn => ({ session }, value) => {
+    try { return textMessage(fn(session.userId, conversation(session), value, defaultChatName(session))); }
     catch (err) { return textMessage(safeReason(err.message)); }
   };
   const currentJob = (session, id) => q.find(id, session.userId, conversation(session),
     chats.current(session.userId, conversation(session))?.id);
   command('/help', '帮助').action(help);
-  command('/new [name:text]', '开启新对话').action(manage((owner, chat, name) => {
+  command('/new [name:text]', '开启新对话；名称默认使用用户名').action(manage((owner, chat, name, defaultName) => {
     const previous = chats.current(owner, chat);
-    const s = chats.create(owner, chat, name, { backend: previous?.backend, model: previous?.lmStudioModel, preset: previous?.lmStudioPreset, imagePrompt: previous?.imagePrompt });
+    const s = chats.create(owner, chat, name || defaultName, { backend: previous?.backend, model: previous?.lmStudioModel, preset: previous?.lmStudioPreset, imagePrompt: previous?.imagePrompt });
     return `已开启：${s.name}（${s.id}）。旧会话保留，可用 /chat 切回。`
       + (s.lmStudioPreset ? `\n沿用本地预设：${s.lmStudioPreset}。` : '')
       + (s.imagePrompt ? `\n沿用图片模板：${s.imagePrompt}，/draw 角色名 生成图片。` : '');
@@ -204,9 +209,16 @@ exports.apply = (ctx, config) => {
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
       + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''}${busy(s.id) ? ' [处理中]' : ''}${s.backend === 'lmstudio' ? ' [LM Studio：' + s.lmStudioModel + ']' : ''}${s.lmStudioPreset ? ' [本地预设：' + s.lmStudioPreset + ']' : ''}${s.reasoningEffort && s.backend !== 'lmstudio' ? ' [推理：' + reasoningLabel(s.reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
   }));
+  command('/rename [name:text]', '重命名当前会话；最多 40 字').action(manage((owner, chat, name) => {
+    if (!name?.trim()) throw Error('用法：/rename 新名称');
+    const current = chats.current(owner, chat);
+    if (!current) throw Error('暂无当前会话，请先发消息或用 /new 创建');
+    const s = chats.rename(current.id, owner, chat, name);
+    return `已重命名：${s.name}（${s.id}）`;
+  }));
   command('/backend [target:text]', '查看或切换 web/lmstudio；可附模型编号').action(async ({ session }, target) => {
     try {
-      const chat = chats.ensure(session.userId, conversation(session));
+      const chat = chats.ensure(session.userId, conversation(session), defaultChatName(session));
       if (!target) return textMessage(`当前后端：${backendLabel(chat.backend)}${chat.backend === 'lmstudio' ? '（' + chat.lmStudioModel + '）' : ''}。\n/backend lmstudio [模型编号] 切换本地；/backend web 切回网页。两边的上下文分别保留。`);
       const [backend, ...args] = target.trim().split(/\s+/);
       if (!['web', 'lmstudio'].includes(backend) || args.length > 1 || (backend === 'web' && args.length))
@@ -222,7 +234,7 @@ exports.apply = (ctx, config) => {
         : '当前会话已切回 ChatGPT 网页；本地模型的历史仍保留。');
     } catch (err) { return textMessage(safeReason(err.message)); }
   });
-  command('/preset [name:text]', '公共预设；show/list 查看，create/edit/delete 管理，off 关闭').action(manage((owner, chat, value) => {
+  command('/preset [name:text]', '公共预设；show/list 查看，create/edit/delete 管理，off 关闭').action(manage((owner, chat, value, defaultName) => {
     const current = chats.current(owner, chat);
     const label = `当前本地预设：${current?.lmStudioPreset || '未启用'}。`;
     const lines = (value || '').split(/\r?\n/);
@@ -284,13 +296,13 @@ exports.apply = (ctx, config) => {
       return '当前会话已关闭本地预设。已有聊天记录保留，/new 开启空白上下文。';
     }
     const preset = presets.read(value);
-    const s = current || chats.ensure(owner, chat);
+    const s = current || chats.ensure(owner, chat, defaultName);
     chats.setPreset(s.id, owner, chat, preset.name);
     return `会话「${s.name}」已选择本地预设：${preset.name}。下一条本地模型消息起生效。`
       + (s.backend === 'lmstudio' ? '' : '\n/backend lmstudio 切换到本地模型后使用。')
       + '\n已有聊天记录保留，/new 沿用预设开启新剧情。';
   }));
-  command('/prompt [name:text]', '图片模板；list/show/preview 查看，create/edit/delete 管理，名称选择，off 取消').action(manage((owner, chat, value) => {
+  command('/prompt [name:text]', '图片模板；list/show/preview 查看，create/edit/delete 管理，名称选择，off 取消').action(manage((owner, chat, value, defaultName) => {
     const current = chats.current(owner, chat);
     const label = `当前图片模板：${current?.imagePrompt || '未选择'}。`;
     const lines = (value || '').split(/\r?\n/);
@@ -350,7 +362,7 @@ exports.apply = (ctx, config) => {
       return '已取消当前图片模板选择。已提交任务和聊天历史保留。';
     }
     const template = imagePrompts.read(value);
-    const s = current || chats.ensure(owner, chat);
+    const s = current || chats.ensure(owner, chat, defaultName);
     chats.setImagePrompt(s.id, owner, chat, template.name);
     const required = template.fields.filter(f => f.name !== '角色名' && f.name !== '补充要求' && f.fallback === undefined).map(f => f.name);
     const optional = [...new Set([...template.fields.filter(f => f.name !== '角色名' && f.fallback !== undefined).map(f => f.name), '补充要求'])];
@@ -404,14 +416,14 @@ exports.apply = (ctx, config) => {
     const j = currentJob(session, id); return j ? deliver(j, session) : '未找到你的任务';
   });
   command('/logs [mode:string]', '过程通知 on/off').action(({ session }, mode) => logs(session, mode));
-  command('/reasoning [level:string]', '当前会话推理程度 default/instant/medium/high/xhigh/pro').action(manage((owner, chat, value) => {
+  command('/reasoning [level:string]', '当前会话推理程度 default/instant/medium/high/xhigh/pro').action(manage((owner, chat, value, defaultName) => {
     if (chats.current(owner, chat)?.backend === 'lmstudio') return 'LM Studio 使用本地模型设置；/reasoning 适用于 ChatGPT 网页。';
     if (!value) {
       const s = chats.current(owner, chat);
       return `当前会话推理程度：${reasoningLabel(s?.reasoningEffort)}。\n${REASONING_USAGE}\n即时 / 中 / 高 / 超高 / Pro；default 跟随网页。`;
     }
     const level = normalizeReasoning(value);
-    const s = chats.ensure(owner, chat);
+    const s = chats.ensure(owner, chat, defaultName);
     chats.setReasoning(s.id, owner, chat, level);
     return `会话「${s.name}」推理程度已设为：${reasoningLabel(level)}。下一条消息起生效，已排队或运行中的任务保持原设置。`
       + (level === 'default' ? '' : level === 'pro' ? '\nPro 暂不可用时使用当前最高可用档，恢复后自动使用 Pro。'

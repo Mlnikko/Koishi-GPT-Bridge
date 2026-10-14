@@ -115,6 +115,63 @@ const bridgeOf = async root => {
   throw new Error('桥接端口未就绪');
 };
 
+test('all conversation creation routes default to the username', async () => {
+  for (const command of ['/new', '/backend', '/reasoning high', '/prompt 角色海报', '/preset 测试角色', undefined]) {
+    const app = apply();
+    fs.writeFileSync(path.join(app.root, 'presets', '测试角色.md'), '角色设定');
+    const s = Object.assign(session({ elements: [{ type: 'text', attrs: { content: '你好' } }] }), { username: ' 小明 ' });
+    await dispatch(app, s, command);
+    const data = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json')));
+    assert.equal(data.items[0].name, '小明', command);
+  }
+});
+
+test('default names fall back safely and explicit names take priority', async () => {
+  const app = apply();
+  for (const [fields, expected] of [
+    [{ username: '   ', event: { user: { name: '平台昵称' } } }, '平台昵称'],
+    [{}, 'alice'],
+    [{ username: '长'.repeat(60) }, '长'.repeat(40)],
+  ]) {
+    const s = Object.assign(session(), fields);
+    await dispatch(app, s, '/new');
+    const data = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json')));
+    assert.equal(data.items.at(-1).name, expected);
+  }
+  assert.match(await dispatch(app, Object.assign(session(), { username: '小明' }), '/new 自定义 名称'), /已开启：自定义 名称/);
+});
+
+test('rename persists without changing context and only changes the current owned conversation', async () => {
+  const app = apply({ groupChat: true });
+  const s = Object.assign(session(), { username: '小明' });
+  assert.match(await dispatch(app, s, '/rename 新名称'), /暂无当前会话/);
+  await dispatch(app, s, '/new');
+  const file = path.join(app.root, 'conversations.json');
+  const { Conversations } = require('../src/core/conversations.cjs');
+  const c = new Conversations(file), first = c.current('alice', 'qq:alice');
+  c.bindWeb(first, THREAD);
+  // Reload to model an existing conversation with a bound web history.
+  const restored = apply({ dataDir: app.root, groupChat: true });
+  const before = JSON.parse(fs.readFileSync(file)).items[0];
+  assert.match(await dispatch(restored, session({ userId: 'bob' }), '/rename 偷改'), /暂无当前会话/);
+  assert.match(await dispatch(restored, session({ isDirect: false, channelId: 'group', stripped: { appel: true } }), '/rename 偷改'), /暂无当前会话/);
+  assert.match(await dispatch(restored, s, '/rename'), /用法/);
+  assert.match(await dispatch(restored, s, `/rename ${'长'.repeat(41)}`), /最多 40 字/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).items[0], before);
+  assert.match(await dispatch(restored, s, '/rename 我的 绘图'), /已重命名：我的 绘图/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).items[0], { ...before, name: '我的 绘图' });
+  await dispatch(restored, s, '/backend');
+  assert.match(await dispatch(restored, s, '/chat'), /我的 绘图/);
+  await dispatch(restored, s, '/new 第二个');
+  await dispatch(restored, s, `/chat ${first.id}`);
+  await dispatch(restored, s, '/rename 再次修改');
+  const recovered = new Conversations(file);
+  assert.equal(recovered.current('alice', 'qq:alice').name, '再次修改');
+  assert.equal(recovered.list('alice', 'qq:alice')[1].name, '第二个');
+  assert.deepEqual(jobFiles(app.root), []);
+  assert.match(await dispatch(apply({ dataDir: app.root }), s, '/chat'), /再次修改/);
+});
+
 test('a private message is forwarded as-is and persisted as a job', async () => {
   const app = apply();
   const s = session({ elements: [{ type: 'img', attrs: { src: png() } }, { type: 'text', attrs: { content: '把背景改成夜晚' } }] });
@@ -172,7 +229,7 @@ test('every message from one user stays in the same persistent conversation', as
   const app = apply();
   const s = session({ elements: [{ type: 'text', attrs: { content: '画一只猫' } }], messageId: 'm1' });
   await dispatch(app, s, undefined);
-  assert.match(s.sent[0], /会话：默认会话（\S{8}）/, '第一次发消息就该自动进入默认会话，不需要任何命令');
+  assert.match(s.sent[0], /会话：alice（\S{8}）/, '第一次发消息就该自动进入alice，不需要任何命令');
   await settle(app.root);
   s.messageId = 'm2';
   s.elements = [{ type: 'text', attrs: { content: '把它改成橘色的' } }];
@@ -183,8 +240,8 @@ test('every message from one user stays in the same persistent conversation', as
   assert.ok(jobs[0].sessionId, '任务必须绑定会话，否则续聊无从谈起');
   assert.equal(jobs[0].sessionId, jobs[1].sessionId, '两条消息必须落在同一个会话里');
   const list = await dispatch(app, s, '/chat');
-  assert.match(list, /当前：默认会话（\S{8}）/);
-  assert.match(list, /默认会话 \[当前\]/);
+  assert.match(list, /当前：alice（\S{8}）/);
+  assert.match(list, /alice \[当前\]/);
   // 另一个用户不共享这个会话。
   const other = session({ userId: 'bob', channelId: 'bob', elements: [{ type: 'text', attrs: { content: '你好' } }] });
   assert.match(await dispatch(app, other, '/chat'), /当前：暂无/);
@@ -206,8 +263,8 @@ test('/new starts a fresh context and preserves the previous conversation for sw
   const list = await dispatch(app, s, '/chat');
   assert.match(list, /当前：新话题（\S{8}）/);
   assert.match(list, /新话题 \[当前\]/);
-  assert.match(list, /默认会话/, '旧会话保留，仍可切回');
-  assert.match(await dispatch(app, s, `/chat ${first.sessionId}`), /已切换：默认会话/);
+  assert.match(list, /alice/, '旧会话保留，仍可切回');
+  assert.match(await dispatch(app, s, `/chat ${first.sessionId}`), /已切换：alice/);
 });
 
 test('a deleted ChatGPT thread is unbound, so the next message starts a new one', async () => {
@@ -399,7 +456,7 @@ const slash = (app, text, options = {}) => dispatch(app, session({ ...options, e
 test('help lists short commands including backend selection and stays local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/backend', '/preset', '/prompt', '/draw', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/rename', '/backend', '/preset', '/prompt', '/draw', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
