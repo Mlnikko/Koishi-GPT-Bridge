@@ -125,7 +125,13 @@ async function pageStep(operation,job){
    &&(b.getAttribute('data-codex-intelligence-trigger')==='true'
     ||b.getAttribute('data-composer-navigation-target')==='reasoning'
     ||['选择 ChatGPT 模型','Select ChatGPT model'].includes(b.getAttribute('aria-label'))));
-  if(triggers.length!==1)throw Error('无法定位网页推理程度菜单，请检查 ChatGPT 模型选择器；本次未提交');
+  // The editor can mount before the model picker during page hydration.
+  // Keep this bounded by the worker's persisted attempt count, and never
+  // treat missing/ambiguous controls as permission to use another effort.
+  if(triggers.length!==1){
+   if((job.reasoningAttempts||0)<5)return {pending:true,waitingFor:'reasoning-trigger',triggerCount:triggers.length};
+   throw Error('无法定位网页推理程度菜单（匹配到 '+triggers.length+' 个候选，已等待重试），请检查 ChatGPT 模型选择器；本次未提交');
+  }
   const trigger=triggers[0];
   if(trigger.disabled||trigger.getAttribute('aria-disabled')==='true')throw Error('网页推理程度菜单不可用；本次未提交');
   if(trigger.getAttribute('aria-expanded')!=='true'){
@@ -546,6 +552,19 @@ const probeDom=()=>({
    chars:String(node.innerText||'').length,excluded:exclusion(node),selected:node===editor,score:exclusion(node)?-1:score(node),
    ancestors:ancestorChain(node),testid:node.getAttribute('data-testid'),label:node.getAttribute('aria-label')})),
   composerTag:composer?.tagName||null,sendCandidates:sendButtons.length,
+  reasoningEffort:job.reasoningEffort||'default',reasoningAttempts:job.reasoningAttempts||0,
+  // Capture only page controls, not labels from replies or conversation titles.
+  // The old send/upload-only probe could not explain model-picker failures.
+  reasoningControls:buttons().filter(b=>!b.closest?.(historySelector+', nav, aside')
+   &&(b.getAttribute('aria-haspopup')||b.getAttribute('aria-expanded')!==null
+    ||b.getAttribute('data-codex-intelligence-trigger')!==null
+    ||b.getAttribute('data-composer-navigation-target')==='reasoning'
+    ||/model|模型|reasoning|推理|thinking|思考/i.test(b.getAttribute('aria-label')||'')))
+   .slice(0,30).map(b=>({label:(b.getAttribute('aria-label')||b.innerText.trim()).slice(0,160),
+    id:b.getAttribute('id'),testid:b.getAttribute('data-testid'),visible:visible(b),disabled:!!b.disabled,
+    expanded:b.getAttribute('aria-expanded'),controls:b.getAttribute('aria-controls'),
+    intelligenceTrigger:b.getAttribute('data-codex-intelligence-trigger'),
+    navigationTarget:b.getAttribute('data-composer-navigation-target')})),
   draftMatched:!!editor && [job.draft,...(job.drafts||[])].some(text=>text && normalize(text)===normalize(editor.innerText)),
   fileInputs:Array.from(document.querySelectorAll('input[type="file"]')).map(input=>({accept:input.getAttribute('accept'),disabled:!!input.disabled})),
   buttons:buttons().map(b=>({label:b.getAttribute('aria-label')||b.innerText.trim(),disabled:!!b.disabled})).filter(b=>/send|发送|upload|上传/i.test(b.label)).slice(0,10)};

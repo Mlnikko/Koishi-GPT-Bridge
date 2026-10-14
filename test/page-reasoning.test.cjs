@@ -160,6 +160,32 @@ test('default reasoning leaves the page selection untouched', async () => {
   assert.equal((await f.step('default')).applied, true);
   assert.equal(f.opened(), 0); assert.equal(f.events.length, 0);
 });
+test('a model picker mounted after the editor is retried before selecting and verifying', async () => {
+  const f = fixture();
+  f.trigger.setAttribute('hidden', '');
+  for (let attempt = 1; attempt < 5; attempt++) {
+    const result = await f.step('medium', { reasoningAttempts: attempt });
+    assert.equal(result.pending, true); assert.equal(result.triggerCount, 0);
+    assert.equal(f.opened(), 0); assert.equal(f.events.length, 0);
+  }
+  delete f.trigger.attrs.hidden;
+  let result;
+  for (let attempt = 5; attempt <= 12; attempt++) {
+    result = await f.step('medium', { reasoningAttempts: attempt });
+    if (!result.pending) break;
+  }
+  assert.equal(result.applied, true); assert.equal(result.level, 'medium');
+});
+
+for (const count of [0, 2]) test('persistent missing or ambiguous model pickers fail without clicks: '+count, async () => {
+  const f = fixture();
+  if (!count) f.trigger.setAttribute('hidden', '');
+  else f.document.body.appendChild(el('button', { 'aria-label': '选择 ChatGPT 模型' }));
+  assert.equal((await f.step('medium', { reasoningAttempts: 1 })).pending, true);
+  assert.match((await f.step('medium', { reasoningAttempts: 5 })).error, new RegExp('匹配到 '+count+' 个候选'));
+  assert.equal(f.opened(), 0); assert.equal(f.events.length, 0);
+});
+
 test('the owned modal menu can be completed while it aria-hides the composer', async () => {
   const f = fixture();
   await f.step('xhigh');
