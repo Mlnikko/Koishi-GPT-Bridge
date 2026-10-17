@@ -20,6 +20,7 @@ test('media confirmation has a separate configurable budget and follows a longer
 test('malformed access, timing, port and retention settings fail immediately', () => {
   for (const bad of [{ allowedUsers: '*' }, { allowedUsers: [1] }, { allowedUsers: [''] },
     { groupChat: 'false' }, { notifyProgress: 'false' }, { dataDir: {} }, { dataDir: '' },
+    { skillsDir: {} }, { skillsDir: '' }, { skillsDir: 'bad\x00path' },
     { webBridgePort: -1 }, { webBridgePort: 65536 }, { webBridgePort: 1.5 },
     { sendTimeoutMs: 2147483648 }, { mediaSendTimeoutMs: 0 }, { mediaSendTimeoutMs: NaN },
     { mediaSendTimeoutMs: 2147483648 }, { replyTimeoutMs: Infinity }, { retentionDays: -1 },

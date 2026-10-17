@@ -44,6 +44,17 @@ test('model selection excludes embeddings, validates requested models and requir
   await assert.rejects(bridge.resolveModel(), /尚无聊天模型/);
 });
 
+test('memory guardrail rejection gives an actionable failure without saving a fabricated turn', async t => {
+  const { bridge, job, requests } = await fixture(t, (req, res) => {
+    res.statusCode = 400;
+    res.end(JSON.stringify({ error: { message: 'Failed to load model: insufficient system resources; requires 28.99 GB of memory' } }));
+  });
+  const task = job('aaaaaaaaaaaa');
+  await assert.rejects(bridge.run(task), error => error.code === 'lmstudio_memory' && /内存不足.*较小模型/.test(error.message));
+  assert.equal(requests.length, 1); assert.equal(bridge.history(task).turns.length, 0);
+  assert.equal(fs.existsSync(path.join(task.dir, 'result.json')), false);
+});
+
 test('context persists across restart, isolates owners/chats/sessions/models, and stores recoverable replies', async t => {
   const { bridge, requests, job } = await fixture(t, null, { apiKey: 'local-secret' });
   const first = job('aaaaaaaaaaaa');
@@ -145,6 +156,29 @@ function imageJob(job, id, input, overrides = {}) {
   return value;
 }
 const chats = requests => requests.filter(r => r.url === '/v1/chat/completions');
+
+test('skill context is pinned with presets, budgets include both, and image history never stores injected instructions', async t => {
+  const { parseSkill, skillContext } = require('../../src/core/skills.cjs');
+  const { Presets } = require('../../src/core/presets.cjs');
+  const { root, bridge, job, requests } = await fixture(t, null, { historyChars: 1500 });
+  const skill = parseSkill('---\nname: summarize\ndescription: 整理材料\n---\n保留事实与数值。', 'summarize');
+  const presets = new Presets(path.join(root, 'presets'));
+  fs.writeFileSync(path.join(presets.dir, 'role.md'), '保持角色口吻');
+  const preset = presets.read('role'), system = preset.prompt + '\n\n' + skillContext(skill);
+  const first = imageJob(job, 'skill-image', [{ type: 'image', file: 'input-0.png' }], { skill, preset });
+  await bridge.run(first);
+  assert.equal(chats(requests)[0].body.messages[0].content, system);
+  assert.equal(chats(requests)[0].body.messages[1].content[0].type, 'image_url');
+  await new LMStudioBridge({ ...bridge }).run(job('skill-next', { skill, preset, input: [{ type: 'text', text: '接着原图说' }] }));
+  const messages = chats(requests).at(-1).body.messages;
+  assert.equal(messages[0].content, system);
+  assert.equal(messages.at(-1).content, '接着原图说');
+  assert.equal(messages.filter(m => m.role === 'system').length, 1);
+  const before = requests.length;
+  await assert.rejects(bridge.run(job('skill-invalid', { skill: { ...skill, revision: 'bad' } })), /快照/);
+  await assert.rejects(bridge.run(job('skill-overflow', { skill, preset, input: [{ type: 'text', text: 'x'.repeat(1501 - system.length) }] })), /上下文字数/);
+  assert.equal(requests.length, before);
+});
 
 test('preset system prompts survive history trimming, reserve budget and remain compatible with image turns', async t => {
   const { Presets } = require('../../src/core/presets.cjs');

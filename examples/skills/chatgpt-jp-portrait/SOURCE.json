@@ -1,0 +1,15 @@
+{
+  "source": "Agent-Skill/skills/chatgpt-jp-portrait",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "f8706110bd0f25c1581dd76f5a9238ebc7d211d28ea9b823156389d69076d8ef"
+    },
+    {
+      "path": "assets/chatgpt-web-instructions.md",
+      "sha256": "457b6a38e98f951fb757a96a511c8c6077403fc2eed3285448fb3b117c79a681"
+    }
+  ],
+  "adaptation": "Inline the complete web instructions into SKILL.md; use the current bridge backend without requiring local resource access.",
+  "importedSha256": "c97faad32db3e77fb4b5a522aaf40e9cccd20e348e084c087f6e0933f99b6cb6"
+}

@@ -1,6 +1,9 @@
 # 依赖
 node_modules/
 
+# macOS 文件夹显示设置
+.DS_Store
+
 # 本机环境变量与凭据
 .env
 .env.*

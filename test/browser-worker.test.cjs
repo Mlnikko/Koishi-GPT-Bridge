@@ -65,6 +65,111 @@ function worker({state=null,results={},storageSeed={}}={}){
 const opsOf=(calls,op)=>calls.filter(call=>call.op===op);
 const routeOf=(calls,route)=>calls.filter(call=>call.route===route);
 
+test('explicit Work mode switches the page before filling even when no skill is selected',async()=>{
+ const state={id:'plain-work',mode:'work',text:'普通工作任务',images:[]};let workMode=false;
+ const {sandbox,storage,calls}=worker({state,results:(op)=>{
+  if(op==='inspect')return {editor:true,assistants:0,users:0,needsWork:!workMode,workMode};
+  if(op==='work'){workMode=true;return {};}
+  if(op==='submit')return {filled:true};if(op==='send')return {clicked:true};
+ }});
+ await wait();for(let i=0;i<5;i++)await sandbox.tick();
+ assert.equal(storage.current.mode,'work');assert.equal(opsOf(calls,'work').length,1);
+ assert.equal(opsOf(calls,'skill').length,0);assert.equal(opsOf(calls,'chat').length,0);
+ assert.equal(opsOf(calls,'send').length,1);assert.equal(opsOf(calls,'submit')[0].job.mode,'work');
+ assert.ok(calls.findIndex(c=>c.op==='work')<calls.findIndex(c=>c.op==='submit'));
+});
+
+test('a restored Work thread waits for history before using mode controls and resumes after its shell mounts',async()=>{
+ const state={id:'work-loading',mode:'work',text:'正文',threadId:THREAD,images:[]};
+ const current={...state,tabId:1,phase:'opening',openedAt:Date.now()-16000};let workMode=false;
+ const {sandbox,storage,calls}=worker({state,storageSeed:{current},results:op=>{
+  if(op==='inspect')return {editor:true,threadId:THREAD,assistants:1,users:1,needsWork:!workMode,workMode};
+  if(op==='work')return {pending:true,waitingFor:'work-mode-control'};
+  if(op==='submit')return {filled:true};if(op==='send')return {clicked:true};
+ }});
+ await wait();assert.equal(opsOf(calls,'work').length,0,'a first empty shell observation cannot select the mode');
+ await sandbox.tick();assert.equal(storage.current.phase,'opening');assert.ok(storage.current.modeWaitAt);
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(routeOf(calls,'/failure').length,0);
+ workMode=true;await sandbox.tick();await sandbox.tick();
+ assert.equal(storage.current.modeWaitAt,undefined);assert.equal(opsOf(calls,'send').length,1);
+});
+
+test('native skill selection completes before filling and its evidence survives worker suspension',async()=>{
+ const state={id:'native-skill',text:'只要手部特写提示词',skill:{name:'chatgpt-jp-portrait'},images:[]};
+ let selected=false;
+ const {sandbox,storage,calls}=worker({state,results:(op)=>{
+  if(op==='inspect')return {editor:true,assistants:0,users:0};
+  if(op==='skill'){
+   if(!selected){selected=true;return {pending:true,query:'@chatgpt jp portrait'};}
+   return {applied:true,id:'installed-skill-id',name:'chatgpt jp portrait'};
+  }
+  if(op==='submit')return {filled:true};
+  if(op==='send')return {clicked:true};
+ }});
+ await wait();await sandbox.tick();
+ assert.equal(storage.current.phase,'skill');
+ assert.equal(opsOf(calls,'submit').length,0);
+ await sandbox.tick();
+ assert.equal(storage.current.skillApplied.id,'installed-skill-id');
+ // A resumed worker reads the durable state rather than injecting SKILL.md or
+ // treating the mention's display label as a foreign draft.
+ await sandbox.tick();await sandbox.tick();
+ const filled=opsOf(calls,'submit')[0];
+ assert.equal(filled.job.message,state.text);
+ assert.deepEqual(filled.job.skillApplied,{id:'installed-skill-id',name:'chatgpt jp portrait'});
+ assert.equal(opsOf(calls,'send').length,1);
+ assert.ok(calls.findIndex(c=>c.op==='skill')<calls.findIndex(c=>c.op==='submit'));
+});
+
+test('a native skill that never becomes a confirmed token cannot fill or send a message',async()=>{
+ const current={id:'native-timeout',tabId:1,phase:'skill',openedAt:Date.now(),skill:{name:'missing'},skillAttempts:15,text:'原文'};
+ const {sandbox,calls}=worker({state:{id:current.id,text:'原文',skill:current.skill},storageSeed:{current},results:{probe:{}}});
+ await wait();
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
+ assert.match(routeOf(calls,'/failure')[0].body.message,/@技能选择超时/);
+});
+
+for(const userSwitches of [false,true])
+test('native skill focus restores the previous tab and respects a user tab switch: '+userSwitches,async()=>{
+ const state={id:'native-focus',text:'正文',images:[],skill:{name:'chatgpt-jp-portrait'}};
+ const updates=[];let active=99;
+ const {sandbox,storage,calls}=worker({state,results:op=>op==='inspect'?{editor:true,assistants:0,users:0}:
+  op==='skill'?{applied:true,id:'native-id',name:'chatgpt jp portrait'}:{}});
+ sandbox.chrome.tabs.get=async()=>({url:'https://chatgpt.com/',windowId:2,active:active===1});
+ sandbox.chrome.tabs.query=async()=>[{id:active}];
+ sandbox.chrome.tabs.update=async id=>{updates.push(id);active=id;};
+ await wait();await sandbox.tick();
+ assert.deepEqual(updates,[1]);assert.equal(storage.current.skillPreviousTab,99);
+ if(userSwitches)active=88;
+ await sandbox.tick();
+ if(userSwitches){
+  assert.equal(active,88);assert.equal(opsOf(calls,'submit').length,0);
+  assert.match(routeOf(calls,'/failure')[0].body.message,/焦点已变化/);
+ }else{
+  assert.equal(active,99);assert.deepEqual(updates,[1,99]);
+  assert.equal(storage.current.skillApplied.id,'native-id');
+ }
+});
+
+for(const userSwitches of [false,true])
+test('native skill selection also focuses Chrome and restores the prior application: '+userSwitches,async()=>{
+ const state={id:'native-window',text:'正文',images:[],skill:{name:'chatgpt-jp-portrait'}};
+ const changes=[];let focused=false,active=99;
+ const {sandbox,storage,calls}=worker({state,results:op=>op==='inspect'?{editor:true,assistants:0,users:0}:
+  op==='skill'?{applied:true,id:'native-id',name:'chatgpt jp portrait'}:{}});
+ sandbox.chrome.tabs.get=async()=>({url:'https://chatgpt.com/',windowId:2,active:active===1});
+ sandbox.chrome.tabs.query=async()=>[{id:active}];
+ sandbox.chrome.tabs.update=async id=>{active=id;};
+ sandbox.chrome.windows={get:async()=>({id:2,focused}),getLastFocused:async()=>({id:2,focused:false}),
+  update:async(id,options)=>{changes.push({id,focused:options.focused});focused=options.focused;}};
+ await wait();await sandbox.tick();assert.equal(focused,true);assert.equal(active,1);
+ if(userSwitches)focused=false;
+ await sandbox.tick();
+ assert.equal(focused,false);assert.equal(opsOf(calls,'submit').length,0);
+ if(userSwitches){assert.equal(changes.length,1);assert.match(routeOf(calls,'/failure')[0].body.message,/窗口焦点已变化/);}
+ else {assert.deepEqual(changes,[{id:2,focused:true},{id:2,focused:false}]);assert.equal(active,99);assert.ok(storage.current.skillApplied);}
+});
+
 test('idle polling keeps the heartbeat without repeating identical persistent storage writes',async()=>{
  const {sandbox,storage,calls}=worker();await wait();
  let writes=0;const set=sandbox.chrome.storage.local.set;

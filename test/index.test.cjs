@@ -116,7 +116,7 @@ const bridgeOf = async root => {
 };
 
 test('all conversation creation routes default to the username', async () => {
-  for (const command of ['/new', '/backend', '/reasoning high', '/prompt 角色海报', '/preset 测试角色', undefined]) {
+  for (const command of ['/new', '/backend', '/reasoning high', '/prompt 角色海报', '/preset 测试角色', '/skill summarize-text', undefined]) {
     const app = apply();
     fs.writeFileSync(path.join(app.root, 'presets', '测试角色.md'), '角色设定');
     const s = Object.assign(session({ elements: [{ type: 'text', attrs: { content: '你好' } }] }), { username: ' 小明 ' });
@@ -289,7 +289,7 @@ test('a deleted ChatGPT thread is unbound, so the next message starts a new one'
   assert.equal(failed.status, 'failed');
   assert.equal(failed.errorCode, 'thread_gone');
   const saved = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'), 'utf8'));
-  assert.equal(saved.items[0].webThreadId, undefined, '失效的网页会话必须解绑，否则这个用户会被永久卡死');
+  assert.equal(saved.items[0].contexts.chat.webThreadId, undefined, '失效的网页会话必须解绑，否则这个用户会被永久卡死');
   assert.ok(saved.items[0].id);
 });
 
@@ -453,15 +453,35 @@ test('the plugin refuses to load without an allowedUsers list', () => {
 
 const slash = (app, text, options = {}) => dispatch(app, session({ ...options, elements: [{ type: 'text', attrs: { content: text } }] }), text);
 
-test('help lists short commands including backend selection and stays local and authorized', async () => {
+test('daily help lists only common commands and stays local and authorized', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
   const help = await slash(app, '/help');
-  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/new', '/chat', '/rename', '/backend', '/preset', '/prompt', '/draw', '/close', '/status', '/stop', '/retry', '/logs', '/reasoning']);
+  assert.deepEqual(help.match(/^\/[a-z]+/gm), ['/help', '/mode', '/new', '/chat', '/status', '/stop']);
   assert.equal(app.stages.some(s => s.kind === 'command'), false, 'short commands must not register bare words in Koishi');
   assert.equal(await dispatch(app, session(), '/help'), help);
   assert.equal(await slash(app, '/help', { userId: 'bob' }), undefined);
   assert.equal(await slash(app, '/help', { isDirect: false }), undefined);
   assert.equal(await slash(app, '/help', { isDirect: false, stripped: { appel: true, content: '/help' } }), help);
+  assert.deepEqual(jobFiles(app.root), []);
+});
+
+test('mode help stays concise, advanced commands remain available, and invalid switches do not generate', async t => {
+  const provider = await localServer(t), app = apply({ allowedUsers: ['alice'], lmStudioBaseUrl: provider.url, groupChat: true });
+  assert.match(await slash(app, '/mode'), /当前模式：聊天/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.match(await slash(app, '/mode 工作'), /已切换到工作/);
+  assert.deepEqual((await slash(app, '/help')).match(/^\/[a-z]+/gm), ['/help', '/mode', '/new', '/chat', '/status', '/stop', '/skill']);
+  assert.match(await slash(app, '/help all'), /\/backend[\s\S]*\/reasoning|\/reasoning[\s\S]*\/backend/);
+  assert.match(await slash(app, '/model'), /local-chat/);
+  assert.match(await slash(app, '/mode 本地'), /已切换到本地模型：local-chat/);
+  const help = await slash(app, '/help'); assert.match(help, /^\/model/gm); assert.match(help, /^\/preset/gm);
+  assert.match(await slash(app, '/mode Chat'), /已切换到聊天/);
+  for (const bad of ['/mode unknown', '/mode 聊天 model', '/mode 本地 a b', '/model a b'])
+    assert.match(await slash(app, bad), /用法/);
+  for (const command of ['/mode 工作', '/model local-chat']) {
+    assert.equal(await slash(app, command, { userId: 'mallory' }), undefined);
+    assert.equal(await slash(app, command, { isDirect: false, stripped: { appel: false, content: command } }), undefined);
+  }
   assert.deepEqual(jobFiles(app.root), []);
 });
 
@@ -504,7 +524,7 @@ test('removed Chinese commands only show the migration notice and never create j
 
 test('all short commands remain gated by private authorization and group mentions', async () => {
   const app = apply({ allowedUsers: ['alice'], groupChat: true });
-  for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/preset', '/preset show', '/preset role',
+  for (const text of ['/help', '/new', '/chat', '/backend lmstudio', '/skill', '/skill show summarize-text', '/skill summarize-text', '/skill off', '/preset', '/preset show', '/preset role',
     '/preset create role\n正文', '/preset edit role\n正文', '/preset delete role', '/prompt', '/prompt 角色海报', '/prompt preview 英雄', '/draw 英雄', '/close', '/status', '/stop', '/retry', '/logs off', '/reasoning high']) {
     assert.equal(await slash(app, text, { userId: 'mallory' }), undefined);
     assert.equal(await slash(app, text, { isDirect: false, channelId: 'group', stripped: { appel: false, content: text } }), undefined);
@@ -521,11 +541,11 @@ test('/reasoning stays local, validates input and follows the selected conversat
   assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
   assert.match(await slash(app, '/REASONING 高'), /已设为：高/);
   const first = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
-  assert.equal(first.reasoningEffort, 'high');
+  assert.equal(first.contexts.chat.reasoningEffort, 'high');
   assert.match(await slash(app, '/reasoning', { userId: 'bob' }), /跟随网页/);
   assert.match(await slash(app, '/reasoning', { isDirect: false, channelId: 'group', stripped: { appel: true } }), /跟随网页/);
   await slash(app, '/new second');
-  assert.match(await slash(app, '/reasoning'), /跟随网页/);
+  assert.match(await slash(app, '/reasoning'), /当前会话推理程度：高/);
   await slash(app, `/chat ${first.id}`);
   assert.match(await slash(app, '/reasoning'), /当前会话推理程度：高/);
   assert.match(await slash(app, '/reasoning default'), /跟随网页/);
@@ -559,9 +579,9 @@ test('/reasoning changes only future jobs and the snapshot reaches the browser b
   await settle(app.root);
 });
 
-test('bare words, unknown slash text and command-looking image captions are forwarded as content', async () => {
+test('bare words and image captions are forwarded; unknown slash commands return local help', async () => {
   const app = apply({ notifyProgress: false });
-  for (const text of ['new', 'stop', 'status', '/stopping', '桥接状态正常吗？']) {
+  for (const text of ['new', 'stop', 'status', '桥接状态正常吗？']) {
     await slash(app, text, { messageId: text });
     await settle(app.root);
   }
@@ -571,7 +591,9 @@ test('bare words, unknown slash text and command-looking image captions are forw
   await dispatch(app, s, '/stop');
   await settle(app.root);
   const jobs = jobFiles(app.root);
-  assert.equal(jobs.length, 6);
+  assert.equal(jobs.length, 5);
+  assert.match(await slash(app, '/stopping'), /没有这个命令.*\/help/);
+  assert.equal(jobFiles(app.root).length, 5);
   assert.deepEqual(jobs.find(j => j.messageId === 'caption').input.map(s => s.type), ['text', 'image']);
   assert.equal(jobs.find(j => j.messageId === 'caption').input[0].text, '/stop');
 });
@@ -859,6 +881,189 @@ async function localServer(t, onChat) {
   return { url: `http://127.0.0.1:${server.address().port}/v1`, requests };
 }
 
+test('three modes route through shared delivery, resume separate histories after restart and never send skills in Chat', async t => {
+  const provider = await localServer(t);
+  let app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const workThread = '99999999-2222-3333-4444-555555555555';
+  const webTurn = async (text, mode, threadId, expectedThread, skill) => {
+    const { port, token } = await bridgeOf(app.root);
+    const call = async (route, body) => (await fetch(`http://127.0.0.1:${port}` + route, {
+      method: body ? 'POST' : 'GET', headers: { 'x-bridge-token': token, 'x-bridge-capabilities': 'web-modes,native-skills,reasoning', 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })).json();
+    await call('/state');
+    const s = session({ messageId: text, elements: [{ type: 'text', attrs: { content: text } }] });
+    assert.equal(await dispatch(app, s), undefined);
+    let job;
+    for (let i = 0; i < 100 && !job; i++) { job = (await call('/state')).job; if (!job) await wait(); }
+    assert.ok(job); assert.equal(job.mode, mode); assert.equal(job.threadId, expectedThread || '');
+    assert.equal(job.text, text); assert.equal(job.skill?.name, skill);
+    assert.match(await slash(app, '/mode 本地'), /正在处理任务/);
+    assert.match(await slash(app, '/skill summarize-text'), /正在处理任务/);
+    await call('/result', { id: job.id, threadId, segments: [{ type: 'text', text: mode + ' reply' }] });
+    await settle(app.root); assert.deepEqual(s.sent, [mode + ' reply']); return job;
+  };
+  const first = await webTurn('Chat first', 'chat', THREAD, undefined);
+  await slash(app, '/mode 工作'); await webTurn('Work first', 'work', workThread, undefined);
+  await slash(app, '/skill summarize-text'); await slash(app, '/mode 本地');
+  const localText = async text => {
+    const s = session({ messageId: text, elements: [{ type: 'text', attrs: { content: text } }] });
+    assert.equal(await dispatch(app, s), undefined); await settle(app.root);
+    assert.deepEqual(s.sent, ['本地回答 ' + text]);
+  };
+  await localText('Local first'); assert.equal(provider.requests[0].messages.length, 1);
+  await slash(app, '/mode 聊天');
+  // Chat must not load a remembered Work skill or inject it as plain text.
+  const skillFile = path.join(app.root, 'skills', 'summarize-text', 'SKILL.md');
+  const content = fs.readFileSync(skillFile); fs.unlinkSync(skillFile);
+  await webTurn('Chat second', 'chat', THREAD, THREAD); fs.writeFileSync(skillFile, content);
+  const root = app.root; for (const dispose of app.disposes) dispose();
+  // Port 0 chooses a new endpoint on restart; wait for its fresh port record.
+  fs.rmSync(path.join(root, 'web-bridge-port'));
+  app = apply({ dataDir: root, lmStudioBaseUrl: provider.url, notifyProgress: false });
+  await slash(app, '/mode 工作'); await webTurn('Work second', 'work', workThread, workThread, 'summarize-text');
+  await slash(app, '/mode 本地'); await localText('Local second');
+  assert.deepEqual(provider.requests[1].messages.map(message => message.content), ['Local first', '本地回答 Local first', 'Local second']);
+  const sessionId = jobFiles(root).find(job => job.id === first.id).sessionId;
+  assert.ok(sessionId); assert.ok(jobFiles(root).every(job => job.sessionId === sessionId));
+  const saved = JSON.parse(fs.readFileSync(path.join(root, 'conversations.json'))).items[0];
+  assert.equal(saved.contexts.chat.webThreadId, THREAD); assert.equal(saved.contexts.work.webThreadId, workThread);
+  assert.equal(saved.contexts.local.skill, undefined); assert.equal(saved.contexts.work.skill, 'summarize-text');
+});
+
+test('mode switching is blocked while image preparation owns the conversation', async () => {
+  const { createBot } = require('../src/app/bot.cjs');
+  const { Conversations } = require('../src/core/conversations.cjs');
+  const { normalizeConfig } = require('../src/core/config.cjs');
+  const { downloadImage } = require('../src/lib/image.cjs');
+  const root = temp(), chats = new Conversations(path.join(root, 'conversations.json'));
+  const config = normalizeConfig({ allowedUsers: ['alice'], dataDir: root, notifyProgress: false }, root);
+  let release; const gate = new Promise(resolve => { release = resolve; });
+  const bot = createBot(config, { chats, presets: {}, skills: {}, preferences: { enabled: () => false },
+    web: { run: async () => { throw Error('offline'); }, close: () => {} }, local: {}, logger: { warn: () => {} },
+    imageLoader: async (...args) => { await gate; return downloadImage(...args); } });
+  const s = session({ messageId: 'preparing', elements: [{ type: 'img', attrs: { src: png() } }] });
+  try {
+    const pending = bot.forward(s);
+    assert.equal(bot.busy(bot.currentChat(s).id), true);
+    await assert.rejects(bot.switchMode(s, 'work'), /正在处理任务/);
+    release(); await pending; await settle(root);
+    assert.equal(jobFiles(root)[0].mode, 'chat');
+  } finally { release(); bot.close(); }
+});
+
+test('skill commands browse without generation, isolate conversations and persist through new chats and restart', async () => {
+  const app = apply({ groupChat: true });
+  assert.match(await slash(app, '/skill'), /未启用[\s\S]*summarize-text/);
+  assert.match(await slash(app, '/skill show summarize-text'), /主要结论|主要.*结论/);
+  assert.equal(fs.existsSync(path.join(app.root, 'conversations.json')), false);
+  assert.match(await slash(app, '/skill summarize-text'), /已选择技能/);
+  assert.match(await slash(app, '/skill @chatgpt jp portrait'), /已选择技能：chatgpt-jp-portrait[\s\S]*原生 @技能/);
+  assert.match(await slash(app, '/skill @summarize text'), /已选择技能：summarize-text/);
+  assert.match(await slash(app, '/status'), /当前技能：summarize-text/);
+  const first = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
+  assert.match(await slash(app, '/skill', { userId: 'bob' }), /未启用/);
+  assert.match(await slash(app, '/skill', { isDirect: false, channelId: 'group', stripped: { appel: true } }), /未启用/);
+  assert.match(await slash(app, '/new 新话题'), /沿用技能：summarize-text/);
+  await slash(app, '/skill off'); assert.match(await slash(app, '/skill'), /未启用/);
+  await slash(app, `/chat ${first.id}`); assert.match(await slash(app, '/skill'), /当前技能：summarize-text/);
+  for (const dispose of app.disposes) dispose();
+  const rebooted = apply({ dataDir: app.root });
+  assert.match(await slash(rebooted, '/skill'), /当前技能：summarize-text/);
+  assert.deepEqual(jobFiles(app.root), []);
+  const file = path.join(app.root, 'skills', 'summarize-text', 'SKILL.md');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8') + '\n' + '😀'.repeat(2600) + '\n末尾<at id="bot"/> &内容');
+  const show = await slash(rebooted, '/skill show');
+  const pages = Number(/第 1\/(\d+) 页/.exec(show)[1]); assert.ok(pages > 1);
+  const last = await slash(rebooted, `/skill show --page ${pages}`);
+  assert.match(last, /末尾&lt;at id="bot"\/&gt; &amp;内容/); assert.ok(last.length <= 1500);
+  for (const value of ['off extra', 'list zero', 'show --page 0', 'summarize-text\nbody', '../secret'])
+    assert.match(await slash(rebooted, '/skill ' + value), /用法|名称/);
+  assert.match(await slash(rebooted, '/skill list 9999'), /只有.*页/);
+});
+
+test('an @ skill command reaches the webpage as a native name with the original message only', async () => {
+  const app = apply({ notifyProgress: false }), { port, token } = await bridgeOf(app.root);
+  const call = async (route, body) => (await fetch(`http://127.0.0.1:${port}` + route, {
+    method: body ? 'POST' : 'GET', headers: { 'x-bridge-token': token, 'x-bridge-capabilities': 'reasoning,native-skills,web-modes', 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })).json();
+  await call('/state');
+  await slash(app, '/skill @chatgpt jp portrait');
+  const text = 'P03 + C04，白色陶瓷杯，只要提示词。';
+  await dispatch(app, session({ messageId: 'native-command', elements: [{ type: 'text', attrs: { content: text } }] }));
+  await wait(); const { job } = await call('/state');
+  assert.equal(job.text, text); assert.deepEqual(job.skill, { name: 'chatgpt-jp-portrait' });
+  assert.ok(!JSON.stringify(job).includes('instructions'));
+  await call('/result', { id: job.id, threadId: THREAD, segments: [{ type: 'text', text: '手部特写提示词' }] });
+  const [saved] = await settle(app.root); assert.equal(saved.input[0].text, text);
+  assert.equal(saved.delivery, 'sent');
+});
+
+test('LM Studio receives the selected skill with presets while user history stays original; invalid skills never submit', async t => {
+  const provider = await localServer(t), app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  await slash(app, '/backend lmstudio'); await slash(app, '/preset create role\n保持角色口吻。');
+  await slash(app, '/preset role'); await slash(app, '/skill summarize-text');
+  const s = session({ messageId: 'skill-first', elements: [{ type: 'text', attrs: { content: '我的原文材料' } }] });
+  await dispatch(app, s); await settle(app.root);
+  const messages = provider.requests[0].messages;
+  assert.equal(messages[0].role, 'system');
+  assert.match(messages[0].content, /保持角色口吻[\s\S]*summarize-text/);
+  assert.equal(messages[1].content, '我的原文材料');
+  const first = jobFiles(app.root)[0];
+  assert.match(await slash(app, `/status ${first.id}`), /技能：summarize-text（版本/);
+  const file = path.join(app.root, 'skills', 'summarize-text', 'SKILL.md');
+  const original = fs.readFileSync(file, 'utf8');
+  fs.writeFileSync(file, original + '\n编辑后的规则。');
+  s.messageId = 'skill-edited'; await dispatch(app, s); await settle(app.root);
+  assert.match(provider.requests[1].messages[0].content, /编辑后的规则/);
+  assert.equal(provider.requests[1].messages[1].content, '我的原文材料');
+  assert.doesNotMatch(jobFiles(app.root).find(j => j.id === first.id).skill.instructions, /编辑后的规则/);
+  fs.writeFileSync(file, original + '\n' + '字'.repeat(12500));
+  s.messageId = 'skill-overflow'; assert.match(await dispatch(app, s), /上下文字数/);
+  fs.unlinkSync(file); s.messageId = 'skill-missing';
+  assert.match(await dispatch(app, s), /未找到技能/); assert.equal(provider.requests.length, 2);
+  assert.equal(jobFiles(app.root).length, 2);
+  await slash(app, '/skill off'); s.messageId = 'skill-off';
+  await dispatch(app, s); await settle(app.root);
+  assert.equal(provider.requests.at(-1).messages[0].content, '保持角色口吻。');
+});
+
+test('queued messages retain their skill and busy conversations refuse skill switches', async t => {
+  let reached, release;
+  const started = new Promise(resolve => { reached = resolve; });
+  const provider = await localServer(t, (body, res) => {
+    if (!release) { release = () => res.end('{"choices":[{"message":{"content":"done"}}]}'); reached(); }
+    else res.end('{"choices":[{"message":{"content":"done"}}]}');
+  });
+  const app = apply({ lmStudioBaseUrl: provider.url, notifyProgress: false });
+  const a = session({ messageId: 'skill-running', elements: [{ type: 'text', attrs: { content: 'a' } }] });
+  const b = session({ userId: 'bob', messageId: 'skill-queued', elements: [{ type: 'text', attrs: { content: 'b' } }] });
+  for (const s of [a, b]) { await dispatch(app, s, '/backend lmstudio'); await dispatch(app, s, '/skill summarize-text'); }
+  await dispatch(app, a); await started; await dispatch(app, b);
+  assert.equal(jobFiles(app.root).find(j => j.messageId === b.messageId).status, 'queued');
+  assert.match(await dispatch(app, a, '/skill off'), /正在处理任务/);
+  assert.match(await dispatch(app, b, '/skill off'), /正在处理任务/);
+  assert.match(await dispatch(app, b, '/skill show'), /summarize-text/);
+  fs.unlinkSync(path.join(app.root, 'skills', 'summarize-text', 'SKILL.md'));
+  release(); await settle(app.root);
+  assert.equal(provider.requests.length, 2);
+  assert.equal(provider.requests[0].messages[0].content, provider.requests[1].messages[0].content);
+  assert.ok(jobFiles(app.root).every(j => j.skill.instructions.length > 0 && j.delivery === 'sent'));
+});
+
+test('explicit skill libraries are read-only and missing roots fail before starting the bridge', async () => {
+  const root = temp(), library = path.join(root, 'curated'); fs.mkdirSync(library);
+  const app = apply({ skillsDir: library });
+  assert.match(await slash(app, '/skill'), /暂无可用技能/);
+  assert.deepEqual(fs.readdirSync(library), []);
+  assert.equal(fs.existsSync(path.join(app.root, 'skills')), false);
+  const missing = path.join(root, 'missing'), built = harness();
+  assert.throws(() => plugin.apply(built.ctx, { allowedUsers: ['*'], dataDir: path.join(root, 'data'), skillsDir: missing, webBridgePort: 0 }));
+  assert.equal(fs.existsSync(path.join(root, 'data', 'web-bridge-port')), false);
+  assert.equal(fs.existsSync(missing), false);
+});
+
 test('QQ-created presets are public, creator-managed and selected independently by each user and session', async t => {
   const provider = await localServer(t);
   const config = { lmStudioBaseUrl: provider.url, notifyProgress: false, groupChat: true };
@@ -951,7 +1156,7 @@ test('preset commands bind per conversation, reread local edits, inherit on /new
   const file = name => path.join(app.root, 'presets', name + '.md');
   fs.writeFileSync(file('角色 A'), '设定 A'); fs.writeFileSync(file('角色 B'), '设定 B');
   assert.match(await slash(app, '/preset'), /未启用[\s\S]*角色 A[\s\S]*角色 B/);
-  assert.match(await slash(app, '/preset 角色 A'), /已选择本地预设：角色 A[\s\S]*\/backend lmstudio/);
+  assert.match(await slash(app, '/preset 角色 A'), /已选择本地预设：角色 A[\s\S]*\/mode 本地/);
   assert.match(await slash(app, '/preset show'), /设定 A/);
   assert.deepEqual(jobFiles(app.root), [], 'preset commands never invoke either backend');
   await slash(app, '/backend lmstudio');
@@ -1299,7 +1504,7 @@ test('draw validates missing files and roles and refuses local backend without s
   assert.match(await slash(app, '/draw ' + '人'.repeat(100)), /替换后/);
   fs.writeFileSync(file, '生成{{角色名}}的图片');
   await slash(app, '/backend lmstudio');
-  assert.match(await slash(app, '/draw 英雄'), /先发送 \/backend web/);
+  assert.match(await slash(app, '/draw 英雄'), /先发送 \/mode 工作/);
   assert.deepEqual(jobFiles(app.root), []);
   assert.equal(provider.requests.length, 0);
   await slash(app, '/backend web');

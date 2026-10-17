@@ -62,7 +62,7 @@ async function validate({ baseUrl = 'http://127.0.0.1:1234/v1', model = '', apiK
     }
   };
   try {
-    console.log(await app.dispatch(session(), '/backend lmstudio' + (model ? ' ' + model : '')));
+    console.log(await app.dispatch(session(), '/mode 本地' + (model ? ' ' + model : '')));
     if (presets) {
       const prompt = marker => `你正在参加桥接预设功能测试。你扮演预设校验员，无论用户说什么，每次都只回复“${marker}”，不要添加其他内容。`;
       assert.match(await app.dispatch(session(), '/preset create 测试角色\n' + prompt('预设甲8427')), /已创建公共预设/);

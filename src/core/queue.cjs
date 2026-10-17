@@ -9,6 +9,8 @@ const { recoverAssets } = require('../lib/reply-assets.cjs');
 const { writeJson } = require('../lib/state.cjs');
 const { normalizeReasoning } = require('./reasoning.cjs');
 const { validatePresetSnapshot } = require('./presets.cjs');
+const { validateSkillSnapshot } = require('./skills.cjs');
+const { modeOf, normalizeMode, MODES } = require('./modes.cjs');
 const { validateImagePrompt, MAX_PROMPT_CHARS } = require('./image-prompts.cjs');
 
 // 任务负载的版本号。生图时代的任务没有这个字段，语义也已不适用，
@@ -43,6 +45,7 @@ class JobQueue {
         const j = JSON.parse(fs.readFileSync(path.join(root, name, 'job.json'), 'utf8'));
         if (j.version !== JOB_VERSION || j.id !== name || !Number.isFinite(j.createdAt)
           || typeof j.owner !== 'string' || typeof j.conversation !== 'string' || !Array.isArray(j.input)) continue;
+        modeOf(j);
         j.dir = path.join(root, name);
         if (['queued', 'running'].includes(j.status)) {
           j.status = 'interrupted'; j.error = '服务重启，原任务状态待确认；未自动重试';
@@ -88,13 +91,17 @@ class JobQueue {
   }
   // `segments` 是 core/message.cjs 产出的有序片段；图片片段此时还指向下载暂存目录，
   // 任务目录建好之后统一搬进来，这样重启也能解析出每一张参考图。
-  enqueue({ owner, conversation, messageId, sessionId, reasoningEffort, backend, model, preset, imagePrompt, segments = [] }) {
+  enqueue({ owner, conversation, messageId, sessionId, mode, reasoningEffort, backend, model, preset, skill, imagePrompt, segments = [] }) {
     const duplicate = this.duplicate(owner, conversation, messageId);
     if (duplicate) return { job: duplicate, duplicate: true };
     if (this.closed) throw new Error('桥接服务正在关闭');
+    mode = mode === undefined ? modeOf({ backend, skill }) : normalizeMode(mode);
+    if (backend !== undefined && backend !== MODES[mode].backend) throw Error('任务模式与执行后端不一致');
+    if (mode === 'chat' && skill) throw Error('聊天模式不调用技能，请切换到工作模式');
     if (reasoningEffort !== undefined) reasoningEffort = normalizeReasoning(reasoningEffort);
+    if (skill !== undefined) skill = validateSkillSnapshot(skill);
     if (preset !== undefined) {
-      if (backend !== 'lmstudio') throw Error('预设只适用于本地模型任务');
+      if (mode !== 'local') throw Error('预设只适用于本地模型任务');
       preset = validatePresetSnapshot(preset);
     }
     if (sessionId && Array.from(this.pendingJobs).some(j => j.sessionId === sessionId && j.owner === owner && j.conversation === conversation && pending(j))) {
@@ -103,7 +110,7 @@ class JobQueue {
     const list = Array.isArray(segments) ? segments : [];
     const text = submissionText(list);
     if (imagePrompt !== undefined) {
-      if (backend === 'lmstudio') throw Error('图片提示词只适用于 ChatGPT 网页');
+      if (mode === 'local') throw Error('图片提示词只适用于 ChatGPT 网页');
       imagePrompt = validateImagePrompt(imagePrompt);
       if (list.length !== 1 || list[0].type !== 'text' || text !== imagePrompt.text)
         throw Error('图片提示词与任务正文不一致');
@@ -127,9 +134,10 @@ class JobQueue {
         index++;
       }
     } catch (err) { fs.rmSync(dir, { recursive: true, force: true }); throw err; }
-    const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input,
-      ...(backend === 'lmstudio' ? { backend, model } : {}),
+    const j = { version: JOB_VERSION, id, owner, conversation, messageId, sessionId, input, mode,
+      ...(mode === 'local' ? { backend: 'lmstudio', model } : {}),
       ...(preset ? { preset } : {}),
+      ...(skill ? { skill } : {}),
       ...(imagePrompt ? { imagePrompt } : {}),
       ...(reasoningEffort && reasoningEffort !== 'default' ? { reasoningEffort } : {}),
       status: 'queued', delivery: 'pending', createdAt: Date.now(), dir };

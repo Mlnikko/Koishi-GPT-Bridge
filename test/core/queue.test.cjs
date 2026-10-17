@@ -6,6 +6,24 @@ const path = require('node:path');
 const { JobQueue, JOB_VERSION } = require('../../src/core/queue.cjs');
 const root = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-queue-test-'));
 const input = id => ({ owner: 'alice', conversation: 'qq:alice', messageId: id, segments: [{ type: 'text', text: 'a cat' }] });
+
+test('web and local skill snapshots survive edits, deduplication and restart without touching user input', () => {
+  const { parseSkill } = require('../../src/core/skills.cjs');
+  const dir = root(), q = new JobQueue(dir, () => assert.fail('must not submit'));
+  const skill = parseSkill('---\nname: summarize\ndescription: 整理\n---\n原始技能指令', 'summarize');
+  assert.throws(() => q.enqueue({ ...input('bad'), skill: { ...skill, instructions: 'tampered' } }), /快照/);
+  const first = q.enqueue({ ...input('web'), skill }).job;
+  const second = q.enqueue({ ...input('local'), backend: 'lmstudio', model: 'local', skill }).job;
+  skill.instructions = 'changed';
+  assert.equal(first.skill.instructions, '原始技能指令');
+  assert.equal(second.skill.instructions, '原始技能指令');
+  assert.equal(q.enqueue({ ...input('web'), skill }).job, first);
+  assert.equal(first.input[0].text, 'a cat');
+  const restored = new JobQueue(dir, () => assert.fail('must not submit'));
+  assert.equal(restored.jobs.length, 2);
+  assert.ok(restored.jobs.every(j => j.skill.instructions === '原始技能指令' && j.status === 'interrupted'));
+  q.close(); restored.close();
+});
 for (const [ext, bytes] of [
   ['png', require('../../scripts/vision-fixture.cjs').visionPng({ width: 32, height: 32 })],
   ['gif', require('../helpers/media.cjs').animatedGif()],
