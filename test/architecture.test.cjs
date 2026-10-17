@@ -13,12 +13,14 @@ const srcDir = path.join(projectRoot, 'src');
 //   lib/    通用工具，不依赖项目内任何模块
 //   core/   领域逻辑，可用 lib
 //   bridge/ 本机 HTTP 桥接，可用 core 与 lib
-//   index   插件入口，可用全部
-const LAYERS = { lib: 0, core: 1, bridge: 2 };
+//   app/    应用编排，注入会话、连接器与 QQ 回传
+//   commands/ 命令及帮助，只调用应用和领域接口
+//   index   插件装配入口
+const LAYERS = { lib: 0, core: 1, bridge: 2, app: 3, commands: 4 };
 const ENTRY = 'index.cjs';
 const layerOf = rel => {
   const first = rel.split('/')[0];
-  if (first === ENTRY) return 3;
+  if (first === ENTRY) return 5;
   return LAYERS[first];
 };
 
@@ -65,6 +67,24 @@ test('依赖方向只能自上而下', () => {
     }
   }
   assert.deepEqual(violations, [], `存在反向依赖：\n${violations.join('\n')}`);
+});
+
+test('命令模块不得直接依赖传输适配器', () => {
+  const leaks = [...graph].flatMap(([module, deps]) => module.startsWith('commands/')
+    ? deps.filter(dep => dep.startsWith('bridge/')).map(dep => module + ' → ' + dep) : []);
+  assert.deepEqual(leaks, []);
+});
+
+test('运行时模块没有循环依赖', () => {
+  const visited = new Set(), visiting = new Set();
+  const visit = (module, chain = []) => {
+    assert.ok(!visiting.has(module), '循环依赖：' + [...chain, module].join(' → '));
+    if (visited.has(module)) return;
+    visiting.add(module);
+    for (const dependency of graph.get(module)) visit(dependency, [...chain, module]);
+    visiting.delete(module); visited.add(module);
+  };
+  for (const module of modules) visit(module);
 });
 
 test('lib 层不依赖项目内任何其他分层', () => {

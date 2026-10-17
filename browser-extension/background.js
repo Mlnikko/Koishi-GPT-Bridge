@@ -69,6 +69,9 @@ async function waitForComposer(current,info){
   delete current.historySeen;delete current.historyStreak;
   delete current.reasoningApplied;delete current.reasoningAttempts;delete current.reasoningVerify;
   delete current.reasoningFallback;
+  delete current.skillApplied;delete current.skillAttempts;delete current.skillQuery;delete current.skillQueryWritten;
+  delete current.skillInputMethod;
+  await restoreSkillFocus(current);
   await store(current,'输入框未就绪，正在重新加载原网页会话（仅一次）');
   await chrome.tabs.reload(current.tabId);return;
  }
@@ -145,6 +148,64 @@ async function applyReasoning(current){
  await store(current,current.reasoningFallback?'网页 Pro 暂不可用，已确认使用当前最高推理程度：'+reasoning.level:
   '网页推理程度已确认：'+reasoning.level);
 }
+async function applySkill(current){
+ current.phase='skill';current.skillAttempts=(current.skillAttempts||0)+1;
+ if(current.skillAttempts>15)throw Error(current.skillWaitReason==='window-focus'?
+  '网页 @技能需要 Chrome 窗口获得焦点，请保持 Mac 解锁；本次未提交':'网页 @技能选择超时，未确认技能标记；本次未提交');
+ const tab=await chrome.tabs.get(current.tabId);
+ if(current.skillFocusStarted&&tab.active===false)throw Error('选择 @技能时标签页焦点已变化；本次未提交，请重试');
+ const canFocusWindow=chrome.windows?.get&&Number.isInteger(tab.windowId);
+ const window=canFocusWindow?await chrome.windows.get(tab.windowId):null;
+ if(current.skillFocusStarted&&window&&window.focused===false)
+  throw Error('选择 @技能时 Chrome 窗口焦点已变化；本次未提交，请重试');
+ // ChatGPT's mention menu is focus-dependent. Keep only this short selection
+ // stage active, then return to the previous tab unless the user switched away.
+ if(!current.skillFocusStarted&&(tab.active===false||window?.focused===false)){
+  const [previous]=await chrome.tabs.query({active:true,windowId:tab.windowId});
+  current.skillPreviousTab=previous?.id;current.skillFocusStarted=true;
+  if(window?.focused===false){
+   const last=await chrome.windows.getLastFocused();
+   current.skillWindowFocus={id:tab.windowId,previousFocusedWindow:last.focused?last.id:null};
+  }
+  await store(current,'正在打开独立标签页的原生技能菜单');
+  if(current.skillWindowFocus)await chrome.windows.update(tab.windowId,{focused:true});
+  await chrome.tabs.update(current.tabId,{active:true});return;
+ }
+ await store(current,'正在选择网页 @技能：'+current.skill.name);
+ if(!current.skillQuery){
+  const query='@'+current.skill.name.replace(/-/g,' '),threadId=current.threadId||'';
+  const stored=await chrome.storage.local.get('drafts');
+  const drafts=(stored.drafts||[]).filter(entry=>entry.threadId!==threadId||entry.text!==query);
+  drafts.push({threadId,text:query});current.skillQuery=query;
+  current.drafts=[...(current.drafts||[]),query].slice(-32);
+  await chrome.storage.local.set({current,draft:query,drafts:drafts.slice(-32)});
+ }
+ const selection=await page(current.tabId,'skill',current);
+ current.skillWaitReason=selection.waitingFor||null;
+ if(selection.queryWritten)current.skillQueryWritten=true;
+ if(selection.inputMethod)current.skillInputMethod=selection.inputMethod;
+ if(selection.query)await store(current,'正在等待网页技能菜单');
+ if(!selection.applied)return;
+ if(!selection.id||!selection.name)throw Error('网页技能标记信息不完整；本次未提交');
+ current.skillApplied={id:selection.id,name:selection.name};current.phase='opening';
+ await restoreSkillFocus(current);
+ await store(current,'已确认网页 @技能：'+selection.name);
+}
+async function restoreSkillFocus(current){
+ if(!current?.skillFocusStarted)return;
+ const tab=await chrome.tabs.get(current.tabId).catch(()=>null);
+ if(tab?.active&&current.skillPreviousTab&&current.skillPreviousTab!==current.tabId)
+  await chrome.tabs.update(current.skillPreviousTab,{active:true}).catch(()=>{});
+ if(tab?.active&&current.skillWindowFocus){
+  const window=await chrome.windows.get(current.skillWindowFocus.id).catch(()=>null);
+  if(window?.focused){
+   const previous=current.skillWindowFocus.previousFocusedWindow;
+   await chrome.windows.update(previous||window.id,{focused:!!previous}).catch(()=>{});
+  }
+ }
+ delete current.skillFocusStarted;delete current.skillPreviousTab;
+ delete current.skillWindowFocus;
+}
 async function tick(){
  if(ticking)return;ticking=true;
  let current;
@@ -154,6 +215,7 @@ async function tick(){
   const stored=await chrome.storage.local.get(['current','draft','drafts','status']);
   current=stored.current;
   if(!remote.job){
+   await restoreSkillFocus(current);
    // A completed/orphaned task is never resubmitted, even after service restarts.
    if(current?.tabId&&current.sentAt)await page(current.tabId,'stop',current).catch(()=>{});
    const idleStatus='已连接本机 Koishi，等待任务';
@@ -162,19 +224,25 @@ async function tick(){
    return;
   }
   const task=remote.job;
+  const requestedMode=task.mode||(task.skill?'work':'chat');
+  if(!['chat','work'].includes(requestedMode)||requestedMode==='chat'&&task.skill)throw Error('网页任务模式无效；本次未提交');
   if(task.cancelled && (!current || current.id!==task.id)){
    await api('/failure',{id:task.id,message:'任务已取消，未提交网页'});return;
   }
   if(!current || current.id!==task.id){
+   await restoreSkillFocus(current);
    if(current?.tabId&&current.sentAt)await page(current.tabId,'stop',current).catch(()=>{});
    const tab=await chrome.tabs.create({url:task.threadId?'https://chatgpt.com/c/'+task.threadId:'https://chatgpt.com/',active:false});
-   current={...task,tabId:tab.id,phase:'opening',openedAt:Date.now(),hasImages:!!(task.images&&task.images.length),
+   current={...task,mode:requestedMode,tabId:tab.id,phase:'opening',openedAt:Date.now(),hasImages:!!(task.images&&task.images.length),
     sentText:task.text||'',draft:stored.draft||null,
     drafts:(stored.drafts||[]).filter(entry=>entry.threadId===(task.threadId||'')).map(entry=>entry.text),padded:false};
    await store(current,'正在打开 ChatGPT 标签页');await api('/progress',{id:task.id,phase:'opening'});return;
   }
+  current.mode=current.mode||requestedMode;
+  if(current.mode!==requestedMode)throw Error('网页任务模式已变化；本次未提交');
   if(current.phase==='failing'){await returnFailure(current);return;}
   if(task.cancelled){
+   await restoreSkillFocus(current);
    if(!current.sentAt){await api('/failure',{id:task.id,message:'任务已取消，未提交网页'});await store(null,'任务已取消');return;}
    await page(current.tabId,'stop',current);
    const stopped=await page(current.tabId,'inspect',current);
@@ -185,6 +253,7 @@ async function tick(){
   // A modal model menu may aria-hide the composer. Finish and close our menu
   // before inspecting the composer again, including after worker suspension.
   if(current.phase==='reasoning'){await applyReasoning(current);return;}
+  if(current.phase==='skill'){await applySkill(current);return;}
   const info=await page(current.tabId,'inspect',current);
   if(info.loading){
    if(Date.now()-(current.sentAt||current.openedAt)> (current.sentAt?240000:60000))throw Error('ChatGPT 页面加载超时，请检查专用标签页');
@@ -210,7 +279,6 @@ async function tick(){
    delete current.busyWaitAt;
    if(info.editorAmbiguous||!info.editor){await waitForComposer(current,info);return;}
    delete current.composerWaitAt;
-   if(info.needsChat){await page(current.tabId,'chat',current);return;}
    if(info.unknownDrafts || info.attachments || info.uploading)
     throw Error('专用标签页已有草稿或附件，请清空后重新发送任务；本次未填写或上传');
    // 复用已有会话时，历史轮次是页面异步渲染出来的：输入框先出现，历史要几秒后才补齐。
@@ -231,7 +299,15 @@ async function tick(){
     if(current.historyStreak<2)return;
     if(Date.now()-current.openedAt<(info.assistants?8000:15000))return;
    }
+   if(current.mode==='work'?info.needsWork:info.needsChat){
+    current.modeWaitAt=current.modeWaitAt||Date.now();
+    if(Date.now()-current.modeWaitAt>30000)throw Error('当前网页会话无法确认'+(current.mode==='work'?'工作':'聊天')+'模式，请先 /new；本次未提交');
+    await page(current.tabId,current.mode,current);
+    await store(current,'正在等待网页'+(current.mode==='work'?'工作':'聊天')+'模式准备');return;
+   }
+   delete current.modeWaitAt;
    if(!reasoningConfirmed(current)){await applyReasoning(current);return;}
+   if(current.skill&&!current.skillApplied){await applySkill(current);return;}
    current.baseline=info.assistants;
    current.assistantId=info.assistantId;
    // Count the user's turns before submitting: the new turn is what proves the
@@ -289,6 +365,7 @@ async function tick(){
   if(current.phase==='filled'){
    if(!reasoningConfirmed(current))
     throw Error('网页推理程度未经确认；本次未提交，请重新发送');
+   if(current.skill&&!current.skillApplied)throw Error('网页 @技能未经确认；本次未提交');
    // Wait a separate polling turn for the editor to commit React state.
    // Persist before clicking: crashes in this gap fail closed, never duplicate.
    current.phase='sending';current.sentAt=Date.now();await store(current,'正在提交 ChatGPT');
@@ -333,10 +410,13 @@ async function tick(){
   if(info.threadId){
    await api('/progress',{id:task.id,threadId:info.threadId,phase:'submitted',evidence:{
     workerVersion:chrome.runtime.getManifest?.().version||'development',userId:info.userId||'',
+    requestedMode:current.mode,observedMode:info.workMode?'work':'chat',
+    userText:info.userText||'',textMatched:!!info.textMatched,
     userBaseline:current.userBaseline,users:info.users,assistantBaseline:current.baseline,assistants:info.assistants,
     assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
     ...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort,reasoningApplied:current.reasoningApplied}:{}),
     ...(current.reasoningFallback?{reasoningFallback:current.reasoningFallback}:{}),
+    ...(current.skill?{skillRequested:current.skill.name,skillApplied:current.skillApplied}:{}),
    },timing:current.timing});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
   }
@@ -388,6 +468,7 @@ async function tick(){
    try{
     if(!current.failure){
      if(!err.probe)err.probe=await page(current.tabId,'probe',current).catch(()=>undefined);
+     await restoreSkillFocus(current);
      const phase=current.phase;
      current.failure={message,probe:{...err.probe,timing:timings(current)}};current.phase='failing';
      await chrome.storage.local.set({current,lastFailure:{id:current.id,tabId:current.tabId,threadId:current.threadId||'',phase,

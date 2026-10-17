@@ -18,6 +18,8 @@ function normalizeConfig(config, defaultRoot) {
   }
   if (config.dataDir != null && (typeof config.dataDir !== 'string' || !config.dataDir.trim()))
     throw Error('dataDir 必须是非空路径');
+  if (config.skillsDir != null && (typeof config.skillsDir !== 'string' || !config.skillsDir.trim() || /\x00/.test(config.skillsDir)))
+    throw Error('skillsDir 必须是非空路径');
   let lmStudioUrl;
   try { lmStudioUrl = new URL(config.lmStudioBaseUrl ?? 'http://127.0.0.1:1234/v1'); }
   catch { throw Error('lmStudioBaseUrl 必须是本机 LM Studio 的 HTTP 地址'); }
@@ -36,6 +38,7 @@ function normalizeConfig(config, defaultRoot) {
     ...config,
     allowedUsers: [...new Set(config.allowedUsers.map(user => user.trim()))],
     dataDir: path.resolve(config.dataDir || defaultRoot),
+    skillsDir: config.skillsDir == null ? undefined : path.resolve(config.skillsDir),
     webBridgePort: integer('webBridgePort', 5141, 0, 65535),
     lmStudioBaseUrl: lmStudioUrl.href.replace(/\/$/, ''),
     lmStudioModel: config.lmStudioModel?.trim() || '',

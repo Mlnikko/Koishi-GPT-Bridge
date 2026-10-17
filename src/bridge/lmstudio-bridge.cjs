@@ -5,6 +5,7 @@ const { createHash } = require('node:crypto');
 const { writeJson, writeAtomic } = require('../lib/state.cjs');
 const { submissionText } = require('../core/message.cjs');
 const { validatePresetSnapshot } = require('../core/presets.cjs');
+const { skillContext } = require('../core/skills.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
 const { sniffImage, MAX_INPUT_BYTES } = require('../lib/image.cjs');
 
@@ -48,6 +49,8 @@ class LMStudioBridge {
       catch { throw fail('lmstudio_protocol', 'LM Studio 未返回有效 JSON，请检查服务地址'); }
       if (!response.ok) {
         const message = typeof value.error?.message === 'string' ? value.error.message.slice(0, 400) : '';
+        if (/insufficient system resources|insufficient.*memory|not enough memory|out of memory/i.test(message))
+          throw fail('lmstudio_memory', '本机可用内存不足，无法加载当前模型。请在 LM Studio 改用较小模型或释放内存后重试。');
         throw fail('lmstudio_http', `LM Studio 请求失败（HTTP ${response.status}）${message ? '：' + message : ''}`);
       }
       return value;
@@ -71,7 +74,7 @@ class LMStudioBridge {
       return selected;
     }
     if (!models.length) throw fail('lmstudio_model', 'LM Studio 尚无聊天模型，请先下载或加载模型');
-    if (models.length > 1) throw fail('lmstudio_model', '有多个本地聊天模型，请指定：/backend lmstudio 模型编号\n' + models.join('\n'));
+    if (models.length > 1) throw fail('lmstudio_model', '有多个本地聊天模型，请指定模型编号：\n' + models.join('\n'));
     return models[0];
   }
   async ensureVision(model, options) {
@@ -79,7 +82,7 @@ class LMStudioBridge {
     if (!Array.isArray(value.models)) throw fail('lmstudio_protocol', '无法读取本地模型图片能力，请检查 LM Studio 版本');
     const info = value.models.find(item => item.key === model || item.loaded_instances?.some(instance => instance.id === model));
     if (info?.capabilities?.vision !== true)
-      throw fail('lmstudio_unsupported', '当前本地模型不支持图片，请选择视觉模型或用 /backend web');
+      throw fail('lmstudio_unsupported', '当前本地模型不支持图片，请选择视觉模型或切换网页模式');
   }
   historyFile(job) {
     const identity = [this.baseUrl, job.owner, job.conversation, job.sessionId, job.model];
@@ -176,7 +179,7 @@ class LMStudioBridge {
     } catch { /* Asset cleanup is best effort after the successful commit. */ }
   }
   async run(job, { signal, timeoutMs = this.timeoutMs, onProgress = () => {} } = {}) {
-    if (!job.sessionId || !job.model) throw fail('lmstudio_session', '本地会话或模型未设置，请先用 /backend lmstudio');
+    if (!job.sessionId || !job.model) throw fail('lmstudio_session', '本地会话或模型未设置，请先选择本地模式和模型');
     if (signal?.aborted) throw cancelled();
     const text = submissionText(job.input);
     const history = this.history(job);
@@ -185,9 +188,10 @@ class LMStudioBridge {
     let turn = previous;
     if (!turn) {
       const preset = job.preset === undefined ? undefined : validatePresetSnapshot(job.preset);
-      const promptChars = preset?.prompt.length || 0;
-      if (preset && promptChars + text.length > this.historyChars)
-        throw fail('lmstudio_context', '预设和本次消息超出本地上下文字数上限，请缩短预设或消息，或调整 lmStudioHistoryChars');
+      const system = [preset?.prompt, skillContext(job.skill)].filter(Boolean).join('\n\n');
+      const promptChars = system.length;
+      if (system && promptChars + text.length > this.historyChars)
+        throw fail('lmstudio_context', '预设、技能和本次消息超出本地上下文字数上限，请缩短内容或调整 lmStudioHistoryChars');
       const started = Date.now(), prepared = this.prepare(job);
       const turns = this.trim(history.turns, { chars: promptChars + text.length, images: prepared.images, bytes: prepared.bytes });
       if (prepared.images || turns.some(t => imageStats(t.input).images))
@@ -196,7 +200,7 @@ class LMStudioBridge {
       // must still detect a changed or missing historical image on disk.
       const encoded = new Map();
       const messages = turns.flatMap(t => [{ role: 'user', content: this.content(t, history, undefined, encoded) }, { role: 'assistant', content: t.assistant }]);
-      if (preset) messages.unshift({ role: 'system', content: preset.prompt });
+      if (system) messages.unshift({ role: 'system', content: system });
       messages.push({ role: 'user', content: this.content({ user: text, input: prepared.input }, history, prepared.pending, encoded) });
       onProgress(`本地模型 ${job.model} 正在生成回复`);
       const remaining = timeoutMs - (Date.now() - started);

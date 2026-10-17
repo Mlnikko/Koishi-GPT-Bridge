@@ -1,6 +1,9 @@
 // Standalone page function: Chrome serializes it for injection, so all DOM helpers stay inside.
 async function pageStep(operation,job){
  try {
+ const requestedMode=job.mode||(job.skill?'work':'chat');
+ if(!['chat','work'].includes(requestedMode))throw Error('无效的网页模式；本次未提交');
+ if(requestedMode==='chat'&&job.skill)throw Error('聊天模式不调用技能；本次未提交');
  const buttons=()=>Array.from(document.querySelectorAll('button'));
  const byLabel=labels=>buttons().find(b=>labels.includes(b.getAttribute('aria-label')||'') || labels.includes(b.innerText.trim()));
  const roles=role=>{
@@ -99,10 +102,41 @@ async function pageStep(operation,job){
  const sendButtons=Array.from((composer||document).querySelectorAll?.('button')||[]).filter(isSend);
  const sendButton=sendButtons.length===1?sendButtons[0]:null;
  const normalized=value=>String(value||'').replace(/\s+/g,' ').trim();
- const ownedDraft=node=>[job.draft,...(job.drafts||[])].some(text=>text&&normalized(text)===normalized(node.innerText));
- const unknownDrafts=eligible.some(node=>normalized(node.innerText)&&!['询问 ChatGPT','Ask ChatGPT'].includes(normalized(node.innerText))&&!ownedDraft(node));
+ const skillKey=value=>normalized(value).toLowerCase().replace(/[-_\s]+/g,' ');
+ const mentionSelector='[browser-skill-mention-name]';
+ const skillMentions=node=>Array.from(node?.querySelectorAll?.(mentionSelector)||[]);
+ const mentionInfo=node=>{
+  const name=node?.getAttribute('browser-skill-mention-name');
+  const match=/^browser-skill:\/\/\/([a-zA-Z0-9_-]{1,128})(?:\?|$)/.exec(node?.getAttribute('browser-skill-mention-path')||'');
+  return name&&match&&node.getAttribute('contenteditable')==='false'?{id:match[1],name}:null;
+ };
+ const selectedSkill=()=>{
+  const mentions=skillMentions(editor),all=Array.from(editor?.querySelectorAll?.('[data-appearance="inline-mention"]')||[]);
+  const info=mentions.length===1?mentionInfo(mentions[0]):null;
+  return info&&job.skill&&skillKey(info.name)===skillKey(job.skill.name)&&all.length===1
+   &&(!job.skillApplied||job.skillApplied.id===info.id)?{...info,node:mentions[0]}:null;
+ };
+ // Keep the rich mention in the editor while comparing only the user's body.
+ const editorBody=node=>{
+  if(!skillMentions(node).length)return String(node?.innerText||'');
+  const read=parent=>Array.from(parent.childNodes||[]).map(child=>{
+   if(child.nodeType===3)return child.nodeValue;
+   if(child.nodeType!==1||child.getAttribute('browser-skill-mention-name')!==null)return '';
+   return child.tagName==='BR'?'\n':read(child)+(['P','DIV'].includes(child.tagName)?'\n':'');
+  }).join('');
+  return read(node);
+ };
+ const query='@'+String(job.skill?.name||'').replace(/-/g,' ');
+ const ownedDraft=node=>[job.draft,...(job.drafts||[])].some(text=>text&&normalized(text)===normalized(editorBody(node)));
+ const nativeDraft=node=>node===editor&&!!selectedSkill()&&(!normalized(editorBody(node))||ownedDraft(node));
+ const ownQuery=node=>node===editor&&job.phase==='skill'&&job.skill&&normalized(node.innerText)===query;
+ const unknownDrafts=eligible.some(node=>{
+  if(skillMentions(node).length)return !nativeDraft(node);
+  return normalized(node.innerText)&&!['询问 ChatGPT','Ask ChatGPT','使用 ChatGPT Work','Use ChatGPT Work'].includes(normalized(node.innerText))&&!ownedDraft(node)&&!ownQuery(node);
+ });
  const attachmentSelector='img[src^="blob:"], img[src^="data:image/"], img[src^="https://"], [data-testid*="attachment" i], [data-testid*="composer-file" i]';
- const recoverySafe=!unknownDrafts&&!eligible.some(node=>scopeOf(node)?.querySelector?.(attachmentSelector+', [role="progressbar"], [aria-busy="true"]'));
+ const outsideMention=node=>!node.closest?.(mentionSelector);
+ const recoverySafe=!unknownDrafts&&!eligible.some(node=>Array.from(scopeOf(node)?.querySelectorAll?.(attachmentSelector+', [role="progressbar"], [aria-busy="true"]')||[]).some(outsideMention));
  // A hidden historical button (or another tool's Stop) is not evidence that
  // this reply is streaming. Use the same composer boundary as Send/cancel.
  const stopCandidates=buttons().filter(button=>isStop(button)
@@ -111,8 +145,55 @@ async function pageStep(operation,job){
  const stop=scopedStops[0]||(!composer&&stopCandidates.length===1?stopCandidates[0]:null);
  const match=location.pathname.match(/^\/c\/([a-f0-9-]{36})$/);
  const threadId=match?.[1]||'';
- if(['reasoning','attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)
+ if(['reasoning','skill','attach','prepare','submit','send','read','image','stop'].includes(operation) && job.threadId && job.threadId!==threadId)
   throw Error('网页会话与任务不一致');
+ if(operation==='skill'){
+  if(!job.skill||!/^[-a-z0-9]{1,64}$/.test(job.skill.name))throw Error('网页技能名称无效；本次未提交');
+  if(!editor||candidates.length>1||stop)throw Error('网页尚未就绪，无法选择 @技能；本次未提交');
+  if(typeof document.hasFocus==='function'&&!document.hasFocus())return {pending:true,waitingFor:'window-focus'};
+  const selected=selectedSkill();
+  if(selected){
+   if(normalized(editorBody(editor)))throw Error('技能标记旁已有正文，未覆盖草稿；本次未提交');
+   return {applied:true,id:selected.id,name:selected.name};
+  }
+  if(skillMentions(editor).length||unknownDrafts)throw Error('专用标签页已有其他草稿或技能标记；本次未提交');
+  if(normalized(editor.innerText)!==query||!job.skillQueryWritten){
+   if(normalized(editor.innerText)&&!ownedDraft(editor))throw Error('输入框已有内容，未选择技能');
+   editor.focus();document.execCommand('selectAll',false);
+   if(normalized(editor.innerText)){
+    // Give the editor a polling turn to commit deletion before pasting. Its
+    // internal selection may otherwise still point after a restored @query.
+    document.execCommand('delete',false);
+    editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));
+    return {pending:true,queryCleared:true};
+   }
+   // Let the site's editor process the same paste transaction as a user. A
+   // direct DOM edit can display @text without opening its native mention menu.
+   let pasted=false;
+   if(typeof DataTransfer==='function'&&typeof ClipboardEvent==='function'){
+    const data=new DataTransfer();data.setData('text/plain',query);
+    pasted=!editor.dispatchEvent(new ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:data}));
+   }
+   if(!pasted){
+    document.execCommand('insertText',false,query);
+    editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:query}));
+   }
+   return {pending:true,query,queryWritten:true,inputMethod:pasted?'paste':'input'};
+  }
+  // A full-name search moves the installed skill into Exact matches. Accept
+  // only these two groups, then verify the resulting native skill token.
+  const skillSections='[data-mention-section-id="skills"], [data-mention-section-id="exact-matches"]';
+  const sections=Array.from(document.querySelectorAll(skillSections)).filter(visible);
+  const choices=sections.flatMap(section=>Array.from(section.querySelectorAll('button'))).filter(button=>visible(button)
+   &&Array.from(button.querySelectorAll('[data-menu-row-content] span')).some(span=>!span.children.length&&skillKey(span.textContent)===skillKey(job.skill.name)));
+  if(choices.length>1)throw Error('网页存在多个同名技能：'+job.skill.name+'；本次未提交');
+  if(!choices.length){
+   if((job.skillAttempts||0)<8)return {pending:true,query};
+   throw Error('网页未找到技能「'+job.skill.name+'」，请先在 ChatGPT 工作模式安装同名技能；本次未提交');
+  }
+  if(choices[0].disabled||choices[0].getAttribute('aria-disabled')==='true')throw Error('网页技能暂不可用；本次未提交');
+  choices[0].click();return {pending:true,query};
+ }
  if(operation==='reasoning'){
   const levels=['instant','medium','high','xhigh','pro'];
   const target=job.reasoningEffort;
@@ -508,13 +589,18 @@ const probeDom=()=>({
  // Attachments are counted inside the composer only, so conversation images are
  // never mistaken for a reference image that is still uploading.
  const attachmentNodes=composer && typeof composer.querySelectorAll==='function'
-  ?Array.from(composer.querySelectorAll(attachmentSelector)):[];
+  ?Array.from(composer.querySelectorAll(attachmentSelector)).filter(outsideMention):[];
  // A card and its thumbnail describe one attachment, not two uploaded files.
  const attachments=attachmentNodes.filter(node=>!attachmentNodes.some(parent=>parent!==node&&parent.contains(node)));
- const uploading=!!composer?.querySelector?.('[role="progressbar"], [aria-busy="true"]')
+ const composerBusy=Array.from(composer?.querySelectorAll?.('[role="progressbar"], [aria-busy="true"]')||[])
+  .filter(node=>visible(node)&&outsideMention(node)&&!node.closest?.('[data-mention-section-id]'));
+ const uploading=!!composerBusy.length
   || attachmentNodes.some(node=>node.tagName==='IMG'&&node.complete===false);
  const chatGroup=document.querySelector('[aria-label="撰写器模式"], [aria-label="Composer mode"]');
  const chatButton=chatGroup && Array.from(chatGroup.querySelectorAll('button')).find(b=>['聊天','Chat'].includes(b.innerText.trim()));
+ const workButton=chatGroup && Array.from(chatGroup.querySelectorAll('button')).find(b=>['工作','Work'].includes(b.innerText.trim()));
+ const workMode=!!editor&&(/ChatGPT Work/i.test(editor.getAttribute('aria-label')||'')
+  ||!!composer?.querySelector?.('[data-composer-input-variant^="work"]'));
  // 完成判定必须看**读出来的内容**，而不是整个轮次的文本：空轮次里也有
  // 「ChatGPT 说：」这类无障碍标题，把它当成回复就会在图片还没渲染出来时提前收工，
  // 而收工之后扩展会关掉标签页 —— 等于把还在生成的图一起关掉。
@@ -541,7 +627,8 @@ const probeDom=()=>({
   editor:!!editor,editorAmbiguous:candidates.length>1,editorSelection:best,unknownDrafts,recoverySafe,stopping:!!stop,images:images.length,imageLoading,gallery,pendingGallery,attachments:attachments.length,uploading,
   replyLength,assistantId,replySignature:checksum(answerText)+'/'+replyLength+'/'+images.length+'/'+checksum(images.map(mediaKey).join('|')),
   busyText,
-  needsChat:!!chatButton && chatButton.getAttribute('aria-pressed')!=='true',
+  needsChat:requestedMode==='chat'&&(workMode||!!chatButton&&chatButton.getAttribute('aria-pressed')!=='true'),
+  needsWork:requestedMode==='work'&&!workMode,workMode,
   login:!editor && !!byLabel(['登录','Log in','Sign in']),
   challenge:/verify you are human|确认您是真人|验证您是真人|checking your browser/i.test(document.body.innerText.slice(0,1500))};
  if(operation==='probe')return {...probeDom(),phase:job.phase,users:user.length,userBaseline:job.userBaseline,
@@ -553,6 +640,15 @@ const probeDom=()=>({
    ancestors:ancestorChain(node),testid:node.getAttribute('data-testid'),label:node.getAttribute('aria-label')})),
   composerTag:composer?.tagName||null,sendCandidates:sendButtons.length,
   reasoningEffort:job.reasoningEffort||'default',reasoningAttempts:job.reasoningAttempts||0,
+  requestedMode,observedMode:workMode?'work':'chat',
+  skillRequested:job.skill?.name||null,skillAttempts:job.skillAttempts||0,
+  documentFocused:typeof document.hasFocus==='function'?document.hasFocus():null,
+  visibility:document.visibilityState||null,skillQueryWritten:!!job.skillQueryWritten,
+  skillInputMethod:job.skillInputMethod||null,
+  composerBusy:composerBusy.map(node=>({tag:node.tagName,role:node.getAttribute('role'),label:node.getAttribute('aria-label')})).slice(0,8),
+  skillSelected:selectedSkill()?{name:selectedSkill().name,id:selectedSkill().id}:null,
+  skillCandidates:Array.from(document.querySelectorAll('[data-mention-section-id="skills"] button, [data-mention-section-id="exact-matches"] button')).filter(visible)
+   .slice(0,12).map(node=>normalized(node.innerText).slice(0,180)),workMode,
   // Capture only page controls, not labels from replies or conversation titles.
   // The old send/upload-only probe could not explain model-picker failures.
   reasoningControls:buttons().filter(b=>!b.closest?.(historySelector+', nav, aside')
@@ -574,9 +670,24 @@ const probeDom=()=>({
   if(!replyLength && !images.length && job.sentAt && Date.now()-job.sentAt>90000)snapshot.probe=probeDom();
   return snapshot;
  }
- if(operation==='chat'){if(chatButton)chatButton.click();return snapshot;}
+ if(operation==='chat'){
+  if(!snapshot.needsChat)return snapshot;
+  if(unknownDrafts||attachments.length||stop)throw Error('网页已有草稿或附件，未切换聊天模式');
+  if(!chatButton||chatButton.disabled)return {pending:true,waitingFor:'chat-mode-control'};
+  chatButton.click();return snapshot;
+ }
+ if(operation==='work'){
+  if(workMode)return snapshot;
+  if(unknownDrafts||attachments.length||stop)throw Error('网页已有草稿或附件，未切换工作模式');
+  // Existing Work threads briefly mount an empty Chat-shaped loading shell.
+  // Missing mode controls at this point do not prove the thread is incompatible.
+  if(!workButton||workButton.disabled)return {pending:true,waitingFor:'work-mode-control'};
+  workButton.click();return snapshot;
+ }
  if(operation==='stop'){if(stop)stop.click();return {stopped:!!stop};}
  if(operation==='attach'){
+  if(stop||(requestedMode==='work'?snapshot.needsWork:snapshot.needsChat))throw Error('网页不在所需模式，未上传附件');
+  if(job.threadId&&job.threadId!==threadId)throw Error('网页会话与任务不一致');
   if(!editor||candidates.length>1)throw Error('无法确定 ChatGPT 消息输入框，未上传附件');
   if(unknownDrafts||attachments.length||uploading)throw Error('专用标签页已有草稿或附件，未上传参考图片');
   const list=Array.isArray(job.images)?job.images:[];
@@ -613,9 +724,10 @@ const probeDom=()=>({
  if(operation==='prepare'||operation==='submit'){
   if(submitted)return {alreadySent:true};
   if(candidates.length>1)throw Error('检测到多个输入框，无法确定 ChatGPT 消息输入框');
-  if(!editor || stop || snapshot.needsChat)throw Error('网页未就绪或不在普通 Chat 模式');
+  if(!editor || stop || (requestedMode==='work'?snapshot.needsWork:snapshot.needsChat))throw Error('网页未就绪或不在所需模式');
+  if(job.skill&&!selectedSkill())throw Error('网页 @技能标记缺失或已变化；本次未提交');
   if(job.threadId && job.threadId!==threadId)throw Error('网页会话与任务不一致');
-  const current=editor.innerText.trim();
+  const current=editorBody(editor).trim();
   const placeholder=['询问 ChatGPT','Ask ChatGPT'];
   // A previous run can leave its own unsent draft behind. The extension remembers
   // the last text it filled in, so the connector's leftovers are recognisable
@@ -625,11 +737,18 @@ const probeDom=()=>({
   if(current && !placeholder.includes(current) && !leftover)throw Error('专用标签页输入框已有内容，请清空后重新发送任务');
   if(operation==='prepare')return {prepared:true};
   editor.focus();
-  if(leftover){document.execCommand('selectAll',false);document.execCommand('delete',false);}
   const message=String(job.message||'');
-  document.execCommand('selectAll',false);document.execCommand('insertText',false,message);
+  if(job.skill){
+   const selection=window.getSelection(),range=document.createRange();
+   range.selectNodeContents(editor);range.setStartAfter(selectedSkill().node);
+   selection.removeAllRanges();selection.addRange(range);
+   document.execCommand('insertText',false,' '+message);
+  }else{
+   if(leftover){document.execCommand('selectAll',false);document.execCommand('delete',false);}
+   document.execCommand('selectAll',false);document.execCommand('insertText',false,message);
+  }
   editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:message}));
-  return {filled:normalize(editor.innerText)===normalize(message)};
+  return {filled:normalize(editorBody(editor))===normalize(message)&&(!job.skill||!!selectedSkill())};
  }
  if(operation==='send'){
   if(submitted)return {alreadySent:true};
@@ -637,9 +756,12 @@ const probeDom=()=>({
   // React may render the button before it has committed the editor value. This is
   // a safe retry point because no click has happened yet.
   if(!editor||candidates.length>1)throw Error('无法确定 ChatGPT 消息输入框，未发送');
+  if(stop||(requestedMode==='work'?snapshot.needsWork:snapshot.needsChat))throw Error('网页不在所需模式；本次未提交');
+  if(job.threadId&&job.threadId!==threadId)throw Error('网页会话与任务不一致');
+  if(job.skill&&!selectedSkill())throw Error('网页 @技能标记缺失或已变化；本次未提交');
   if(sendButtons.length>1)throw Error('消息输入框对应多个发送按钮，未发送');
   const send=sendButton;
-  if(normalize(editor?.innerText||'')!==message)throw Error('输入内容已变化，未发送');
+  if(normalize(editorBody(editor))!==message)throw Error('输入内容已变化，未发送');
   if(!send || send.disabled)return {ready:false};
   send.click();return {clicked:true};
  }

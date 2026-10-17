@@ -1,14 +1,131 @@
 # Koishi-GPT-Bridge
 
-Koishi 本机 ChatGPT / LM Studio 对话桥接。
+QQ 机器人统一入口，分为聊天、工作、本地模型三个板块。默认聊天，直接发消息即可；群聊需 @ 机器人。
 
-默认把 QQ 消息原样送进 Chrome 里**已登录的 ChatGPT 普通聊天页面**，再把网页的回复原样送回 QQ。
-也可选择本地图片提示词模板，通过 `/draw 角色名` 替换模板中的角色名后发送生图。
-网页模式不调用 OpenAI 接口，不需要 API Key，也不调用任何本地 CLI。请保持 Chrome、扩展和 Koishi 运行；
-网页额度以账号实际限制为准。
+| 板块 | 切换命令 | 执行位置与能力 |
+| --- | --- | --- |
+| 聊天 | `/mode 聊天` | 已登录的 ChatGPT 网页 Chat，保留最初的连续对话、图片及引用消息收发 |
+| 工作 | `/mode 工作` | 同一账号的 ChatGPT Work，可调用网页已安装的原生 @技能；不选技能也可工作 |
+| 本地模型 | `/mode 本地` | 本机 LM Studio，文字或视觉模型对话，无需网页登录 |
 
-默认后端为 ChatGPT 网页，也可用 `/backend lmstudio` 切换到本机模型。插件本身不启动任何外部进程；
-网页后端通过本机 5141 端口连接 Chrome 扩展，本地后端直接请求 LM Studio 的 HTTP API。
+三种模式各自保存历史、模型/技能选择和推理设置，往返切换会恢复各自上下文。
+`/new [名称]` 新开话题，沿用设置、清空三种模式的历史；旧话题可用 `/chat` 切回。
+
+日常只需 `/mode`、`/new`、`/chat`、`/status`、`/stop`，`/help` 按当前模式显示常用命令。
+工作模式用 `/skill 名称` 选择技能；在聊天模式选技能会自动进入工作模式。
+本地模式用 `/model` 查看模型、`/model 编号` 选择。模板管理、预设编辑等进阶操作见 `/help all`。
+
+```text
+/mode 工作
+/skill @chatgpt jp portrait
+P03 + C04，白色陶瓷杯，只要手部特写提示词。
+/mode 聊天
+你好，继续刚才的聊天话题。
+/mode 本地
+请总结这段材料：……
+```
+
+网页通过 Chrome 扩展和本机 HTTP 桥接，不需要 OpenAI API Key；请保持 Chrome、扩展和 Koishi 运行。
+本地模式直接访问 LM Studio HTTP 服务。所有模式共用一套消息解析、队列、状态、停止和 QQ 回传流程。
+插件本身不启动外部进程。能力及额度以网页账号和本机模型实际支持为准。
+
+升级到 0.4.0 后重启 Koishi，并在 Chrome 扩展页重新加载扩展。旧会话首次成功修改时自动迁移，
+先在原目录保存 `conversations.json.v1-<摘要>.bak` 原始备份；会话编号与本地历史不变。
+详见 [三模式设计与验收](docs/three-modes.md)。
+
+### 本地技能库
+
+支持读取 `技能名/SKILL.md` 作为技能目录。工作模式通过原生 **@技能** 调用网页已安装技能；
+LM Studio 使用本机技能正文作为系统提示词。更新后重启 Koishi，并在 Chrome 扩展页重新加载本扩展。
+在 QQ 私聊发送（群聊需 @ 机器人）：
+
+```text
+/skill
+/skill show summarize-text
+/skill summarize-text
+请整理下面的讨论记录：……
+/skill off
+```
+
+- `/skill` 或 `/skill list [页码]`：查看当前选择、技能名称和说明。
+- `/skill 名称`：选择当前会话的一个技能，从下一条消息起生效。
+- `/skill show [名称]`：查看技能指令；不带名称时查看当前技能。长正文用 `/skill show --page 2 [名称]` 翻页。
+- `/skill off`：后续消息不再选择技能。已有聊天历史保留；
+  需要空白上下文时，先关闭或切换技能，再 `/new`。
+
+默认库为 `data/skills/`（随 `dataDir` 调整），首次创建目录时放入 `examples/skills/` 中的示例：
+文本整理 `summarize-text` 和日系写实人像 `chatgpt-jp-portrait`。
+本机新增或修改技能，下次查看和发消息即读取最新内容，无需重启。
+重启不会覆盖本地修改或恢复已删除的示例；已存在的空目录不会自动安装示例。
+
+每个技能使用独立目录，例如 `data/skills/translate-text/SKILL.md`：
+
+```markdown
+---
+name: translate-text
+description: 翻译用户提供的文本，保留术语、数值与原文格式。
+---
+
+按用户指定的目标语言翻译本次文本。没有指定目标语言时先确认。
+保留人名、数值、代码和专有名词；不确定的术语标出原文。
+```
+
+`name` 必须与目录名一致，最多 64 字，只含小写字母、数字和连字符；`list/show/off` 等为保留名称。
+`description` 最多 1000 字，正文最多 24000 字。文件为 UTF-8，文件头的 `name/description` 支持普通文本、
+单/双引号文本和 `>`/`|` 多行说明；复杂 YAML 标记、锚点等不支持。其他文件头字段不会授予工具权限。
+目录及 `SKILL.md` 均须为普通目录/文件，符号链接不加载。无效技能会在列表中提示，用 `show 名称` 查看具体错误。
+
+已有技能库可通过 `skillsDir: /绝对路径/skills` 接入；配置目录必须已存在，插件只读，不向其中安装示例或修改文件。
+也可将需要的技能目录复制到 `data/skills/`。没有配置时只读取本项目数据目录，不自动扫描用户级技能库。
+库中的技能说明和正文可由所有获准使用机器人的用户查看；使用 LM Studio 时正文会提交给本地模型，管理员应选择适合共享的技能。
+
+选择按用户、私聊/群聊、会话和模式隔离，重启后保留。工作和本地模型分别选择技能；聊天模式不调用技能。`/new` 沿用设置，`/chat` 恢复对应会话。
+处理中可以查看技能，切换或关闭需等待完成或先 `/stop`。入队时保存正文和版本摘要，之后编辑、删除文件不会改变已有任务；
+选中技能丢失或无效时明确报错。`/status` 显示当前选择，`/retry` 仍只重发已有结果。
+
+网页端先输入 `@`，在原生菜单中选中技能，确认技能标记后再发送用户原文，**不会把 SKILL.md 拼进文本框**。
+网页账号须已安装同名技能：例如本地 `chatgpt-jp-portrait` 对应菜单中的 `chatgpt jp portrait`；空格与连字符等价。
+找不到、同名结果不唯一或技能标记失效时停止发送并报告原因，不自动改为粘贴技能正文。
+本机文件用于列表和选择；网页实际执行的规则与版本由网页已安装的技能决定，本机编辑不会自动同步到网页。
+LM Studio 把技能正文与角色预设合并为系统提示词，
+历史只保存原始用户输入。预设、技能及本次消息共同占用 `lmStudioHistoryChars`，超限会在提交前报错。
+普通消息、图片/引用消息和 `/draw` 均沿用原有流程；启用的技能也会作用于 `/draw`。
+
+本地接入只加载 `SKILL.md` 文本，不执行本机技能里的脚本、CLI、MCP 工具，也不自动加载 `references/` 或 `assets/`。
+网页原生技能使用 ChatGPT 自身提供的能力；它不会因此获得对本机项目目录的访问权限。
+
+#### 日系写实人像技能
+
+`chatgpt-jp-portrait` 从本机 `Agent-Skill/skills/chatgpt-jp-portrait` 导入，已将其
+`assets/chatgpt-web-instructions.md` 的完整动作表、镜头表和改图规则内嵌到桥接版 `SKILL.md`，
+供本地模型直接加载，无需模型读取本机文件。网页模式调用你已导入的原生技能。
+`examples/skills/chatgpt-jp-portrait/SOURCE.json` 保存来源文件和导入内容的 SHA-256。
+新增安装自动提供该技能；已有技能目录时，将 `examples/skills/chatgpt-jp-portrait/` 复制到实际 `dataDir/skills/`，不要覆盖已有同名修改。
+
+QQ 使用示例（每行分别发送，群聊需 @ 机器人）：
+
+```text
+/mode 工作
+/skill @chatgpt jp portrait
+J01，P02，F01，奶油色针织衫，樱花街角，直接出图。
+把刚才的针织衫改成浅蓝色，人物、动作和背景保持，直接改图。
+P03 + C04，白色陶瓷杯、浅粉针织袖口，只要手部特写提示词。
+```
+
+默认主体为虚构的18岁成年女性，可明确指定其他成年年龄。`P02` 为回头微笑，`F01` 为腰部以上半身，
+`P03 + C04` 为捧杯的手部特写。网页生成图片；LM Studio 只输出文字提示词。技能不保证每次出图或人脸完全一致。
+
+`/skill chatgpt-jp-portrait` 也可选择同一个技能。选一次后，后续消息会自动带上原生技能标记。
+原生技能需要“工作”模式；`/skill 名称` 会自动进入工作模式，使用独立网页会话。
+原生菜单选择时会短暂激活 Chrome 窗口和独立标签页，选好后恢复之前的焦点。
+选择期间请保持电脑解锁；手动切换窗口或标签页会停止本次选择。
+
+`npm run validate:portrait` 使用当前 Chrome 扩展及真实 ChatGPT 网页，验证选择技能、仅提示词、出图、同一网页会话改图，
+并逐字节核对隔离模拟 QQ 回传的图片。它不向真实 QQ 联系人发消息，也不读取现有聊天状态。
+运行前需先停止占用桥接端口的 Koishi 实例，运行后恢复实例；默认复用 `data/web-bridge-token` 和端口 5141，
+可用 `WEB_BRIDGE_PORT` 指定与扩展一致的端口。测试记录、原始图片和回复保存在 `data/acceptance/portrait-*/`。
+若前两步已通过、改图明确返回网页图像服务错误，可用
+`npm run validate:portrait -- --resume data/acceptance/portrait-目录` 在同一会话额外重试改图一次，保留原错误与已通过结果。
 
 ### 图片提示词模板
 
@@ -107,28 +224,29 @@ QQ 创建的文件首行注释记录创建者，本地编辑时保留该首行�
 本地模板及任务快照随 `data/` 被 Git 忽略。
 
 此功能使用现有网页生成和图片回传流程，沿用 `/status`、`/stop`、`/retry`；`/retry` 只重发已有结果，不重新生成。
-当前会话若选择了 LM Studio，`/draw` 会提示先用 `/backend web` 切回网页。
+当前会话若选择了 LM Studio，`/draw` 会提示先用 `/mode 工作` 切回网页。
 GPT 实际返回的文字或图片均按现有方式回传；模板不会保证模型一定返回图片。每次生成会进入当前网页聊天历史，
 希望不受之前图片影响时，先用 `/new` 开启新会话。
 
-### 本机 LM Studio（0.3.8）
+### 本机 LM Studio
 
 在 LM Studio 的 Developer 页面启动 API 服务，并准备一个聊天模型。默认连接
 `http://127.0.0.1:1234/v1`，只允许本机回环地址；无需 Chrome 或 ChatGPT 登录。
 重启 Koishi 实例加载本次更新后，在 QQ 私聊发送（群聊需 @ 机器人）：
 
 ```text
-/backend lmstudio
+/mode 本地
 你好
 接着刚才的话题继续聊
 ```
 
-- `/backend` 查看当前后端；`/backend web` 切回 ChatGPT 网页。
-- 只有一个聊天模型时自动选择；有多个时发送 `/backend lmstudio 模型编号`，例如
-  `/backend lmstudio google/gemma-4-31b`。嵌入模型用于向量计算，不用于聊天。
+- `/mode` 查看当前模式；`/mode 聊天`、`/mode 工作` 切回对应网页模式。
+- `/model` 查看本机模型；`/skill` 选择本地文字规则，与工作模式的技能选择分别保存。
+- 只有一个聊天模型时自动选择；有多个时发送 `/model 模型编号`，例如
+  `/model google/gemma-4-31b`。嵌入模型用于向量计算，不用于聊天。
 - 每个用户在每个私聊/群聊的会话拥有独立上下文；历史保存在 `data/lmstudio/`，重启后继续。
   `/new [名称]` 沿用本地后端和模型，开启空白上下文；`/chat` 可切回旧话题。
-- 网页与本地的上下文分别保留，切换后端不会复制另一边的历史。更换本地模型也使用独立上下文。
+- 聊天、工作与本地的上下文分别保留，切换模式不会复制另一边的历史。更换本地模型也使用独立上下文。
 - 本地接入支持文字、图片加文字、纯图片和引用消息中的图片。图片需视觉模型（如本机 Gemma 4 31B），
   插件先检查 LM Studio 报告的视觉能力；文字与图片按原顺序提交，图片随会话保存，后续文字提问仍带原图。
   本地模型返回文字，不能通过此接入生成图片。`/reasoning` 操作网页设置，本地模型使用 LM Studio 的设置。
@@ -167,7 +285,7 @@ GPT 实际返回的文字或图片均按现有方式回传；模板不会保证�
 创建不会自动改变当前会话选择。后续命令分别发送：
 
 ```text
-/backend lmstudio
+/mode 本地
 /preset 旅伴
 /preset show 旅伴
 /new 新剧情
@@ -189,7 +307,7 @@ cp examples/presets/角色扮演.md data/presets/角色扮演.md
 重启 Koishi 加载本次功能后，在 QQ 私聊发送（群聊需 @ 机器人）：
 
 ```text
-/backend lmstudio
+/mode 本地
 /preset
 /preset 角色扮演
 你好，我们开始故事吧
@@ -231,16 +349,19 @@ cp examples/presets/角色扮演.md data/presets/角色扮演.md
 
 ### 管理命令
 
-发送 `/help` 查看下面这些命令。命令以 `/` 开头；普通的「取消」「stop」等文字仍作为聊天内容发送。
+发送 `/help` 查看当前模式常用命令，`/help all` 查看完整清单。命令以 `/` 开头；普通的「取消」「stop」等文字仍作为聊天内容发送。
 方括号中的参数可省略；任务默认选择当前会话最近一条，也可填写任务编号查询或取回历史回复。
 
 | 命令 | 作用 |
 | --- | --- |
-| `/help` | 帮助 |
+| `/help [聊天\|工作\|本地\|all]` | 当前板块常用帮助；all 查看完整帮助 |
+| `/mode [聊天\|工作\|本地] [模型编号]` | 切换模式，分别保留上下文；不带参数查看当前模式 |
+| `/model [模型编号]` | 查看本机聊天模型；带编号选择并进入本地模式 |
 | `/new [名称]` | 开启新对话，名称默认使用用户名，旧会话保留 |
 | `/rename 新名称` | 重命名当前会话，最多 40 字；可先用 `/chat 编号` 切换到要修改的会话 |
 | `/chat [会话编号]` | 列出会话；带编号切换 |
-| `/backend [web\|lmstudio] [模型编号]` | 查看或切换对话后端；本地可指定模型 |
+| `/backend [web\|lmstudio] [模型编号]` | 旧版兼容，日常请使用 `/mode` |
+| `/skill [名称\|list\|show\|off]` | 查看、选择或关闭技能；聊天中选择会进入工作模式，本地选择独立保存 |
 | `/preset [名称\|show\|list\|create\|edit\|delete\|off]` | 公共预设查看、选择或管理；编辑/删除限创建者；新会话沿用 |
 | `/prompt [模板名\|list\|show\|preview\|create\|edit\|delete\|off]` | 查看、选择、预览或管理公共图片模板；编辑/删除限创建者 |
 | `/draw 角色名` | 将当前模板替换角色名后发送到 GPT 网页生成图片 |
@@ -255,7 +376,7 @@ cp examples/presets/角色扮演.md data/presets/角色扮演.md
 
 已移除最近任务列表和单独的重开命令；新建与重开统一用 `/new`，连接检查合入 `/status`。
 旧的 `桥接…` 命令只提示使用 `/help`，不再执行操作，也不会提交网页任务。
-仅完整匹配的文字命令会执行；含图片的消息、引用中的命令和未知的斜杠文本仍按普通内容转发。
+仅完整匹配的文字命令会执行；含图片的消息、引用中的命令仍按普通内容转发；未知的斜杠命令返回帮助，不会提交模型。
 
 同一个会话同一时间只处理一条消息：上一条还在跑的时候再发，会被直接拒绝并提示等待或取消。
 如果绑定的网页会话在 ChatGPT 那边被删掉或链接失效，任务会明确失败并解绑，**下一条消息自动开一个新的网页会话**，
@@ -291,8 +412,8 @@ cp examples/presets/角色扮演.md data/presets/角色扮演.md
 可用选项取决于账号套餐和模型，见 [OpenAI 官方说明](https://help.openai.com/en/articles/20001354-gpt-6-and-other-models-in-chatgpt)。
 该命令操作网页的思考强度滑块，关闭并重新打开菜单确认选择后才提交消息，不向消息正文添加提示词，也不调用 API。
 
-设置按当前会话保存到 `data/conversations.json`，重启后保留，`/chat` 切回时沿用该会话设置；
-新会话默认跟随网页。每条任务入队时记录推理程度，修改设置从下一条消息起生效，排队或生成中的任务不变。
+设置按当前会话的聊天/工作模式分别保存到 `data/conversations.json`，重启和 `/chat` 切回后保留；
+`/new` 沿用两种模式的设置，首次使用时默认跟随网页。每条任务入队时记录推理程度，修改设置从下一条消息起生效，排队或生成中的任务不变。
 网页选择可能影响账号后续默认值，因此 `default` 会沿用网页当前值；有明确设置的会话每次发送前都会重新应用并读回确认。
 
 Pro 选项暂时缺失（例如额度用尽）时，`pro` 任务改用滑块当前可用的最高档，关闭并重新打开菜单读回确认后才继续。
@@ -431,49 +552,30 @@ Windows 路径同样需要加引号，例如 `node scripts/setup-web-bridge.cjs 
 
 ## 项目结构
 
-```
-koishi-codex-image-bridge/
-├── src/                        插件运行时，Koishi 从这里加载
-│   ├── index.cjs               Koishi 入口：导出 name / apply，注册命令与兜底转发
-│   ├── lib/                    通用工具层，不依赖项目内其他模块
-│   │   ├── image.cjs           参考图安全下载、格式嗅探、PNG 尺寸解析
-│   │   ├── reply.cjs           回复片段校验、Markdown 围栏还原、按段落拆分
-│   │   ├── feedback.cjs        用户可见文案、失败分类、本机路径脱敏
-│   │   └── state.cjs           原子 JSON 状态发布与暂存清理
-│   ├── core/                   领域层，可用 lib
-│   │   ├── config.cjs          配置归一化；在打开文件和端口前校验
-│   │   ├── message.cjs         QQ 消息元素 → 有序片段
-│   │   ├── conversations.cjs   网页会话持久化
-│   │   ├── preferences.cjs     用户在各聊天中的过程通知设置
-│   │   ├── presets.cjs         本地 Markdown 预设、名称与任务快照校验
-│   │   └── queue.cjs           任务队列持久化与串行执行
-│   └── bridge/                 传输层，可用 core 与 lib
-│       ├── web-bridge.cjs      与 Chrome 扩展的本机 HTTP 桥接（127.0.0.1:5141）
-│       └── lmstudio-bridge.cjs 本机模型 API、独立上下文与回复保存
-├── browser-extension/          Chrome MV3 扩展
-│   ├── background.js           任务状态机与恢复
-│   ├── bridge-client.js        本机 HTTP 通信与图片字节传输
-│   └── page.js                 可独立注入的页面操作、轮次识别与回复读取
-├── scripts/
-│   ├── setup-web-bridge.cjs    生成扩展的本地配置与桥接令牌
-│   ├── doctor.cjs             只读连接诊断，不发送消息、不写入在线心跳
-│   ├── check-project.cjs      脚本语法、版本和入口校验
-│   └── test.cjs               显式发现测试文件，兼容 Node 20+ 和 Windows
-├── test/                       镜像 src/ 的分层
-│   ├── lib/ core/ bridge/      各模块单元测试
-│   ├── helpers/dom.cjs         测试用的最小 DOM 桩（扩展页面脚本只能在沙箱里跑）
-│   ├── index.test.cjs          装配层：假 Koishi 上下文驱动整个插件
-│   ├── architecture.test.cjs   分层与依赖规则的守卫
-│   ├── pipeline.test.cjs       端到端：QQ 元素 → 安全下载 → 落盘 → 桥接 → 回复回传
-│   └── browser-worker.test.cjs 扩展后台脚本
-├── docs/                       设计、架构、运维与历史记录
-├── koishi.example.yml          配置示例
-├── data/                       运行时状态（任务、会话、令牌），已 gitignore
-└── package.json
+```text
+src/
+├── index.cjs          装配与 Koishi 绑定
+├── commands/          一份注册表负责路由、参数和按模式帮助
+│   ├── modes.cjs      /mode、/model、推理设置与旧命令兼容
+│   ├── sessions.cjs   新建、选择、重命名、关闭话题
+│   └── …              技能、预设、模板命令
+├── app/               用例编排
+│   ├── bot.cjs        入站、任务、状态、通知与发送
+│   ├── engines.cjs    按任务快照选择网页或本地执行
+│   └── session-scope.cjs  授权、聊天范围、默认名称
+├── core/              模式、会话、队列与资源库领域规则
+├── bridge/            网页、本地模型、QQ 回传适配器
+└── lib/               下载、回复与原子文件工具
+browser-extension/     页面操作与任务状态机；Chat/Work 共用
+scripts/               诊断、静态检查、隔离实测工具
+test/                  领域、应用、桥接、扩展及架构回归
+docs/                  设计、运维、版本与验收记录
+data/                  私有运行状态，已 gitignore
 ```
 
-分层规则是强制约束：`lib` 不得依赖 `core`/`bridge`，`core` 不得依赖 `bridge`，反向依赖与孤立模块都会被
-`test/architecture.test.cjs` 拦下。新增目录时需要同步更新该测试里的分层表。详见 [docs/architecture.md](docs/architecture.md)。
+依赖方向为 `commands → app → bridge → core → lib`，入口只做装配；命令也可直接调用领域接口。
+架构测试会检查反向依赖、循环依赖、孤立模块和命令直接访问传输适配器。
+详见 [架构](docs/architecture.md) 与 [三模式设计](docs/three-modes.md)。
 
 ## 验证
 
@@ -495,6 +597,7 @@ npm run doctor    # 检查运行中的实例；自定义目录：npm run doctor 
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/three-modes.md](docs/three-modes.md) | 三板块边界、简明命令、迁移与本轮验收 |
 | [docs/design-v1.md](docs/design-v1.md) | 从生图插件转向通用桥接器的第一版设计 |
 | [docs/architecture.md](docs/architecture.md) | 分层与依赖规则、各模块职责、数据流、授权与群聊、失败反馈、连接器工作原理 |
 | [docs/operations.md](docs/operations.md) | Windows 部署位置、重启方式、判断运行中实例是否加载了新代码、实现注意与排障 |

@@ -2,40 +2,38 @@
 
 ## 分层与依赖方向
 
-运行时模块按依赖方向分三层，箭头只能自上而下：
+运行时按职责分层，入口只负责装配：
 
-```
-index.cjs            插件入口，可用全部
-   │
-   ├── bridge/       传输层：网页、本机模型、QQ 回传
-   │      │
-   ├── core/         领域层：消息片段、会话、队列
-   │      │
-   └── lib/          通用工具层：不依赖其他分层
+```text
+index.cjs → commands/ → app/ → bridge/ → core/ → lib/
+                 └──────────────────────→ core/
 ```
 
-| 分层 | 允许依赖 | 模块 |
+| 分层 | 允许依赖 | 职责 |
 | --- | --- | --- |
-| `src/lib/` | 仅同层 | `image.cjs`、`reply.cjs`、`reply-assets.cjs`、`feedback.cjs`、`state.cjs` |
-| `src/core/` | `lib`、同层 | `config.cjs`、`message.cjs`、`conversations.cjs`、`reasoning.cjs`、`preferences.cjs`、`presets.cjs`、`queue.cjs` |
-| `src/bridge/` | `lib`、`core`、同层 | `web-bridge.cjs`、`lmstudio-bridge.cjs`、`qq-delivery.cjs` |
-| `src/index.cjs` | 全部 | 入口 |
+| `src/lib/` | 同层 | 下载、回复片段、媒体和原子文件工具 |
+| `src/core/` | `lib`、同层 | 模式、会话上下文、任务队列、技能/预设/模板库 |
+| `src/bridge/` | `core`、`lib`、同层 | 网页协议、本地模型 HTTP、QQ 发送确认 |
+| `src/app/` | `bridge`、`core`、`lib`、同层 | 入站、执行路由、状态和生命周期编排 |
+| `src/commands/` | `app`、`core`、`lib`、同层 | 路由、参数校验、帮助和命令用例，禁止直接依赖 bridge |
+| `src/index.cjs` | 全部 | 配置、模块创建、Koishi 中间件与生命周期绑定 |
 
-`test/architecture.test.cjs` 会把这张表变成可执行约束，检查四件事：
-
-1. 每个运行时模块都归属已知分层——新增目录时该测试会失败，提醒更新分层表，而不是让规则静默失效。
-2. 依赖方向只能自上而下，出现反向依赖即失败。
-3. 没有从入口不可达的孤立模块（防重构后留下死代码）。
-4. 运行时模块不含 `child_process`、`execFile`、`codexPath`、`CODEX_HOME`、`runner.cjs`。
-
-第 4 条是防止本地 CLI 调用路径回归的哨兵。网页后端收发经由浏览器内的在线页面完成，一旦有人重新引入
-本地子进程，就必须同时重新处理「不继承 Koishi 密钥」与「Windows 无进程组信号」两件事。
+`test/architecture.test.cjs` 将这些约定作为自动化约束：已知分层、禁止反向/循环依赖、
+无入口不可达模块、命令不直接访问传输层，以及运行时不引入子进程调用。
+三个产品模式复用队列与回复管线，Chat 与 Work 复用一个网页连接器。
+产品能力及使用方式见 [三模式设计](three-modes.md)。
 
 ## 模块职责
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.cjs` | Koishi 插件入口。校验配置、装配各模块、注册管理命令与**兜底转发中间件**，将任务回传交给 QQ 传输模块。 |
+| `src/index.cjs` | Koishi 装配入口。校验配置、构造模块、绑定统一授权范围、命令/兜底中间件、定时器和 dispose。 |
+| `src/commands/registry.cjs` | 单一注册表负责命令路由、参数形式与按模式帮助；图片/引用保持内容语义，未知斜杠命令就地反馈。 |
+| `src/commands/*.cjs` | 按会话、模式、技能、预设、模板分组；调用应用和领域接口。 |
+| `src/app/bot.cjs` | 入站准备、冻结配置快照、队列、状态、通知、模式切换及共享 QQ 回传。 |
+| `src/app/engines.cjs` | 按任务模式选择连接器，校验任务与会话模式、本地模型一致；管理模式所属网页绑定和失效解绑。 |
+| `src/app/session-scope.cjs` | 唯一授权过滤、聊天范围与默认会话名称。 |
+| `src/core/modes.cjs` | chat/work/local 能力表、别名与旧任务模式推断；不执行 IO。 |
 | `src/lib/image.cjs` | 参考图安全下载（协议白名单、SSRF 防护、体积与超时限制、文件头嗅探）与 PNG 文件头解析。 |
 | `src/lib/reply.cjs` | 回复片段校验、Markdown 围栏还原、按段落拆分、总量截断。**纯函数。** |
 | `src/lib/feedback.cjs` | 面向用户的文案、失败分类、本机路径与凭据脱敏、模型文本转义。 |
@@ -44,9 +42,10 @@ index.cjs            插件入口，可用全部
 | `src/core/config.cjs` | 集中归一化配置并校验用户名单、布尔项、端口、计时器和各输入/输出限制；校验完成后才装配服务。 |
 | `src/core/message.cjs` | QQ 消息元素 → 有序片段（文本/图片），剥掉开头的 @ 机器人。**纯函数。** |
 | `src/core/reasoning.cjs` | 推理程度名称、别名与取值校验，供配置及命令共用。 |
-| `src/core/conversations.cjs` | 会话的持久化（名称、归属用户、选中状态、网页编号、本地模型与预设名称）；原子保存选择，`/new` 显式继承本地配置。 |
+| `src/core/conversations.cjs` | 话题与三种模式上下文持久化；旧格式先备份再原子迁移，`/new` 只继承设置；两种网页模式禁止绑定同一个 thread。 |
 | `src/core/preferences.cjs` | 按用户和聊天位置持久化过程通知开关；个人设置优先于 `notifyProgress` 默认配置。 |
 | `src/core/presets.cjs` | 公共 UTF-8 Markdown 预设发现、创建、编辑与删除；单文件保存创建者和正文，编辑/删除验证创建者，剥离文件头并校验模型任务快照。 |
+| `src/core/skills.cjs` | 只读发现 `技能名/SKILL.md`，校验文件头与正文，提供版本快照和本地模型系统提示词；网页只传技能名。默认库首次安装示例，不执行脚本或加载其他资源。 |
 | `src/core/queue.cjs` | 任务持久化、查询索引、串行生成与终态恢复；参考图移入任务目录；保留期清理。结果落盘后释放生成槽。 |
 | `src/bridge/web-bridge.cjs` | 本机 HTTP 桥接服务（默认 127.0.0.1:5141）。管理当前网页任务、令牌校验、进度与结果回传、参考图字节按需下发、回复图片二进制上传。 |
 | `src/bridge/lmstudio-bridge.cjs` | 本地模型 HTTP 请求、独立文字/图片历史及结果保存；在历史前注入任务的预设快照，并为系统提示词预留字数预算。 |
@@ -84,9 +83,11 @@ index.cjs            插件入口，可用全部
 
 | 路径 | 内容 |
 | --- | --- |
-| `data/conversations.json` | 会话名称、所属用户、选中状态、网页编号、本地模型及 `lmStudioPreset` 预设名。 |
+| `data/conversations.json` | version 2：话题名称、归属、选中状态、mode，以及 contexts.chat/work/local 的独立设置与网页编号。 |
+| `data/conversations.json.v1-<摘要>.bak` | 首次修改旧会话之前的原始文件备份；只读加载不写盘，便于回退。 |
 | `data/presets/<名称>.md` | 实例共享预设正文，QQ 创建的文件首行注释保存创建者；按消息读取最新正文，创建者信息不进入模型任务快照，Git 忽略。 |
-| `data/jobs/<id>/job.json` | 任务状态、入站片段、网页编号及本地任务的 `preset: { name, prompt, revision }` 快照（`version: 2`）。 |
+| `data/skills/<name>/SKILL.md` | 默认技能库，包含文件头与指令正文；`skillsDir` 可改为已有只读库，每条消息读取并保存版本快照。 |
+| `data/jobs/<id>/job.json` | 任务状态、显式 mode、入站片段、网页编号、本地任务的 `preset: { name, prompt, revision }` 及可选 `skill: { name, description, instructions, revision }` 快照（`version: 2`）。 |
 | `data/jobs/<id>/input-<序号>.<扩展名>` | 该任务下载的参考图片。 |
 | `data/jobs/<id>/result-<序号>.<扩展名>` | 回复中的第 n 张图片，扩展名为 png/gif/jpg/webp。 |
 | `data/jobs/<id>/reply.md` | 完整回复文本（含代码围栏），供重发与排查。 |
@@ -96,6 +97,12 @@ index.cjs            插件入口，可用全部
 | `data/jobs/<id>/timing.json` | 0.3.5 起保存最近一次提交/读取阶段的等待原因与采样时间；覆盖更新，单份小于 20000 字符。最终读取和图片上传时间保存在结果或失败探针的 `timing` 中。 |
 | `data/web-bridge-token` | 扩展与桥接共用的随机令牌。 |
 | `data/web-bridge-port` | 桥接实际监听的端口（`port: 0` 时由系统分配）。 |
+
+网页任务的 `/state` 只返回 `skill: { name }` 和原始用户消息，不传本地技能正文。
+扩展用 `web-modes` 声明支持显式 Chat/Work 路由，用 `native-skills` 声明支持原生 @技能；工作任务不选技能也需要前者。不支持时在发布任务前失败。
+扩展在独立标签页中打开 @ 菜单、选择唯一同名技能、读回原生技能标记，再保留标记填写并发送用户正文。
+选择阶段跨 service worker 休眠持久化；找不到技能、出现歧义或发送前标记变化时不提交。
+网页实际技能规则由 ChatGPT 中已安装版本决定，本地 `revision` 只标识本机库快照。
 
 任务文件含消息正文与 QQ openid，权限 0600，目录权限 0700。`data/` 已在 `.gitignore` 中忽略。
 
@@ -124,7 +131,7 @@ QQ 消息（私聊；群聊需 @ 机器人）
 
 ## 兜底转发
 
-`src/index.cjs` 的转发中间件注册在**所有管理命令之后**，沿用 Koishi 的 `next(fallback)` 语义：
+`src/index.cjs` 绑定的转发中间件注册在**所有管理命令之后**，沿用 Koishi 的 `next(fallback)` 语义：
 
 ```js
 scope.middleware((session, next) => next(() => forward(session)));
@@ -133,7 +140,7 @@ scope.middleware((session, next) => next(() => forward(session)));
 命令先匹配并产出结果，因此管理命令不会被转发；其余授权消息一律进入 `forward()`。
 **这就是「桥接」的全部**：没有意图识别，也没有自然语言分类，没有「用户是不是想画图」这种判断。
 
-命令统一精确匹配 `/` 前缀，不注册 Koishi 裸词；图文、引用和未知斜杠文本沿用普通消息转发。
+命令统一精确匹配 `/` 前缀，不注册 Koishi 裸词；图文和引用沿用普通消息转发，未知斜杠命令返回帮助。
 `/reasoning` 将当前会话的推理程度原子保存，入队时写入任务快照。扩展通过心跳能力标识声明支持，
 桥接拒绝把显式推理任务交给旧扩展。网页准备完成后先切换思考强度滑块，按菜单的可读描述确认结果，
 再上传、填写和发送；设置不会写进用户正文。无设置时跟随网页，不改变既有默认行为。
@@ -179,9 +186,9 @@ scope.middleware((session, next) => next(() => forward(session)));
 
 - `/new [名称]`：进入全新上下文，原会话保持打开，可用 `/chat 编号` 切回。
 - `/chat [编号]`：不带编号列出会话，带编号切换；`/close [编号]` 关闭指定或当前会话。
-- 重命名、最近任务列表、单独重开与旧中文长命令已移除。历史任务仍可通过 `/status 编号`、`/retry 编号` 查询或取回。
+- `/rename 新名称` 重命名当前话题。最近任务列表、单独重开与旧中文长命令已移除；历史任务仍可通过 `/status 编号`、`/retry 编号` 查询或取回。
 
-命令路由和帮助共用入口中的一份注册表。授权范围内的前置中间件只识别完整斜杠命令，不向 Koishi 注册 `new`、`stop` 等裸词，也不覆盖内置帮助命令。图片消息和被引用的命令走内容转发；旧中文命令返回迁移提示。其余消息继续交给兜底中间件。
+命令路由和帮助共用 `commands/registry.cjs` 的一份注册表。授权范围内的前置中间件只识别完整斜杠命令，不向 Koishi 注册 `new`、`stop` 等裸词，也不覆盖内置帮助命令。图片消息和被引用的命令走内容转发；旧中文命令返回迁移提示。其余消息继续交给兜底中间件。
 
 续聊通过服务器保存的确切 ChatGPT 会话编号进入同一网页会话，不接受用户提交任意会话编号。
 
@@ -194,7 +201,7 @@ scope.middleware((session, next) => next(() => forward(session)));
 1. 扩展复用 `https://chatgpt.com/c/<编号>` 时，若地址被重定向回首页（`info.threadId` 变空）且已过 15 秒宽限，
    直接失败并报「会话已不存在或无法打开」，而不是一路空等到桥接超时。
 2. 桥接的 `webFailure()` 把它归为独立的 `thread_gone`（不是通用的 `execution_failed`）。
-3. `src/index.cjs` 的任务 runner 捕获 `thread_gone` 后调用 `Conversations.unbindWeb()` 解绑该会话，
+3. `src/app/engines.cjs` 的任务 runner 捕获 `thread_gone` 后调用 `Conversations.unbindWeb()` 解绑该会话，
    下一条消息因此拿到一个全新的网页会话。
 
 注意 `thread_mismatch`（页面停在别的会话上）**不解绑**：它可能只是专用标签页被手动导航走了，
@@ -218,7 +225,7 @@ scope.middleware((session, next) => next(() => forward(session)));
 ## LM Studio 本地连接器
 
 `src/bridge/lmstudio-bridge.cjs` 直接请求本机 OpenAI 兼容的 `/v1/models` 和 `/v1/chat/completions`，
-不使用浏览器或子进程。`/backend lmstudio [模型编号]` 先检查模型列表，再原子保存当前会话的后端和模型；
+不使用浏览器或子进程。`/mode 本地 [模型编号]` 或 `/model 编号` 先检查模型列表，再原子保存当前会话的模式和模型；
 模型查询期间会话变更或出现新任务时不应用切换。入队时冻结后端与模型，处理中禁止切换后端。
 
 本地历史以服务地址、用户、聊天位置、会话编号、模型编号共同生成 SHA-256 文件名，保存到
@@ -241,7 +248,7 @@ scope.middleware((session, next) => next(() => forward(session)));
 ## ChatGPT 网页连接器
 
 `src/bridge/web-bridge.cjs` 为本机网页任务服务，`browser-extension/` 为 Chrome 扩展。
-它操作已登录的 `https://chatgpt.com/` 普通 Chat 页面，通过页面输入框提交消息，
+它操作已登录的 `https://chatgpt.com/` Chat 或 Work 页面，通过任务的显式 mode 选择页面输入框，
 从最新 assistant 轮次读回内容，不调用未公开聊天接口，也不复制登录 Cookie。
 
 ### 复用会话时，轮次基线必须等历史渲染稳定
@@ -254,6 +261,10 @@ scope.middleware((session, next) => next(() => forward(session)));
 所以续聊时（`current.threadId` 非空）必须等：轮次计数连续两次 `inspect` 不变，且叠加时间下限
 （页面上已有 assistant 轮次 ≥8 秒；一个都没有 ≥15 秒，因为「还没渲染出来」和「本来就是空会话」
 无法区分，宁可多等）。
+
+Work 会话加载期间可能先挂载一个标为「询问 ChatGPT」的空输入框，随后才挂载工作输入框。
+模式判断放在历史稳定之后；模式控件暂时缺失时等待恢复，最多 30 秒，并受打开阶段总期限约束。
+上传、填写和最终点击仍校验模式；无法确认时失败，不会把工作请求降为聊天请求。
 
 收工前再用 message id 确认一次：`data-chatgpt-search-message-ids` 是每条 assistant 消息的稳定标识，
 采样时记录、收工时比对，仍是同一条就说明本轮回复还没出现。计数只说明「轮次变多了」，
@@ -271,7 +282,7 @@ scope.middleware((session, next) => next(() => forward(session)));
 ### 提交顺序
 
 填写与点击发送分属两个轮询周期：填写后先落盘 `phase: 'sending'`，下一个周期才点击，且点击前会确认
-输入框内容仍是自己填的那份。任何一步崩溃都朝「不重复提交」的方向失败。
+输入框内容仍是自己填的那份、网页模式与会话编号仍与任务一致。任何一步崩溃都朝「不重复提交」的方向失败。
 
 纯图片消息先按**空正文**提交；只有发送按钮持续不解锁（5 秒）才补**一个空格**。不写标记，也不写任何
 用户没说过的说明性文字。

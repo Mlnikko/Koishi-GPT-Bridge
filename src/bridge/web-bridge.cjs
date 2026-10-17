@@ -1,4 +1,5 @@
 'use strict';
+const { modeOf } = require('../core/modes.cjs');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -6,7 +7,7 @@ const { randomBytes, timingSafeEqual } = require('node:crypto');
 const { failureInfo, safeReason } = require('../lib/feedback.cjs');
 const { saveAsset, replyAssetPath, ASSET_LIMIT, MAX_ASSETS } = require('../lib/reply-assets.cjs');
 const { validateSegments, replyText } = require('../lib/reply.cjs');
-const { submissionText, imagesOf } = require('../core/message.cjs');
+const { imagesOf, submissionText } = require('../core/message.cjs');
 const { writeJson } = require('../lib/state.cjs');
 
 const PROTOCOL_VERSION = 2;
@@ -45,7 +46,7 @@ function webFailure(reply) {
     return error('thread_gone', '原 ChatGPT 网页会话已不存在或无法打开，下一条消息会自动开启一个新的网页会话。');
   if (/会话不匹配|会话与任务不一致/.test(text))
     return error('thread_mismatch', 'ChatGPT 网页没有停在任务指定的会话上，本次未提交：' + safeReason(text));
-  if (/推理程度/.test(text))return error('browser_interaction','ChatGPT 网页操作未完成：'+safeReason(text));
+  if (/推理程度|技能|模式/.test(text))return error('browser_interaction','ChatGPT 网页操作未完成：'+safeReason(text));
   if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加|回复文件|文件预览/.test(text))
     return error('browser_interaction', 'ChatGPT 网页操作未完成：' + safeReason(text));
   const info = failureInfo({ technical: text });
@@ -96,7 +97,10 @@ class WebBridge {
   requestInfo() {
     const p=this.pending;
     if(!p)return null;
-    return {id:p.job.id,text:submissionText(p.job.input),threadId:p.threadId||'',cancelled:!!p.cancelled,
+    return {id:p.job.id,text:submissionText(p.job.input),mode:modeOf(p.job),threadId:p.threadId||'',cancelled:!!p.cancelled,
+      // A native @ mention loads the skill already installed in ChatGPT. Never
+      // put the local instruction snapshot into the webpage's user message.
+      ...(p.job.skill ? {skill:{name:p.job.skill.name}} : {}),
       ...(p.job.reasoningEffort ? {reasoningEffort:p.job.reasoningEffort} : {}),
       // Only metadata crosses to the extension here; the bytes are served on demand
       // by GET /input so a poll never carries megabytes of image data.
@@ -111,11 +115,19 @@ class WebBridge {
     try {
       if(req.method==='GET' && req.url==='/health') return send(200,this.health());
       if(req.method==='GET' && req.url==='/state') {
-        this.lastSeen=Date.now();this.reasoningSupported=String(req.headers['x-bridge-capabilities']||'').split(',').includes('reasoning');
+        this.lastSeen=Date.now();
+        const capabilities=String(req.headers['x-bridge-capabilities']||'').split(',');
+        this.reasoningSupported=capabilities.includes('reasoning');
+        this.nativeSkillsSupported=capabilities.includes('native-skills');
+        this.webModesSupported=capabilities.includes('web-modes');
         // Older extensions ignore unknown task fields. Never let one submit a
         // request with an explicitly selected effort that it cannot apply.
         if(this.pending?.job.reasoningEffort&&!this.reasoningSupported)
           this.pending.finish(error('browser_upgrade','切换推理程度需要重新加载新版 Chrome 扩展；本次未提交网页'));
+        if(this.pending?.job.skill&&!this.nativeSkillsSupported)
+          this.pending.finish(error('browser_upgrade','原生 @技能需要重新加载新版 Chrome 扩展；本次未提交网页'));
+        if(this.pending&&modeOf(this.pending.job)==='work'&&!this.webModesSupported)
+          this.pending.finish(error('browser_upgrade','工作模式需要重新加载新版 Chrome 扩展；本次未提交网页'));
         return send(200,{job:this.requestInfo(),version:PROTOCOL_VERSION});
       }
       if(req.method==='GET' && new URL(req.url,'http://127.0.0.1').pathname==='/input') {
@@ -223,8 +235,12 @@ class WebBridge {
     if(this.pending)throw error('bridge_busy','ChatGPT 网页连接器正在处理其他任务');
     if(threadId && !validThread(threadId))throw error('thread_invalid','ChatGPT 会话编号无效');
     if(signal?.aborted)throw error('cancelled','任务已取消');
+    if(modeOf(job)==='local')throw error('mode_mismatch','本地模型任务不能提交到网页');
+    if(modeOf(job)==='chat'&&job.skill)throw error('mode_mismatch','聊天模式不调用技能');
     if(Date.now()-this.lastSeen>90000)throw error('browser_offline','ChatGPT 网页连接器未在线。请打开 Chrome 并启用扩展，等待连接后重试');
     if(job.reasoningEffort&&!this.reasoningSupported)throw error('browser_upgrade','切换推理程度需要重新加载新版 Chrome 扩展；本次未提交网页');
+    if(job.skill&&!this.nativeSkillsSupported)throw error('browser_upgrade','原生 @技能需要重新加载新版 Chrome 扩展；本次未提交网页');
+    if(modeOf(job)==='work'&&!this.webModesSupported)throw error('browser_upgrade','工作模式需要重新加载新版 Chrome 扩展；本次未提交网页');
     if(threadId)bindThread({onThread},threadId);
     if(this.closed)throw error('interrupted','网页连接器已关闭，任务未提交');
     if(signal?.aborted)throw error('cancelled','任务已取消');

@@ -5,7 +5,51 @@ const {WebBridge,webFailure,PROTOCOL_VERSION}=require('../../src/bridge/web-brid
 const {saveAsset}=require('../../src/lib/reply-assets.cjs');
 const {animatedGif}=require('../helpers/media.cjs');
 const temp=()=>fs.mkdtempSync(path.join(os.tmpdir(),'web-bridge-test-'));
+
+test('native skill tasks send only a skill name and the original input and image attachments', async t => {
+ const {parseSkill}=require('../../src/core/skills.cjs');
+ const {b,job,call}=await setup(t);
+ await b.handle({method:'GET',url:'/state',headers:{'x-bridge-token':b.token,'x-bridge-capabilities':'native-skills,web-modes'}},{writeHead:()=>{},end:()=>{}});
+ job.skill=parseSkill('---\nname: summarize\ndescription: 整理材料\n---\n保留事实与时间', 'summarize');
+ job.input.push({type:'image',file:'input-0.png',mime:'image/png',size:128});
+ const result=b.run(job).catch(e=>e);await new Promise(setImmediate);
+ const request=b.requestInfo();
+ assert.equal(request.text,'a blue circle');
+ assert.deepEqual(request.skill,{name:'summarize'});
+ assert.ok(!JSON.stringify(request).includes(job.skill.instructions));
+ assert.equal(request.images[0].name,'input-0.png');
+ assert.equal(job.input[0].text,'a blue circle');
+ await call('/failure',{id:job.id,message:'结束验收'});await result;
+});
+test('native skills fail before submission with older extensions, including a capability change during polling',async t=>{
+ const {parseSkill}=require('../../src/core/skills.cjs');
+ const {b,job,call}=await setup(t);
+ job.skill=parseSkill('---\nname: summarize\ndescription: 整理材料\n---\n正文','summarize');
+ await call('/state');
+ await assert.rejects(b.run(job),err=>err.code==='browser_upgrade'&&/@技能/.test(err.message));
+ await b.handle({method:'GET',url:'/state',headers:{'x-bridge-token':b.token,'x-bridge-capabilities':'native-skills,web-modes'}},{writeHead:()=>{},end:()=>{}});
+ const result=b.run(job).catch(err=>err);await new Promise(setImmediate);
+ assert.ok(b.requestInfo().skill);
+ assert.equal((await(await call('/state')).json()).job,null);
+ assert.equal((await result).code,'browser_upgrade');
+});
 const id='11111111-2222-3333-4444-555555555555';
+test('Work without a skill is explicit and requires the mode-capable extension',async t=>{
+ const {b,job,call}=await setup(t);job.mode='work';
+ await call('/state');
+ await assert.rejects(b.run(job),err=>err.code==='browser_upgrade'&&/工作模式/.test(err.message));
+ await b.handle({method:'GET',url:'/state',headers:{'x-bridge-token':b.token,'x-bridge-capabilities':'web-modes'}},{writeHead:()=>{},end:()=>{}});
+ const result=b.run(job).catch(err=>err);await new Promise(setImmediate);
+ assert.equal(b.requestInfo().mode,'work');assert.equal(b.requestInfo().skill,undefined);
+ assert.equal((await(await call('/state')).json()).job,null);
+ assert.equal((await result).code,'browser_upgrade');
+});
+test('the webpage transport rejects local tasks and contradictory Chat skills before publishing',async t=>{
+ const {b,job,call}=await setup(t);await call('/state');
+ await assert.rejects(b.run({...job,mode:'local'}),/本地模型/);
+ await assert.rejects(b.run({...job,mode:'chat',skill:{name:'some-skill'}}),/聊天模式/);
+ assert.equal(b.pending,null);
+});
 test('cancellation inside the initial progress callback is registered before notification',async t=>{
  const {b,job,call}=await setup(t);await call('/state');const controller=new AbortController();
  const result=b.run(job,{signal:controller.signal,onProgress:()=>controller.abort()}).catch(e=>e);
@@ -179,6 +223,7 @@ test('only technical problems are classified as failures',()=>{
  assert.equal(webFailure('请登录 ChatGPT').code,'authentication');
  assert.equal(webFailure('429 rate_limit_exceeded').code,'rate_limit');
  assert.equal(webFailure('参考图片上传超时，未提交请求').code,'browser_interaction');
+ assert.equal(webFailure('当前网页会话无法确认工作模式；本次未提交').code,'browser_interaction');
  assert.equal(webFailure('读取不到回复内容').code,'reply_unreadable');
  assert.equal(webFailure('ECONNRESET').code,'network');
  // 会话消失必须是独立的码：调用方靠它解绑 webThreadId，让下一条消息能自愈。
