@@ -55,8 +55,11 @@ async function verify() {
     const { App } = local('koishi');
     stage('发行包已加载，正在启动隔离 Koishi');
     app = new App();
+    stage('隔离 Koishi 上下文已创建');
     app.baseDir = instance;
+    stage('正在注册发行包插件');
     app.plugin(plugin, { allowedUsers: ['package-smoke'], webBridgePort: 0 });
+    stage('发行包插件已注册，正在等待启动完成');
     await app.start();
     stage('隔离 Koishi 已启动，正在检查桥接与扩展');
     const dataDir = path.join(instance, 'data', plugin.name);
