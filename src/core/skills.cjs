@@ -65,7 +65,10 @@ class Skills {
     if (defaults && !fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       for (const entry of fs.readdirSync(defaults, { withFileTypes: true })) {
-        if (entry.isDirectory()) fs.cpSync(path.join(defaults, entry.name), path.join(dir, entry.name), { recursive: true, errorOnExist: true, force: false });
+        // A filter selects Node's JS copy path. The native recursive fast path
+        // can abort Node 22 on Windows Unicode paths (nodejs/node#63970).
+        if (entry.isDirectory()) fs.cpSync(path.join(defaults, entry.name), path.join(dir, entry.name),
+          { recursive: true, errorOnExist: true, force: false, filter: () => true });
       }
     }
     this.checkDirectory();

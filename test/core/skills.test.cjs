@@ -80,3 +80,22 @@ test('default examples seed only on first directory creation and explicit librar
   const missing = path.join(root, 'external');
   assert.throws(() => new Skills(missing)); assert.equal(fs.existsSync(missing), false);
 });
+
+test('first-run seeding survives Windows Unicode and space paths and preserves nested files', t => {
+  const { root, write } = fixture(t);
+  const source = path.join(root, '中文 示例库'), target = path.join(root, '中文 实例', '技能库');
+  fs.mkdirSync(path.join(source, 'example', 'assets'), { recursive: true });
+  fs.copyFileSync(write('example', '中文技能正文'), path.join(source, 'example', 'SKILL.md'));
+  const bytes = Buffer.from([0, 1, 127, 255]);
+  fs.writeFileSync(path.join(source, 'example', 'assets', '参考文件.bin'), bytes);
+  // Native cpSync regressions can abort the process without throwing. Keep the
+  // reproduction in a child so that a failure is reported by the test runner.
+  const script = `const assert=require('node:assert/strict');
+    const {Skills}=require(${JSON.stringify(require.resolve('../../src/core/skills.cjs'))});
+    const library=new Skills(process.argv[1],process.argv[2]);
+    assert.equal(library.read('example').instructions,'中文技能正文');`;
+  const child = require('node:child_process').spawnSync(process.execPath, ['-e', script, target, source],
+    { encoding: 'utf8', timeout: 10000 });
+  assert.equal(child.status, 0, String(child.error || child.signal || '') + child.stderr);
+  assert.deepEqual(fs.readFileSync(path.join(target, 'example', 'assets', '参考文件.bin')), bytes);
+});

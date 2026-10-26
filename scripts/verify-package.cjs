@@ -52,13 +52,6 @@ async function verify() {
     assert.equal(typeof plugin.Config, 'function');
     assert.equal(typeof plugin.usage, 'string');
     assert.throws(() => plugin.Config({ allowedUsers: [] }));
-    const apply = plugin.apply;
-    plugin.apply = (ctx, config) => {
-      stage('正在执行发行包入口');
-      return apply(ctx, config);
-    };
-    const copy = fs.cpSync;
-    fs.cpSync = (...args) => { stage('正在复制示例目录：' + path.basename(args[0])); return copy(...args); };
     const { App } = local('koishi');
     stage('发行包已加载，正在启动隔离 Koishi');
     app = new App();
