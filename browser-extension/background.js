@@ -7,12 +7,12 @@ try{
  importScripts('config.js');
  bridgeConfig=BRIDGE;
 }catch{
- configurationError='无法加载 config.js，请在项目目录运行 node scripts/setup-web-bridge.cjs，再重新加载扩展。';
+ configurationError='无法加载 config.js，请在 Koishi 实例目录运行 npx --no-install koishi-gpt-bridge-setup，再加载或重载输出目录的扩展。旧源码部署可运行 node scripts/setup-web-bridge.cjs。';
 }
 if(!configurationError){
  const match=/^http:\/\/127\.0\.0\.1:(\d{1,5})$/.exec(bridgeConfig?.url||'');
  if(!match || Number(match[1])<1 || Number(match[1])>65535 || typeof bridgeConfig?.token!=='string' || !bridgeConfig.token.trim())
-  configurationError='config.js 的本机地址或令牌无效，请重新运行 node scripts/setup-web-bridge.cjs，再重新加载扩展。';
+  configurationError='config.js 的本机地址或令牌无效，请在 Koishi 实例目录重新运行 npx --no-install koishi-gpt-bridge-setup，再重载输出目录的扩展。旧源码部署可运行 node scripts/setup-web-bridge.cjs。';
 }
 let ticking=false;
 async function page(tabId,op,job){
@@ -29,7 +29,7 @@ async function page(tabId,op,job){
  const results=await chrome.scripting.executeScript({target:{tabId},func:pageStep,
   args:[op,{...job,workerVersion:chrome.runtime.getManifest?.().version||'development'}]});
  if(!results[0]?.result)throw Error('ChatGPT 页面脚本未返回结果，请检查扩展错误');
- if(results[0].result.error)throw Error(results[0].result.error);
+ if(results[0].result.error)throw Object.assign(Error(results[0].result.error),{probe:results[0].result.probe});
  return results[0].result;
 }
 async function store(current,status){if(!current)inputs.clear();await chrome.storage.local.set({current,status});}
@@ -69,6 +69,7 @@ async function waitForComposer(current,info){
   delete current.historySeen;delete current.historyStreak;
   delete current.reasoningApplied;delete current.reasoningAttempts;delete current.reasoningVerify;
   delete current.reasoningFallback;
+  delete current.reasoningSelection;
   delete current.skillApplied;delete current.skillAttempts;delete current.skillQuery;delete current.skillQueryWritten;
   delete current.skillInputMethod;
   await restoreSkillFocus(current);
@@ -121,6 +122,13 @@ function validReasoningFallback(current,fallback){
  return current.reasoningEffort==='pro'&&fallback?.requested==='pro'&&fallback.reason==='pro-unavailable'
   &&['instant','medium','high','xhigh'].includes(fallback.level);
 }
+function validWorkSelection(current,selection){
+ const target=/^tier-([1-9])$/.exec(current.reasoningEffort||'');
+ return current.mode==='work'&&selection?.kind==='work-tier'&&Number.isInteger(selection.total)
+  &&selection.total>=1&&selection.total<=9&&Number.isInteger(selection.tier)&&selection.tier>=1&&selection.tier<=selection.total
+  &&typeof selection.label==='string'&&!!selection.label&&typeof selection.model==='string'
+  &&selection.tier===(target?Number(target[1]):current.reasoningEffort==='instant'?1:current.reasoningEffort==='pro'?selection.total:0);
+}
 function reasoningConfirmed(current){
  return !current.reasoningEffort||current.reasoningApplied===current.reasoningEffort
   ||(current.reasoningVerify&&validReasoningFallback(current,current.reasoningFallback)
@@ -132,6 +140,12 @@ async function applyReasoning(current){
  await store(current,'正在切换网页推理程度：'+current.reasoningEffort);
  const verifying=current.reasoningVerify,fallback=current.reasoningFallback;
  const reasoning=await page(current.tabId,'reasoning',current);
+ if(reasoning.selection){
+  if(!validWorkSelection(current,reasoning.selection)
+   ||verifying&&!['kind','tier','total','label','model'].every(key=>reasoning.selection[key]===current.reasoningSelection?.[key]))
+   throw Error('工作网页强度档位确认信息无效；本次未提交');
+  current.reasoningSelection=reasoning.selection;
+ }
  if(reasoning.verify){
   if(reasoning.fallback){
    if(!validReasoningFallback(current,reasoning.fallback))throw Error('网页推理程度降级信息无效；本次未提交');
@@ -145,7 +159,8 @@ async function applyReasoning(current){
   &&reasoning.level===fallback.level))throw Error('网页推理程度与任务不一致；本次未提交');
  if(reasoning.level===current.reasoningEffort)delete current.reasoningFallback;
  current.reasoningApplied=reasoning.level;current.phase='opening';
- await store(current,current.reasoningFallback?'网页 Pro 暂不可用，已确认使用当前最高推理程度：'+reasoning.level:
+ await store(current,current.reasoningSelection?'网页工作强度已确认：第 '+current.reasoningSelection.tier+'/'+current.reasoningSelection.total+' 档（'+current.reasoningSelection.label+'）':
+  current.reasoningFallback?'网页 Pro 暂不可用，已确认使用当前最高推理程度：'+reasoning.level:
   '网页推理程度已确认：'+reasoning.level);
 }
 async function applySkill(current){
@@ -265,8 +280,8 @@ async function tick(){
   if(current.phase==='opening'){
    if(Date.now()-(current.openingStartedAt||current.openedAt)>90000)throw Error('ChatGPT 页面加载超时，会话未能准备就绪；本次未提交');
    // 续聊时页面必须落到同一个 thread 上。地址被重定向走（会话被删除、链接失效）时
-   // info.threadId 会变空，继续等只会一路空耗到桥接超时，所以这里明确失败：桥接收到
-   // 这个原因会解绑失效编号，下一条消息自动开一个新会话。
+   // info.threadId 会变空，继续等只会一路空耗到桥接超时。上报尚未提交的失败，
+   // 让连接器解绑失效编号，在新会话中自动恢复同一条消息一次。
    if(current.threadId && info.threadId!==current.threadId){
     if(Date.now()-current.openedAt>15000)throw Error('ChatGPT 网页会话已不存在或无法打开');
     return;
@@ -416,6 +431,7 @@ async function tick(){
     assistantId:info.assistantId||'',replyBlocks:info.replyBlocks,replyBounded:info.replyBounded,
     ...(current.reasoningEffort?{reasoningEffort:current.reasoningEffort,reasoningApplied:current.reasoningApplied}:{}),
     ...(current.reasoningFallback?{reasoningFallback:current.reasoningFallback}:{}),
+    ...(current.reasoningSelection?{reasoningSelection:current.reasoningSelection}:{}),
     ...(current.skill?{skillRequested:current.skill.name,skillApplied:current.skillApplied}:{}),
    },timing:current.timing});
    if(!current.threadId){current.threadId=info.threadId;await store(current,'已绑定本轮 ChatGPT 网页会话');}
@@ -470,7 +486,8 @@ async function tick(){
      if(!err.probe)err.probe=await page(current.tabId,'probe',current).catch(()=>undefined);
      await restoreSkillFocus(current);
      const phase=current.phase;
-     current.failure={message,probe:{...err.probe,timing:timings(current)}};current.phase='failing';
+     current.failure={message,beforeSubmission:phase==='opening'&&!current.sentAt&&!current.attachSent&&!current.submittedConfirmed,
+      probe:{...err.probe,timing:timings(current)}};current.phase='failing';
      await chrome.storage.local.set({current,lastFailure:{id:current.id,tabId:current.tabId,threadId:current.threadId||'',phase,
       recoveryCount:current.recoveryCount||0,message,at:Date.now()}});
     }

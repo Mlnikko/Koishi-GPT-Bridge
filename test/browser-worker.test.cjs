@@ -65,6 +65,36 @@ function worker({state=null,results={},storageSeed={}}={}){
 const opsOf=(calls,op)=>calls.filter(call=>call.op===op);
 const routeOf=(calls,route)=>calls.filter(call=>call.route===route);
 
+test('native Work tier proof survives worker suspension and is included in submission evidence',async()=>{
+ const state={id:'work-tier-proof',mode:'work',reasoningEffort:'tier-4',text:'原文',images:[]};
+ const selection={kind:'work-tier',tier:4,total:6,label:'轻度',model:'GPT Astra 轻度'};
+ const first=worker({state,results:{inspect:{editor:true,assistants:0,users:0,workMode:true},
+  reasoning:{pending:true,verify:true,selection}}});
+ await wait();await first.sandbox.tick();
+ assert.deepEqual(first.storage.current.reasoningSelection,selection);
+ assert.equal(opsOf(first.calls,'submit').length,0);
+ let sent=false;
+ const resumed=worker({state,storageSeed:{current:first.storage.current},results:op=>{
+  if(op==='reasoning')return {applied:true,level:'tier-4',selection:{model:selection.model,total:6,tier:4,label:'轻度',kind:'work-tier'}};
+  if(op==='inspect')return {editor:true,assistants:0,users:sent?1:0,workMode:true,
+   submitted:sent,threadId:sent?THREAD:'',stopping:sent,replyLength:0,images:0};
+  if(op==='submit')return {filled:true};if(op==='send'){sent=true;return {clicked:true};}
+ }});
+ await wait();for(let i=0;i<5;i++)await resumed.sandbox.tick();
+ assert.equal(opsOf(resumed.calls,'send').length,1);
+ assert.deepEqual(routeOf(resumed.calls,'/progress').find(call=>call.body.evidence)?.body.evidence.reasoningSelection,selection);
+});
+
+test('a changed Work tier proof blocks submission after worker suspension',async()=>{
+ const selection={kind:'work-tier',tier:4,total:6,label:'轻度',model:'GPT Astra 轻度'};
+ const state={id:'work-tier-changed',mode:'work',reasoningEffort:'tier-4',text:'原文',images:[]};
+ const current={...state,tabId:1,phase:'reasoning',openedAt:Date.now(),reasoningVerify:true,reasoningSelection:selection};
+ const {calls}=worker({state,storageSeed:{current},results:{reasoning:{applied:true,level:'tier-4',selection:{...selection,model:'different model'}}}});
+ await wait();
+ assert.equal(opsOf(calls,'submit').length,0);assert.equal(opsOf(calls,'send').length,0);
+ assert.match(routeOf(calls,'/failure')[0].body.message,/强度档位确认信息无效/);
+});
+
 test('explicit Work mode switches the page before filling even when no skill is selected',async()=>{
  const state={id:'plain-work',mode:'work',text:'普通工作任务',images:[]};let workMode=false;
  const {sandbox,storage,calls}=worker({state,results:(op)=>{
@@ -928,7 +958,7 @@ test('a complete picture found at the hard cap is delivered instead of discarded
 
 // ---------------------------------------------------------------- 复用网页会话
 
-test('reusing a ChatGPT thread that no longer opens fails instead of waiting forever', async()=>{
+test('an unopened ChatGPT thread reports a pre-submission failure instead of waiting forever', async()=>{
  // 默认就是持续会话，所以用户不会自己去换会话。地址被重定向回首页（threadId 变空）
  // 说明这个会话已经打不开，必须立刻给出可分类的失败，而不是一路空耗到桥接超时。
  const {sandbox,storage,calls}=worker({
@@ -943,7 +973,35 @@ test('reusing a ChatGPT thread that no longer opens fails instead of waiting for
  const failures=routeOf(calls,'/failure');
  assert.equal(failures.length,1);
  assert.match(failures[0].body.message,/会话已不存在或无法打开/);
+ assert.equal(failures[0].body.beforeSubmission,true);
  assert.match(storage.status,/任务失败/);
+});
+
+test('a replacement request for the same message escapes a persisted old failure and submits only once',async()=>{
+ const first={id:'abcdef123456',text:'再改一版',threadId:THREAD,images:[]};
+ const current={...first,tabId:1,phase:'failing',failure:{message:'ChatGPT 网页会话已不存在或无法打开',beforeSubmission:true}};
+ const state={...first,id:first.id+'-recovery',threadId:''};
+ const {sandbox,storage,calls}=worker({state,storageSeed:{current},results:op=>{
+  if(op==='inspect')return {editor:true,assistants:0,users:0};
+  if(op==='submit')return {filled:true};
+  if(op==='send')return {clicked:true};
+ }});
+ await wait();
+ assert.equal(storage.current.id,state.id);assert.equal(storage.current.phase,'opening');
+ assert.equal(storage.current.failure,undefined);assert.equal(storage.current.threadId,'');
+ for(let i=0;i<3;i++)await sandbox.tick();
+ assert.equal(routeOf(calls,'/failure').length,0);
+ assert.equal(opsOf(calls,'send').length,1);
+ assert.equal(opsOf(calls,'send')[0].job.message,first.text);
+});
+
+test('a failure after send intent is persisted never claims the message was unsubmitted',async()=>{
+ const state={id:'abcdef123456',text:'再改一版',threadId:THREAD,images:[]};
+ const current={...state,tabId:1,phase:'sending',openedAt:Date.now()-30000,sentAt:Date.now()-20000};
+ const {sandbox,calls}=worker({state,storageSeed:{current},results:{inspect:{error:'conversation not found'},probe:{}}});
+ await wait();
+ assert.equal(routeOf(calls,'/failure')[0].body.beforeSubmission,false);
+ assert.equal(opsOf(calls,'send').length,0);
 });
 
 test('a thread that has just been opened is given time to settle before being declared gone', async()=>{

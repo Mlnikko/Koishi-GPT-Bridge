@@ -226,11 +226,23 @@ test('only technical problems are classified as failures',()=>{
  assert.equal(webFailure('当前网页会话无法确认工作模式；本次未提交').code,'browser_interaction');
  assert.equal(webFailure('读取不到回复内容').code,'reply_unreadable');
  assert.equal(webFailure('ECONNRESET').code,'network');
- // 会话消失必须是独立的码：调用方靠它解绑 webThreadId，让下一条消息能自愈。
+ // 会话消失必须是独立的码：调用方解绑后，只在确认未提交时自动恢复本条消息。
  assert.equal(webFailure('ChatGPT 网页会话已不存在或无法打开').code,'thread_gone');
  assert.equal(webFailure('ChatGPT 会话不匹配，未执行操作').code,'thread_mismatch');
  // 拒绝文案不再被当成失败分类。
  assert.equal(webFailure('抱歉，我不能生成该图片。').code,'execution_failed');
+});
+
+for(const submitted of ['none','submitted','reading','asset','unknown'])
+test('thread recovery requires explicit pre-submission evidence: '+submitted,async t=>{
+ const {b,job,call,asset}=await setup(t);await call('/state');
+ const result=b.run(job,{threadId:id}).catch(err=>err);await new Promise(setImmediate);
+ if(['submitted','reading'].includes(submitted))await call('/progress',{id:job.id,phase:submitted});
+ if(submitted==='asset')await asset(`/result-asset?id=${job.id}&i=0`,png());
+ await call('/failure',{id:job.id,message:'conversation not found',
+  ...(submitted==='unknown'?{}:{beforeSubmission:true})});
+ const err=await result;
+ assert.equal(err.code,'thread_gone');assert.equal(err.beforeSubmission,submitted==='none');
 });
 test('a page-structure probe from the extension is kept beside the job, never breaking the report',async t=>{
  const {b,job,call}=await setup(t);await call('/state');

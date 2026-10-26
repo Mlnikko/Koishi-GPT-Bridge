@@ -9,13 +9,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 
-function setup({ projectRoot = path.join(__dirname, '..'), port = 5141, dataDir } = {}) {
+function validatePort(port) {
   port = Number(port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw Error('端口必须是 1–65535 的整数');
+  return port;
+}
+
+function setup({ projectRoot = path.join(__dirname, '..'), port = 5141, dataDir, extensionDir } = {}) {
+  port = validatePort(port);
   // Use the same directory as the plugin; a relocated Koishi install must not
   // silently create a second token in the default project directory.
   const root = dataDir ? path.resolve(dataDir) : path.join(projectRoot, 'data');
-  const target = path.join(projectRoot, 'browser-extension', 'config.js');
+  const target = path.join(extensionDir || path.join(projectRoot, 'browser-extension'), 'config.js');
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   const tokenFile = path.join(root, 'web-bridge-token');
   if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, randomBytes(32).toString('hex'), { mode: 0o600 });
@@ -38,4 +43,4 @@ if (require.main === module) {
     process.exitCode = 1;
   }
 }
-module.exports = { setup };
+module.exports = { setup, validatePort };

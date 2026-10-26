@@ -5,19 +5,21 @@ const { el, createDocument } = require('./helpers/dom.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../browser-extension/page.js'), 'utf8');
 const labels = { instant: 'Instant', medium: 'Medium', high: 'High', xhigh: 'Extra High', pro: 'Pro' };
 
-function fixture({ levels = ['instant', 'medium', 'high', 'xhigh', 'pro'], selected = 'pro', labelNames = labels, discardOnClose = false } = {}) {
+function fixture({ levels = ['instant', 'medium', 'high', 'xhigh', 'pro'], selected = 'pro', labelNames = labels, modelNames, discardOnClose = false } = {}) {
   const document = createDocument(), events = [];
   const editor = el('div', { id: 'prompt-textarea', role: 'textbox', contenteditable: 'true' });
   const trigger = el('button', { id: 'model-trigger', 'aria-label': '选择 ChatGPT 模型',
     'aria-expanded': 'false', 'data-codex-intelligence-trigger': 'true', 'data-selected-reasoning-effort': 'medium' });
   const description = el('span', { id: 'selected-level' });
+  const modelButton = el('button', { 'aria-label': '选择模型' });
   const thumb = el('span', { role: 'slider', 'aria-hidden': 'true', 'aria-valuemin': '0', 'aria-valuemax': String(levels.length - 1) });
   const control = el('div', { role: 'menuitem', 'data-reasoning-slider': 'true', 'aria-describedby': 'selected-level' }, [thumb]);
-  const menu = el('div', { role: 'menu', 'aria-labelledby': 'model-trigger', hidden: '' }, [description, control]);
-  let index = levels.indexOf(selected), opened = 0, verifying = false, fallback;
+  const menu = el('div', { role: 'menu', 'aria-labelledby': 'model-trigger', hidden: '' }, [modelButton, description, control]);
+  let index = levels.indexOf(selected), opened = 0, verifying = false, fallback, selection;
   const render = () => {
     description.childNodes = []; description.appendChild(`${labelNames[levels[index]]}，第 ${index + 1} 项，共 ${levels.length} 项。`);
     thumb.setAttribute('aria-valuenow', String(index));
+    if (modelNames) { modelButton.childNodes = []; modelButton.appendChild(modelNames[levels[index]]); }
   };
   render();
   trigger.click = () => {
@@ -42,13 +44,72 @@ function fixture({ levels = ['instant', 'medium', 'high', 'xhigh', 'pro'], selec
     KeyboardEvent: class { constructor(type, options) { this.type = type; Object.assign(this, options); } } };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
   const step = async (target, extra = {}) => {
-    const result = await sandbox.pageStep('reasoning', { reasoningEffort: target, reasoningVerify: verifying, reasoningFallback: fallback, ...extra });
+    const result = await sandbox.pageStep('reasoning', { reasoningEffort: target, reasoningVerify: verifying,
+      reasoningFallback: fallback, reasoningSelection: selection, ...extra });
     verifying = !result.applied && (verifying || !!result.verify);
     fallback = result.applied ? undefined : result.fallback || fallback;
+    selection = result.selection || selection;
     return result;
   };
-  return { document, editor, trigger, menu, description, thumb, control, events, step, selected: () => levels[index], opened: () => opened };
+  return { document, editor, trigger, menu, description, thumb, control, modelButton, events, step, selected: () => levels[index], opened: () => opened };
 }
+
+const workLevels = ['luna-high', 'sol-light', 'sol-medium', 'astra-light', 'astra-medium', 'astra-xhigh'];
+const workLabels = { 'luna-high': '高', 'sol-light': '轻度', 'sol-medium': '中',
+  'astra-light': '轻度', 'astra-medium': '中', 'astra-xhigh': '极高' };
+const workModels = Object.fromEntries(workLevels.map(level => [level, level.split('-')[0] + ' ' + workLabels[level]]));
+const workFixture = options => fixture({ levels: workLevels, selected: 'sol-light', labelNames: workLabels, modelNames: workModels, ...options });
+
+for (const [target, tier] of [['instant', 1], ['pro', 6], ['tier-2', 2], ['tier-3', 3], ['tier-4', 4], ['tier-5', 5]])
+test('Work selects and verifies native model tiers despite repeated labels: ' + target, async () => {
+  const f = workFixture(); let result;
+  for (let i = 0; i < 12; i++) { result = await f.step(target, { mode: 'work' }); if (!result.pending) break; }
+  assert.equal(result.applied, true); assert.equal(result.level, target);
+  assert.equal(result.selection.kind, 'work-tier'); assert.equal(result.selection.tier, tier);
+  assert.equal(result.selection.total, 6); assert.equal(result.selection.label, workLabels[workLevels[tier - 1]]);
+  assert.equal(result.selection.model, workModels[workLevels[tier - 1]]);
+  assert.equal(f.opened(), 2); assert.equal(f.trigger.getAttribute('aria-expanded'), 'false');
+});
+
+for (const target of ['medium', 'high', 'xhigh']) test('ambiguous Work effort labels require a native tier instead of choosing another model: ' + target, async () => {
+  const f = workFixture(); await f.step(target, { mode: 'work' });
+  assert.match((await f.step(target, { mode: 'work' })).error, /跨模型强度档位.*1–6/);
+  assert.equal(f.events.length, 0);
+});
+
+test('Work rejects out-of-range tiers and conflicting announced positions before changing the selection', async () => {
+  const f = workFixture(); await f.step('tier-7', { mode: 'work' });
+  assert.match((await f.step('tier-7', { mode: 'work' })).error, /当前只有 6 档/);
+  f.description.childNodes = []; f.description.appendChild('轻度，第 4 项，共 6 项。');
+  assert.match((await f.step('tier-3', { mode: 'work' })).error, /无法确认工作网页强度档位/);
+  assert.equal(f.events.length, 0);
+});
+
+test('Work verifies the model as well as the tier after the menu closes', async () => {
+  const f = workFixture({ selected: 'astra-medium' });
+  await f.step('tier-5', { mode: 'work' });
+  assert.equal((await f.step('tier-5', { mode: 'work' })).verify, true);
+  await f.step('tier-5', { mode: 'work' });
+  f.modelButton.childNodes = []; f.modelButton.appendChild('different model 中');
+  assert.match((await f.step('tier-5', { mode: 'work' })).error, /关闭菜单后发生变化/);
+});
+
+test('Chrome storage key reordering does not invalidate an identical Work selection', async () => {
+  const f = workFixture();
+  await f.step('tier-2', { mode: 'work' });
+  const preview = await f.step('tier-2', { mode: 'work' });
+  assert.equal(preview.verify, true);
+  await f.step('tier-2', { mode: 'work' });
+  const stored = Object.fromEntries(Object.entries(preview.selection).sort(([a], [b]) => a.localeCompare(b)));
+  const result = await f.step('tier-2', { mode: 'work', reasoningSelection: stored });
+  assert.equal(result.applied, true); assert.equal(result.selection.tier, 2);
+});
+
+test('Chat cannot consume a Work tier setting', async () => {
+  const f = fixture();
+  assert.match((await f.step('tier-3')).error, /推理程度参数无效/);
+  assert.equal(f.opened(), 0);
+});
 
 test('reasoning is read back from the actual slider and never from a misleading trigger attribute', async () => {
   const f = fixture();

@@ -1,6 +1,6 @@
 'use strict';
 const { MODES, normalizeMode, modeOf, contextOf, modeLabel } = require('../core/modes.cjs');
-const { normalizeReasoning, reasoningLabel, REASONING_USAGE } = require('../core/reasoning.cjs');
+const { normalizeReasoning, reasoningLabel, reasoningUsage } = require('../core/reasoning.cjs');
 const { textMessage } = require('../lib/feedback.cjs');
 
 function registerModes({ command, bot, chats, manage }) {
@@ -41,15 +41,17 @@ function registerModes({ command, bot, chats, manage }) {
       ? '已切换到 LM Studio：' + contextOf(selected, 'local').model + '。直接发消息即可。'
       : '当前会话已切回 ChatGPT 网页（' + modeLabel(selected) + '）。直接发消息即可。');
   });
-  command('/reasoning [程度:string]', '网页推理程度 default/instant/medium/high/xhigh/pro').action(manage((owner, chat, value, defaultName) => {
+  command('/reasoning [程度:string]', '网页推理程度；工作模式可按网页档位编号选择').action(manage((owner, chat, value, defaultName) => {
     const current = chats.current(owner, chat);
     if (modeOf(current) === 'local') return 'LM Studio 使用本地模型设置；/reasoning 适用于聊天、工作模式。';
-    if (!value) return '当前会话推理程度：' + reasoningLabel(contextOf(current).reasoningEffort) + '（' + modeLabel(current) + '）。\n' + REASONING_USAGE;
-    const level = normalizeReasoning(value), s = chats.ensure(owner, chat, defaultName);
+    const mode = modeOf(current);
+    if (!value) return '当前会话推理程度：' + reasoningLabel(contextOf(current).reasoningEffort, mode) + '（' + modeLabel(current) + '）。\n' + reasoningUsage(mode);
+    const level = normalizeReasoning(value, mode), s = chats.ensure(owner, chat, defaultName);
     chats.setReasoning(s.id, owner, chat, level);
-    return '会话「' + s.name + '」的' + modeLabel(s) + '推理程度已设为：' + reasoningLabel(level)
+    return '会话「' + s.name + '」的' + modeLabel(s) + '推理程度已设为：' + reasoningLabel(level, mode)
       + '。下一条消息起生效，已排队或运行中的任务保持原设置。'
-      + (level === 'default' ? '' : level === 'pro' ? '\nPro 暂不可用时使用当前最高可用档，恢复后自动使用 Pro。'
+      + (level === 'default' ? '' : mode === 'work' ? '\n按工作网页的原生强度档位确认；该档位可能同时选择模型与推理强度。'
+        : level === 'pro' ? '\nPro 暂不可用时使用当前最高可用档，恢复后自动使用 Pro。'
         : '\n发送前会应用网页选项；账号不支持时会报错。');
   }));
 }

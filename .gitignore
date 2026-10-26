@@ -1,5 +1,6 @@
 # 依赖
 node_modules/
+dist/
 
 # macOS 文件夹显示设置
 .DS_Store

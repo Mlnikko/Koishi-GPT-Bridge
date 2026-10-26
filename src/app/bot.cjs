@@ -54,7 +54,7 @@ function createBot(config, { chats, presets, skills, preferences, web, local, lo
     + (j.skill ? (j.backend === 'lmstudio' ? `\n技能：${j.skill.name}（版本 ${j.skill.revision.slice(0, 8)}）`
       : `\n网页技能：@${j.skill.name}`) : '')
     + (j.imagePrompt ? `\n图片模板：${j.imagePrompt.name}（版本 ${j.imagePrompt.revision.slice(0, 8)}）` : '')
-    + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort)}` : '')
+    + (j.reasoningEffort ? `\n推理程度：${reasoningLabel(j.reasoningEffort, modeOf(j))}` : '')
     + (imagesIn(j).length ? `\n参考图片：${imagesIn(j).length} 张` : '')
     + (j.status === 'ready' ? `\n回复发送：${j.delivery === 'sent' ? '成功' : j.delivery === 'failed' ? '失败' : '待发送'}（已确认 ${j.deliveryCursor || 0} 段）。可发送「/retry ${j.id}」。` : '')
     + (j.deliveryError ? `\n发送详情：${textMessage(j.deliveryError)}` : '')

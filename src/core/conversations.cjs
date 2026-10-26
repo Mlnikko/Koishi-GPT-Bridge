@@ -140,7 +140,7 @@ class Conversations {
   setReasoning(id, owner, chat, value) {
     const s = this.get(id, owner, chat); if (!s) throw Error('未找到你的会话');
     if (modeOf(s) === 'local') throw Error('本地模型使用自己的推理设置');
-    const level = normalizeReasoning(value);
+    const level = normalizeReasoning(value, modeOf(s));
     return this.updateContext(id, owner, chat, modeOf(s), context => {
       if (level === 'default') delete context.reasoningEffort;
       else context.reasoningEffort = level;

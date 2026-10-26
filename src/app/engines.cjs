@@ -10,20 +10,31 @@ function createRunner({ chats, web, local, replyTimeoutMs, getSession, onProgres
     const mode = modeOf(job), context = contextOf(chat, mode);
     if (chat && modeOf(chat) !== mode) throw Error('会话模式已变化，任务未提交');
     const session = getSession(job.id);
-    const remaining = session ? session.timestamp + 270000 - Date.now() : replyTimeoutMs;
-    if (remaining <= 0) throw Object.assign(Error('消息等待过久，QQ 回复窗口即将到期；本次未提交' + (mode === 'local' ? '本地模型' : '网页') + '，请重新发送。'), { code: 'reply_expired' });
-    const options = { signal, timeoutMs: Math.max(1, Math.min(replyTimeoutMs, remaining)),
-      onProgress: phase => onProgress(job, phase) };
+    const deadline = Math.min(Date.now() + replyTimeoutMs, session ? session.timestamp + 270000 : Infinity);
+    const options = () => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw Object.assign(Error('消息等待过久，QQ 回复窗口即将到期；本次未提交' + (mode === 'local' ? '本地模型' : '网页') + '，请重新发送。'), { code: 'reply_expired' });
+      return { signal, timeoutMs: remaining, onProgress: phase => onProgress(job, phase) };
+    };
     if (mode === 'local') {
       if (context.model !== job.model) throw Error('本地会话配置已变化，任务未提交');
-      return local.run(job, options);
+      return local.run(job, options());
     }
-    try {
-      return await web.run(job, { ...options, threadId: context.webThreadId,
-        onThread: id => { if (chat) chats.bindWeb(chat, id, mode); onThread(id); } });
-    } catch (err) {
-      if (err.code === 'thread_gone' && contextOf(chat, mode).webThreadId) chats.unbindWeb(chat, mode);
-      throw err;
+    for (let recovered = false; ; recovered = true) {
+      const threadId = contextOf(chat, mode).webThreadId;
+      try {
+        return await web.run(job, { ...options(), threadId,
+          // A separate transport ID keeps a lost failure acknowledgement from
+          // applying the old attempt's failure or result to the replacement.
+          requestId: recovered ? job.id + '-recovery' : job.id,
+          onThread: id => { if (chat) chats.bindWeb(chat, id, mode); onThread(id); } });
+      } catch (err) {
+        if (err.code !== 'thread_gone') throw err;
+        if (contextOf(chat, mode).webThreadId) chats.unbindWeb(chat, mode);
+        if (recovered || !threadId || err.beforeSubmission !== true || signal?.aborted) throw err;
+        onThread(undefined);
+        onProgress(job, '原网页会话已失效，正在新建会话并自动重试本条消息（仅一次）');
+      }
     }
   };
 }

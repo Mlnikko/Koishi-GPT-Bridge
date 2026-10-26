@@ -1,9 +1,11 @@
+#!/usr/bin/env node
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
+const { resolveDataDir } = require('../src/core/data-paths.cjs');
 
-async function inspect({ dataDir = path.join(__dirname, '..', 'data') } = {}) {
-  const root = path.resolve(dataDir);
+async function inspect({ dataDir, baseDir, packageRoot } = {}) {
+  const root = resolveDataDir({ dataDir, baseDir, packageRoot }).dataDir;
   const port = Number(fs.readFileSync(path.join(root, 'web-bridge-port'), 'utf8').trim());
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw Error('本机端口记录无效，请启动或重启 Koishi');
   const token = fs.readFileSync(path.join(root, 'web-bridge-token'), 'utf8').trim();

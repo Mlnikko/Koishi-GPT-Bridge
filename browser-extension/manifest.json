@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "QQ ChatGPT 网页桥接",
-  "version": "0.4.0",
+  "version": "0.4.3",
   "minimum_chrome_version": "120",
   "description": "把 QQ 消息送进 ChatGPT 聊天或工作页面，支持原生 @技能，并将网页回复送回。",
   "permissions": [

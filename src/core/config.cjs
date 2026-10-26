@@ -2,7 +2,7 @@
 const path = require('node:path');
 
 // Validate the whole configuration before opening files, sockets or timers.
-function normalizeConfig(config, defaultRoot) {
+function normalizeConfig(config, defaultRoot, baseDir = process.cwd()) {
   if (!Array.isArray(config?.allowedUsers) || !config.allowedUsers.length
     || config.allowedUsers.some(user => typeof user !== 'string' || !user.trim())) {
     throw Error('必须配置 allowedUsers 为非空的用户编号数组');
@@ -16,7 +16,7 @@ function normalizeConfig(config, defaultRoot) {
   for (const key of ['groupChat', 'notifyProgress']) {
     if (config[key] != null && typeof config[key] !== 'boolean') throw Error(`${key} 必须是布尔值`);
   }
-  if (config.dataDir != null && (typeof config.dataDir !== 'string' || !config.dataDir.trim()))
+  if (config.dataDir != null && (typeof config.dataDir !== 'string' || !config.dataDir.trim() || /\x00/.test(config.dataDir)))
     throw Error('dataDir 必须是非空路径');
   if (config.skillsDir != null && (typeof config.skillsDir !== 'string' || !config.skillsDir.trim() || /\x00/.test(config.skillsDir)))
     throw Error('skillsDir 必须是非空路径');
@@ -37,8 +37,8 @@ function normalizeConfig(config, defaultRoot) {
   return {
     ...config,
     allowedUsers: [...new Set(config.allowedUsers.map(user => user.trim()))],
-    dataDir: path.resolve(config.dataDir || defaultRoot),
-    skillsDir: config.skillsDir == null ? undefined : path.resolve(config.skillsDir),
+    dataDir: path.resolve(baseDir, config.dataDir || defaultRoot),
+    skillsDir: config.skillsDir == null ? undefined : path.resolve(baseDir, config.skillsDir),
     webBridgePort: integer('webBridgePort', 5141, 0, 65535),
     lmStudioBaseUrl: lmStudioUrl.href.replace(/\/$/, ''),
     lmStudioModel: config.lmStudioModel?.trim() || '',

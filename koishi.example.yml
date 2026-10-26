@@ -1,18 +1,22 @@
 # 本插件在 koishi.yml 中的配置示例。
 # 可直接把下面 plugins 段合并进 Koishi 实例的 koishi.yml，
-# 键名也可写成带实例后缀的形式，例如 codex-image-local:xw6vpk。
+# 键名也可写成带实例后缀的形式，例如 chatgpt-bridge:xw6vpk。
 #
-# 完整说明见 README.md 的「安装与配置」。
+# 完整配置与迁移步骤见 docs/installation.md。
 
 plugins:
-  codex-image-local:
+  chatgpt-bridge:
     # 必需。允许在【私聊】调用本插件的 QQ openid 列表。
     # ["*"] 表示允许所有 QQ 私聊用户。群聊是否可用由下面的 groupChat 单独控制，
     # 本列表不参与群聊判定。
     allowedUsers:
-      - '*'
+      - '替换为你的 QQ openid'
 
     # 以下均为可选，不写即使用默认值。
+
+    # 新安装默认 <实例>/data/codex-image-local；相对路径从 koishi.yml 所在目录解析。
+    # 旧版源码部署切换 npm 安装前，先显式填入原数据目录绝对路径，避免另建空会话库。
+    # dataDir: /绝对路径/原项目/data
 
     # 群聊支持。默认 false，即群聊完全不响应（保持历史行为）。
     # 设为 true 后，群里任何成员 @ 机器人即可使用，回复直接发到群里，群成员均可见。
@@ -49,7 +53,7 @@ plugins:
     # lmStudioHistoryImageBytes: 20971520
 
     # 本机桥接端口，需与 browser-extension/config.js 中的地址保持一致。
-    # 默认 5141。改动后需重跑：node scripts/setup-web-bridge.cjs <端口>
+    # 默认 5141。改动后在实例目录重跑：npx --no-install koishi-gpt-bridge-setup --port <端口>
     # webBridgePort: 5141
 
     # 单条消息的文字上限，同时也是单条回复的拆分长度。默认 1500 字。

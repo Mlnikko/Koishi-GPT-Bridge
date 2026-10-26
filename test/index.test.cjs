@@ -267,7 +267,7 @@ test('/new starts a fresh context and preserves the previous conversation for sw
   assert.match(await dispatch(app, s, `/chat ${first.sessionId}`), /已切换：alice/);
 });
 
-test('a deleted ChatGPT thread is unbound, so the next message starts a new one', async () => {
+test('a deleted ChatGPT thread after submission is unbound without resending the message', async () => {
   const app = apply();
   const { port, token } = await bridgeOf(app.root);
   const beat = () => fetch(`http://127.0.0.1:${port}/state`, { headers: { 'x-bridge-token': token } });
@@ -284,13 +284,88 @@ test('a deleted ChatGPT thread is unbound, so the next message starts a new one'
   assert.ok(job, '桥接应当已经挂起这个任务');
   // 扩展先上报会话编号（绑定），再报告这个会话在网页侧已经打不开。
   await post('/progress', { id: job.id, threadId: THREAD, phase: 'submitted' });
-  await post('/failure', { id: job.id, message: 'ChatGPT 网页会话已不存在或无法打开' });
+  await post('/failure', { id: job.id, message: 'ChatGPT 网页会话已不存在或无法打开', beforeSubmission: true });
   const [failed] = await settle(app.root);
   assert.equal(failed.status, 'failed');
   assert.equal(failed.errorCode, 'thread_gone');
   const saved = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'), 'utf8'));
   assert.equal(saved.items[0].contexts.chat.webThreadId, undefined, '失效的网页会话必须解绑，否则这个用户会被永久卡死');
   assert.ok(saved.items[0].id);
+});
+
+for (const mode of ['chat', 'work']) test(mode + ' automatically recovers an unopened thread and returns the original message result', async () => {
+  const app = apply({ notifyProgress: false });
+  const { port, token } = await bridgeOf(app.root);
+  const headers = { 'x-bridge-token': token, 'x-bridge-capabilities': 'web-modes,native-skills,reasoning', 'Content-Type': 'application/json' };
+  const call = (route, body) => fetch(`http://127.0.0.1:${port}${route}`, {
+    method: body ? 'POST' : 'GET', headers, body: body ? JSON.stringify(body) : undefined,
+  });
+  const activeJob = async previousId => {
+    for (let attempt = 0; attempt < 300; attempt++) {
+      const { job } = await (await call('/state')).json();
+      if (job && job.id !== previousId) return job;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw Error('桥接未发布预期的网页请求');
+  };
+  const workThread = '99999999-2222-3333-4444-555555555555';
+  const newThread = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  await call('/state');
+  // Both modes already have history; recovery must change only the active one.
+  for (const [selected, threadId] of [['chat', THREAD], ['work', workThread]]) {
+    await slash(app, '/mode ' + selected);
+    const seed = session({ messageId: 'seed-' + selected, elements: [{ type: 'text', attrs: { content: '建立上下文' } }] });
+    await dispatch(app, seed);
+    const job = await activeJob();
+    await call('/result', { id: job.id, threadId, segments: [{ type: 'text', text: '已建立' }] });
+    await settle(app.root);
+  }
+  await slash(app, '/mode ' + mode);
+  const reasoning = mode === 'work' ? 'tier-4' : 'high';
+  await slash(app, '/reasoning ' + (mode === 'work' ? '4' : reasoning));
+  if (mode === 'work') await slash(app, '/skill summarize-text');
+  const original = session({ messageId: 'recover', elements: [
+    { type: 'text', attrs: { content: '继续处理这张图' } }, { type: 'img', attrs: { src: png() } },
+  ] });
+  await dispatch(app, original);
+  const first = await activeJob();
+  assert.equal(first.threadId, mode === 'chat' ? THREAD : workThread);
+  assert.equal((await call('/failure', { id: first.id, message: 'ChatGPT 网页会话已不存在或无法打开', beforeSubmission: true })).status, 200);
+  const retry = await activeJob(first.id);
+  assert.equal(retry.threadId, ''); assert.equal(retry.text, first.text);
+  assert.equal(retry.mode, mode); assert.equal(retry.reasoningEffort, reasoning);
+  assert.deepEqual(retry.images, first.images); assert.deepEqual(retry.skill, first.skill);
+  if (mode === 'work') assert.equal(retry.skill.name, 'summarize-text');
+  const running = jobFiles(app.root).find(job => job.id === first.id);
+  assert.equal(running.status, 'running'); assert.equal(running.threadId, undefined);
+  assert.deepEqual(original.sent, [], '恢复过程中不应向 QQ 报告任务失败');
+  assert.match(await slash(app, '/status'), new RegExp(first.id));
+  const image = await call(`/input?id=${retry.id}&i=0`);
+  assert.equal(image.status, 200);
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), pngBytes());
+  assert.equal((await call(`/input?id=${first.id}&i=0`)).status, 409);
+  // A lost acknowledgement may make the old worker resend its failure. Its
+  // transport ID cannot fail, bind or complete the replacement attempt.
+  assert.equal((await call('/failure', { id: first.id, message: 'conversation not found', beforeSubmission: true })).status, 409);
+  assert.equal((await call('/progress', { id: first.id, threadId: first.threadId, phase: 'submitted' })).status, 409);
+  assert.equal((await call('/result', { id: first.id, threadId: first.threadId, segments: [{ type: 'text', text: '旧回复' }] })).status, 409);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/result-asset?id=${first.id}&i=0`, {
+    method: 'POST', headers, body: pngBytes(),
+  })).status, 409);
+  const result = { id: retry.id, threadId: newThread, segments: [{ type: 'text', text: '自动恢复成功' }] };
+  assert.equal((await call('/result', result)).status, 200);
+  assert.equal((await call('/result', result)).status, 200, '恢复后的结果确认仍应支持网络重试');
+  const jobs = await settle(app.root), finished = jobs.find(job => job.id === first.id);
+  assert.equal(jobs.length, 3, '恢复应继续原任务，不能创建重复的用户任务');
+  assert.equal(finished.status, 'ready'); assert.equal(finished.threadId, newThread);
+  assert.deepEqual(original.sent, ['自动恢复成功']);
+  const dir = path.join(app.root, 'jobs', first.id);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'result.json'))).id, first.id);
+  assert.equal(fs.existsSync(path.join(dir, 'failure.json')), false);
+  const saved = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
+  assert.equal(saved.contexts[mode].webThreadId, newThread);
+  assert.equal(saved.contexts[mode === 'chat' ? 'work' : 'chat'].webThreadId, mode === 'chat' ? workThread : THREAD);
+  assert.equal(saved.contexts[mode].reasoningEffort, reasoning);
 });
 
 test('while one message is still running, the same conversation refuses a second one', async () => {
@@ -577,6 +652,24 @@ test('/reasoning changes only future jobs and the snapshot reaches the browser b
   await fetch(`http://127.0.0.1:${port}/failure`, { method: 'POST', headers,
     body: JSON.stringify({ id: second.id, message: '网页推理程度测试结束' }) });
   await settle(app.root);
+});
+
+test('native Work reasoning tiers persist across mode switches without leaking into Chat', async () => {
+  const app = apply({ notifyProgress: false });
+  await slash(app, '/mode 工作');
+  assert.match(await slash(app, '/reasoning 4'), /已设为：第 4 档/);
+  assert.match(await slash(app, '/reasoning'), /当前会话推理程度：第 4 档/);
+  assert.match(await slash(app, '/chat'), /推理：第 4 档/);
+  const saved = JSON.parse(fs.readFileSync(path.join(app.root, 'conversations.json'))).items[0];
+  assert.equal(saved.contexts.work.reasoningEffort, 'tier-4');
+  await slash(app, '/mode 聊天');
+  assert.match(await slash(app, '/reasoning 4'), /用法/);
+  assert.match(await slash(app, '/reasoning'), /跟随网页/);
+  await slash(app, '/mode 工作');
+  assert.match(await slash(app, '/reasoning'), /第 4 档/);
+  assert.match(await slash(app, '/reasoning instant'), /已设为：网页最低档/);
+  assert.match(await slash(app, '/reasoning pro'), /已设为：网页最高档/);
+  assert.deepEqual(jobFiles(app.root), []);
 });
 
 test('bare words and image captions are forwarded; unknown slash commands return local help', async () => {

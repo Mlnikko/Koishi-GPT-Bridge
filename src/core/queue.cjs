@@ -98,7 +98,7 @@ class JobQueue {
     mode = mode === undefined ? modeOf({ backend, skill }) : normalizeMode(mode);
     if (backend !== undefined && backend !== MODES[mode].backend) throw Error('任务模式与执行后端不一致');
     if (mode === 'chat' && skill) throw Error('聊天模式不调用技能，请切换到工作模式');
-    if (reasoningEffort !== undefined) reasoningEffort = normalizeReasoning(reasoningEffort);
+    if (reasoningEffort !== undefined) reasoningEffort = normalizeReasoning(reasoningEffort, mode);
     if (skill !== undefined) skill = validateSkillSnapshot(skill);
     if (preset !== undefined) {
       if (mode !== 'local') throw Error('预设只适用于本地模型任务');

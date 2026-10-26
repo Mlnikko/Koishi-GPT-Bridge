@@ -18,7 +18,7 @@ function registerSessions({ command, manage, chats, busy }) {
     const current = chats.current(owner, chat);
     const list = chats.list(owner, chat);
     return `当前：${current ? current.name + '（' + current.id + '）' : '暂无（发消息自动创建）'}\n`
-      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''} [${modeLabel(s)}]${busy(s.id) ? ' [处理中]' : ''}${modeOf(s) === 'local' ? ' [LM Studio：' + contextOf(s, 'local').model + ']' : ''}${contextOf(s, 'local').preset ? ' [本地预设：' + contextOf(s, 'local').preset + ']' : ''}${contextOf(s).skill ? ' [技能：' + contextOf(s).skill + ']' : ''}${contextOf(s).reasoningEffort && modeOf(s) !== 'local' ? ' [推理：' + reasoningLabel(contextOf(s).reasoningEffort) + ']' : ''}`).join('\n') || '暂无会话');
+      + (list.map(s => `${s.id} ${s.name}${s.id === current?.id ? ' [当前]' : ''} [${modeLabel(s)}]${busy(s.id) ? ' [处理中]' : ''}${modeOf(s) === 'local' ? ' [LM Studio：' + contextOf(s, 'local').model + ']' : ''}${contextOf(s, 'local').preset ? ' [本地预设：' + contextOf(s, 'local').preset + ']' : ''}${contextOf(s).skill ? ' [技能：' + contextOf(s).skill + ']' : ''}${contextOf(s).reasoningEffort && modeOf(s) !== 'local' ? ' [推理：' + reasoningLabel(contextOf(s).reasoningEffort, modeOf(s)) + ']' : ''}`).join('\n') || '暂无会话');
   }));
   command('/rename [名称:text]', '重命名当前会话；最多 40 字').action(manage((owner, chat, name) => {
     if (!name?.trim()) throw Error('用法：/rename 新名称');

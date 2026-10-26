@@ -197,8 +197,9 @@ async function pageStep(operation,job){
  if(operation==='reasoning'){
   const levels=['instant','medium','high','xhigh','pro'];
   const target=job.reasoningEffort;
+  const tierTarget=/^tier-([1-9])$/.exec(target||'');
   if(!target||target==='default')return {applied:true};
-  if(!levels.includes(target))throw Error('推理程度参数无效；本次未提交');
+  if(!levels.includes(target)&&!(requestedMode==='work'&&tierTarget))throw Error('推理程度参数无效；本次未提交');
   const behindMenu=node=>node.getAttribute('aria-expanded')==='true'&&!node.closest?.('[hidden], [inert]')
    &&(typeof node.getClientRects!=='function'||node.getClientRects().length>0)
    &&(typeof getComputedStyle!=='function'||!['hidden','collapse'].includes(getComputedStyle(node).visibility)&&getComputedStyle(node).display!=='none');
@@ -239,9 +240,38 @@ async function pageStep(operation,job){
   const selected=descriptions.map(text=>aliases[text.split(/[,，。]/)[0].trim().toLowerCase()]).find(Boolean);
   const value=Number(slider?.getAttribute('aria-valuenow')),
    min=Number(slider?.getAttribute('aria-valuemin')),max=Number(slider?.getAttribute('aria-valuemax'));
-  if(!slider||!selected||!['aria-valuenow','aria-valuemin','aria-valuemax'].every(attr=>/^\d+$/.test(slider.getAttribute(attr)||''))
+  if(!slider||!['aria-valuenow','aria-valuemin','aria-valuemax'].every(attr=>/^\d+$/.test(slider.getAttribute(attr)||''))
    ||![value,min,max].every(Number.isInteger)||min>value||value>max||max-min>8)
    throw Error('无法确认网页当前推理程度；本次未提交');
+  // Work's slider can choose different models with repeated effort labels:
+  // e.g. Luna High, Sol Light, Sol Medium, Astra Light, Medium, Extra High.
+  // Use its announced native position, never the Chat label ordering.
+  if(requestedMode==='work'&&(tierTarget||target==='instant'||target==='pro'||max-min!==4)){
+   const ordinal=descriptions.map(text=>/第\s*(\d+)\s*项[，,]\s*共\s*(\d+)\s*项|(?:item\s+)?(\d+)\s+of\s+(\d+)/i.exec(text)).find(Boolean);
+   const position=ordinal&&Number(ordinal[1]||ordinal[3]),total=ordinal&&Number(ordinal[2]||ordinal[4]);
+   if(position!==value-min+1||total!==max-min+1)
+    throw Error('无法确认工作网页强度档位；本次未提交');
+   const desired=tierTarget?Number(tierTarget[1]):target==='instant'?1:target==='pro'?total:0;
+   if(!desired)throw Error('工作网页使用跨模型强度档位，请使用 /reasoning 1–'+total+'，或 instant（最低档）、pro（最高档）；本次未提交');
+   if(desired>total)throw Error('工作网页当前只有 '+total+' 档强度，无法选择第 '+desired+' 档；本次未提交');
+   const label=descriptions.find(text=>text.trim())?.split(/[,，。]/)[0].trim().slice(0,80)||'';
+   const modelControl=Array.from(menus[0].querySelectorAll('[aria-label]')).find(b=>['选择模型','Select model'].includes(b.getAttribute('aria-label')));
+   const selection={kind:'work-tier',tier:position,total,label,model:String(modelControl?.innerText||'').replace(/\s+/g,' ').trim().slice(0,120)};
+   // Chrome storage/RPC can reorder object keys; compare the actual fields.
+   const sameSelection=['kind','tier','total','label','model'].every(key=>selection[key]===job.reasoningSelection?.[key]);
+   if(job.reasoningVerify&&(position!==desired||!sameSelection))
+    return {error:'工作网页强度档位在关闭菜单后发生变化；本次未提交',
+     probe:{requestedMode,reasoningEffort:target,expectedSelection:job.reasoningSelection,actualSelection:selection}};
+   if(position===desired){
+    trigger.click();return {...(job.reasoningVerify?{applied:true,level:target}:{pending:true,verify:true}),selection};
+   }
+   const key=position<desired?'ArrowRight':'ArrowLeft';
+   control.focus();
+   control.dispatchEvent(new KeyboardEvent('keydown',{key,code:key,bubbles:true,cancelable:true}));
+   control.dispatchEvent(new KeyboardEvent('keyup',{key,code:key,bubbles:true}));
+   return {pending:true};
+  }
+  if(!selected)throw Error('无法确认网页当前推理程度；本次未提交');
   // Closing the menu can discard a preview or reveal a late account setting.
   // Reopen and read it back on later worker ticks before allowing a submission.
   const fallback=job.reasoningFallback;

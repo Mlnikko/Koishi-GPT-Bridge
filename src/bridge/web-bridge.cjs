@@ -40,13 +40,12 @@ function webFailure(reply) {
   const text = String(reply || '');
   if (/登录|log in|sign in/i.test(text)) return error('authentication', 'ChatGPT 网页需要登录，请在 Chrome 中登录后重试');
   if (/上限|限额|额度|rate.limit|usage.limit|too many requests/i.test(text)) return error('rate_limit', 'ChatGPT 网页额度或速率受限：' + safeReason(text));
-  // 会话被删除或链接失效。单独给一个码，因为调用方要靠它解绑 webThreadId —— 持续
-  // 会话下用户不会自己去换会话，不解绑就等于把这个人永久卡在一个失效编号上。
+  // 调用方据此解绑失效编号；确认尚未提交的任务可以在新会话上恢复一次。
   if (/会话已不存在|会话无法打开|会话已被删除|conversation not found|thread not found/i.test(text))
-    return error('thread_gone', '原 ChatGPT 网页会话已不存在或无法打开，下一条消息会自动开启一个新的网页会话。');
+    return error('thread_gone', '原 ChatGPT 网页会话已不存在或无法打开。');
   if (/会话不匹配|会话与任务不一致/.test(text))
     return error('thread_mismatch', 'ChatGPT 网页没有停在任务指定的会话上，本次未提交：' + safeReason(text));
-  if (/推理程度|技能|模式/.test(text))return error('browser_interaction','ChatGPT 网页操作未完成：'+safeReason(text));
+  if (/推理程度|强度档位|技能|模式/.test(text))return error('browser_interaction','ChatGPT 网页操作未完成：'+safeReason(text));
   if (/页面加载|标签页|输入框|发送按钮|无法填写|提交状态|页面脚本|人工验证|参考图片|图片上传|无法附加|回复文件|文件预览/.test(text))
     return error('browser_interaction', 'ChatGPT 网页操作未完成：' + safeReason(text));
   const info = failureInfo({ technical: text });
@@ -97,7 +96,7 @@ class WebBridge {
   requestInfo() {
     const p=this.pending;
     if(!p)return null;
-    return {id:p.job.id,text:submissionText(p.job.input),mode:modeOf(p.job),threadId:p.threadId||'',cancelled:!!p.cancelled,
+    return {id:p.requestId,text:submissionText(p.job.input),mode:modeOf(p.job),threadId:p.threadId||'',cancelled:!!p.cancelled,
       // A native @ mention loads the skill already installed in ChatGPT. Never
       // put the local instruction snapshot into the webpage's user message.
       ...(p.job.skill ? {skill:{name:p.job.skill.name}} : {}),
@@ -132,7 +131,7 @@ class WebBridge {
       }
       if(req.method==='GET' && new URL(req.url,'http://127.0.0.1').pathname==='/input') {
         const url=new URL(req.url,'http://127.0.0.1'),p=this.pending;
-        if(!p || url.searchParams.get('id')!==p.job.id) return send(409,{error:'job is no longer active'});
+        if(!p || url.searchParams.get('id')!==p.requestId) return send(409,{error:'job is no longer active'});
         const images=imagesOf(p.job.input);
         const image=images[Number(url.searchParams.get('i')||0)];
         if(!image) return send(404,{error:'no such input image'});
@@ -149,7 +148,7 @@ class WebBridge {
       // as soon as a reply carries more than one image.
       if(url.pathname==='/result-asset') {
         const p=this.pending, id=url.searchParams.get('id');
-        if(!p || id!==p.job.id) return send(409,{error:'job is no longer active'});
+        if(!p || id!==p.requestId) return send(409,{error:'job is no longer active'});
         requestPending=p;
         const index=Number(url.searchParams.get('i'));
         // Assets are uploaded in order, so the running count is also the next index.
@@ -170,12 +169,13 @@ class WebBridge {
       }
       const raw=await readBody(req,JSON_BODY_LIMIT);
       const body=JSON.parse(raw.toString('utf8')||'{}'),p=this.pending;
-      if(!p || body.id!==p.job.id){
+      if(!p || body.id!==p.requestId){
         if(url.pathname==='/result' && body.id===this.lastResult) return send(200,{ok:true});
         return send(409,{error:'job is no longer active'});
       }
       requestPending=p;
       if(url.pathname==='/progress') {
+        if(body.phase==='submitted'||body.phase==='reading')p.submitted=true;
         if(body.threadId){
           bindThread(p,body.threadId);
         }
@@ -194,7 +194,10 @@ class WebBridge {
         // the reply. Keep it beside the job so the selectors can be corrected from
         // real markup instead of guesswork; never let it break the failure report.
         saveProbe(p.job.dir, 'dom-probe.json', body.probe);
-        p.finish(p.cancelled || webFailure(String(body.message||'网页未返回明确原因')));return send(200,{ok:true});
+        const failure=p.cancelled || webFailure(String(body.message||'网页未返回明确原因'));
+        if(failure.code==='thread_gone')
+          failure.beforeSubmission=body.beforeSubmission===true&&!p.submitted&&!p.assets.size;
+        p.finish(failure);return send(200,{ok:true});
       }
       if(url.pathname==='/result') {
         if(p.cancelled){p.finish(p.cancelled);return send(409,{error:'cancelled'});}
@@ -212,7 +215,7 @@ class WebBridge {
         // Keep a plain-text copy so a truncated QQ delivery can be replayed and so
         // a bad reply can be inspected without re-reading the web page.
         try { fs.writeFileSync(path.join(p.job.dir,'reply.md'),replyText(segments),{mode:0o600}); } catch {}
-        this.lastResult=p.job.id;p.finish(null,segments);return send(200,{ok:true});
+        this.lastResult=p.requestId;p.finish(null,segments);return send(200,{ok:true});
       }
       return send(404,{error:'not found'});
     }catch(err){
@@ -229,7 +232,7 @@ class WebBridge {
     try {await previous;if(this.closed)throw error('interrupted','网页连接器已关闭');return await this.runActive(job,options);}
     finally {release();}
   }
-  async runActive(job,{threadId,onThread=()=>{},onProgress=()=>{},signal,timeoutMs=this.timeoutMs}={}) {
+  async runActive(job,{threadId,requestId=job.id,onThread=()=>{},onProgress=()=>{},signal,timeoutMs=this.timeoutMs}={}) {
     try {await this.ready;}catch {throw error('bridge_unavailable','ChatGPT 网页连接器无法监听本机端口，请检查 5141 端口');}
     if(this.closed)throw error('interrupted','网页连接器已关闭，任务未提交');
     if(this.pending)throw error('bridge_busy','ChatGPT 网页连接器正在处理其他任务');
@@ -250,13 +253,16 @@ class WebBridge {
       let done=false,timer,grace;
       const cancel=reason=>{if(done||p.cancelled)return;p.cancelled=reason;grace=setTimeout(()=>p.finish(reason),15000);onProgress('正在请求网页停止生成');};
       const abort=()=>cancel(error('cancelled','任务已取消；网页生成是否停止取决于浏览器连接状态'));
-      const p={job,threadId,onThread,onProgress,assets:new Map(),finish:(err,segments)=>{
+      const p={job,requestId,threadId,onThread,onProgress,assets:new Map(),finish:(err,segments)=>{
         if(done)return;done=true;clearTimeout(timer);clearTimeout(grace);signal?.removeEventListener('abort',abort);
         if(this.pending===p)this.pending=null;
         if(err){
           try{fs.writeFileSync(path.join(job.dir,'failure.json'),JSON.stringify({code:err.code||'web_failed',message:err.message,at:Date.now()}),{mode:0o600});}catch{}
           reject(err);
-        }else resolve(segments);
+        }else {
+          try{fs.rmSync(path.join(job.dir,'failure.json'),{force:true});}catch{}
+          resolve(segments);
+        }
       }};
       this.pending=p;
       signal?.addEventListener('abort',abort,{once:true});

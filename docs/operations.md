@@ -1,5 +1,10 @@
 # 运维
 
+0.4.1 起，新安装、Chrome 扩展导出、诊断和数据迁移以 [安装说明](installation.md) 为准。
+新安装默认数据位于 `<Koishi 实例>/data/codex-image-local/`，扩展导出到该数据目录的 `browser-extension/`。
+在实例目录运行 `npx --no-install koishi-gpt-bridge-setup` 和 `npx --no-install koishi-gpt-bridge-doctor`。
+下文记录的项目 `data/`、源码扩展目录及 0.3.x 版本号属于旧版部署和历史验收。
+
 ## 已有 Windows 部署示例
 
 - 项目位于 `D:\Projects\Koishi\koishi-codex-image-bridge`。
@@ -30,6 +35,39 @@ macOS 同样在 Koishi Desktop 的实例管理界面重启对应实例。不要�
 本次 0.3.8 图片更新已在本机通过全局重载加载，`npm run doctor` 应报告运行中插件版本 0.3.8。
 
 桥接令牌固定保存在 `data/web-bridge-token`，重启会复用同一个值，因此不必重跑 `setup-web-bridge.cjs`。
+
+## 网页会话失效自动恢复
+
+续聊时，原 ChatGPT 会话被删除或打开后跳回首页，扩展会先确认本条消息尚未提交，再由桥接解绑失效会话、
+自动新建网页会话并重试同一任务一次。正文、本次参考图片、模式、推理程度和技能设置保留，无需用户重新发消息。
+新网页会话无法恢复旧会话的历史；依赖上一轮文字或图片的请求，可能仍需补充上下文。
+
+此功能需重启 Koishi 实例并更新、重载 Chrome 扩展。若扩展来自安装命令导出的目录，先在实例目录重新运行
+`npx --no-install koishi-gpt-bridge-setup`（自定义数据目录、端口时传入原来的参数），再在 Chrome 扩展页重载。
+已提交、提交状态不明、取消、登录失效和会话编号不匹配均不会触发自动重发；恢复不延长原来的 QQ 回复窗口。
+
+`npm run validate:thread-recovery` 使用真实 Chrome 扩展和 ChatGPT，在 `data/acceptance/thread-recovery-*` 中创建隔离验收数据，
+用随机不存在的网页会话编号验证聊天、工作图片问答的自动恢复，以及恢复后的各一轮续聊。不会删除现有网页会话。
+脚本拒绝占用已运行的桥接端口；需让扩展连接到空闲的验收端口，并保持网页登录。
+QQ 发送使用模拟确认，不向真实联系人或群发消息；每轮任务、网页提交证据和结论保存在该目录的 `validation.json`。
+
+2026-10-26 本机真实 Chrome / ChatGPT 验收完成：聊天失效恢复约 41 秒、聊天续聊约 28 秒、工作图片恢复约 90 秒、
+工作续聊约 30 秒，四轮均通过。两次恢复均沿用原任务编号且只换一次网页请求，后续消息分别复用各自新绑定的网页会话。
+参考图的原始字节与任务保存内容一致，网页正确回答“左侧红色正方形、右侧蓝色圆形”，续聊返回相同验收标记。
+初轮聊天验证显式 Instant 设置，工作使用网页默认配置；随后在 0.4.3 中完成以下 Work 菜单适配与补充验收。
+此前网络切换导致的 `ERR_NETWORK_CHANGED` 失败轮次也保留在验收目录中，未将该轮记为通过。QQ 回传为隔离模拟。
+
+### Work 原生强度档位（0.4.3）
+
+工作网页的强度滑块可能跨越不同模型，同名“中”“轻度”不能唯一确定选择。
+使用 `/reasoning 1`、`/reasoning 4` 等编号选择网页原生档位；`instant` 选最低档、`pro` 选最高档，`default` 跟随网页。
+编号范围以当前网页实际菜单为准；选择后关闭并重新打开菜单，核对档位、档数、标签及模型，再提交消息。
+聊天模式继续使用原来的 Instant/Medium/High/Extra High/Pro 选项。
+
+扩展在 `submission.json` 的 `reasoningSelection` 中记录实际 Work 档位。Chrome 存储会重排对象字段，确认时逐字段比较，避免将同一选择误判为变化。
+2026-10-26 补充实测：Work `instant` 自动恢复后选择第 1/6 档 `GPT-6 Luna 高`，图片问答成功；
+同一会话改为 `/reasoning 4` 后选择第 4/6 档 `GPT-6 Astra 轻度`，续聊返回同一验收标记。两项均通过，QQ 回传为隔离模拟。
+正式实例与 Chrome 扩展已加载 0.4.3，真实 QQ 聊天收到 `ONLINE-043`，工作第 2/6 档收到 `WORK-043`；详情见 [变更与验收记录](history.md)。
 
 ## LM Studio 本地聊天
 
