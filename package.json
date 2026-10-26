@@ -1,16 +1,13 @@
 {
   "name": "koishi-plugin-chatgpt-bridge",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "QQ 中的 ChatGPT 网页与 LM Studio 助手：连续对话、图片问答、网页生图和改图、原生技能、图片模板及多话题管理。",
   "main": "src/index.cjs",
   "author": "Mlnikko",
-  "homepage": "https://github.com/Mlnikko/Koishi-GPT-Bridge#readme",
+  "homepage": "https://www.npmjs.com/package/koishi-plugin-chatgpt-bridge#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Mlnikko/Koishi-GPT-Bridge.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Mlnikko/Koishi-GPT-Bridge/issues"
   },
   "keywords": [
     "koishi",
@@ -36,7 +33,8 @@
     "docs/operations.md",
     "docs/user-guide.md",
     "docs/three-modes.md",
-    "docs/publishing.md"
+    "docs/publishing.md",
+    "docs/architecture.md"
   ],
   "bin": {
     "koishi-gpt-bridge-setup": "scripts/install-browser-extension.cjs",

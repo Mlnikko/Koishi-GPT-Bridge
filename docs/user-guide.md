@@ -485,7 +485,7 @@ npx --no-install koishi-gpt-bridge-setup
 
 命令会把完整扩展导出到实际数据目录的 `browser-extension/`，复用本机桥接令牌，
 不修改 npm 包目录，也不复制开发机器的 `config.js`。随后在 `chrome://extensions` 开启开发者模式，
-加载命令输出的目录，并登录 ChatGPT。插件和扩展版本应均为 `0.4.3`。
+加载命令输出的目录，并登录 ChatGPT。插件和扩展版本应均为 `0.4.4`。
 
 ```bash
 npx --no-install koishi-gpt-bridge-doctor

@@ -10,7 +10,7 @@ LM Studio 模式直接访问同机模型服务，无需网页登录。插件不�
 首次发布或新版本收录可能延迟。独立 npm 管理的 Koishi 实例也可在实例目录安装：
 
 ```bash
-npm install koishi-plugin-chatgpt-bridge@0.4.3 --registry=https://registry.npmjs.org
+npm install koishi-plugin-chatgpt-bridge@0.4.4 --registry=https://registry.npmjs.org
 ```
 
 Koishi Desktop 实例的依赖由其插件市场管理，等待市场收录后安装。
@@ -35,14 +35,14 @@ npm test
 npm run check:package
 ```
 
-最后一条命令会生成 `dist/koishi-plugin-chatgpt-bridge-0.4.3.tgz` 和验证记录。
+最后一条命令会生成 `dist/koishi-plugin-chatgpt-bridge-0.4.4.tgz` 和验证记录。
 它在临时目录安装该 tarball 和真实 Koishi，验证加载、配置约束、HTTP 健康检查、扩展生成与配对。
 不向网页或 QQ 提交消息。
 
 手动验收时，在一个独立的 Koishi 测试实例目录安装发行包，路径换为本机实际位置：
 
 ```bash
-npm install "/绝对路径/koishi-plugin-chatgpt-bridge-0.4.3.tgz"
+npm install "/绝对路径/koishi-plugin-chatgpt-bridge-0.4.4.tgz"
 ```
 
 此命令用于隔离的 npm 测试实例；已有 Koishi Desktop 实例的依赖应由其插件市场管理。
@@ -127,7 +127,7 @@ npm run setup:extension -- --instance-dir "/实际路径/Koishi 实例"
 
 ## 安装后验收
 
-1. doctor 显示插件为 0.4.3、浏览器在线且空闲；Chrome 弹窗确认扩展也为 0.4.3。
+1. doctor 显示插件为 0.4.4、浏览器在线且空闲；Chrome 弹窗确认扩展也为 0.4.4。
 2. QQ 私聊验证普通文字、图片、同一会话续聊及 `/new`；群聊启用时验证 @ 门槛。
 3. 工作模式验证网页原生技能；本地模式验证模型选择和上下文保存。
 4. 重启后确认原会话及令牌保持，升级包后扩展目录仍可重新加载。

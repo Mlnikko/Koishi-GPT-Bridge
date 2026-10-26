@@ -12,6 +12,9 @@ const root = path.join(__dirname, '..');
 const pkg = require('../package.json');
 const npmCli = process.env.npm_execpath;
 const koishiVersion = process.env.KOISHI_VERSION || pkg.devDependencies.koishi;
+let currentStage = '准备发行包';
+const stage = value => { currentStage = value; fs.writeSync(1, value + '\n'); };
+process.on('exit', code => { if (code) fs.writeSync(2, '发行包验收退出阶段：' + currentStage + '\n'); });
 
 function npm(args, cwd = root) {
   if (!npmCli) throw Error('请使用 npm run check:package 运行打包验收。');
@@ -39,9 +42,10 @@ async function verify() {
     const instance = path.join(temp, 'Koishi 实例 with spaces');
     fs.mkdirSync(instance);
     fs.writeFileSync(path.join(instance, 'package.json'), JSON.stringify({ name: 'bridge-package-smoke', version: '1.0.0', private: true }));
-    console.log(`已打包 ${files.length} 个文件；在隔离实例安装 Koishi ${koishiVersion}。`);
+    stage(`已打包 ${files.length} 个文件；在隔离实例安装 Koishi ${koishiVersion}。`);
     npm(['install', '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', '--prefer-offline',
       '--registry=https://registry.npmjs.org', path.join(temp, pack.filename), 'koishi@' + koishiVersion], instance);
+    stage('依赖安装完成，正在加载发行包');
     const local = createRequire(path.join(instance, 'package.json'));
     const plugin = local(pkg.name);
     const installedRoot = path.dirname(path.dirname(local.resolve(pkg.name)));
@@ -49,10 +53,12 @@ async function verify() {
     assert.equal(typeof plugin.usage, 'string');
     assert.throws(() => plugin.Config({ allowedUsers: [] }));
     const { App } = local('koishi');
+    stage('发行包已加载，正在启动隔离 Koishi');
     app = new App();
     app.baseDir = instance;
     app.plugin(plugin, { allowedUsers: ['package-smoke'], webBridgePort: 0 });
     await app.start();
+    stage('隔离 Koishi 已启动，正在检查桥接与扩展');
     const dataDir = path.join(instance, 'data', plugin.name);
     const portFile = path.join(dataDir, 'web-bridge-port');
     for (let attempt = 0; !fs.existsSync(portFile) && attempt < 200; attempt++)
@@ -88,6 +94,7 @@ async function verify() {
     assert.equal(diagnosis.status, 2, diagnosis.stderr); // The isolated browser is intentionally offline.
     assert.ok(diagnosis.stdout.includes(pkg.version));
     assert.ok(!diagnosis.stdout.includes(token));
+    stage('诊断通过，正在关闭隔离 Koishi');
     await app.stop(); app = undefined;
     const bytes = fs.readFileSync(path.join(temp, pack.filename));
     const report = { name: pkg.name, version: pkg.version, koishiVersion, node: process.version,
@@ -107,4 +114,4 @@ async function verify() {
   }
 }
 
-verify().catch(err => { console.error(err); process.exitCode = 1; });
+verify().catch(err => { fs.writeSync(2, String(err.stack || err) + '\n'); process.exitCode = 1; });

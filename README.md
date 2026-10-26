@@ -3,7 +3,7 @@
 把 **ChatGPT 网页和本机 LM Studio 接入 QQ**，支持连续聊天、看图、生图改图、原生技能和多话题管理。
 网页模式复用已登录的 ChatGPT，无需 OpenAI API Key；能力和额度以账号为准。
 
-[npm](https://www.npmjs.com/package/koishi-plugin-chatgpt-bridge) · [安装与迁移](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/installation.md) · [使用手册](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/user-guide.md) · [问题反馈](https://github.com/Mlnikko/Koishi-GPT-Bridge/issues)
+[npm](https://www.npmjs.com/package/koishi-plugin-chatgpt-bridge) · [安装与迁移](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/installation.md) · [使用手册](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/user-guide.md) · [包内文件](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4)
 
 ## 三种模式
 
@@ -37,7 +37,7 @@
    ```
 
 扩展与 Koishi 需要保持运行。更新后重新生成、重载扩展，并重启 Koishi。
-旧版源码部署升级前，请按[迁移说明](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/installation.md#旧版源码链接部署升级)指定原数据目录。
+旧版源码部署升级前，请按[迁移说明](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/installation.md)指定原数据目录。
 
 ## 使用示例
 
@@ -88,23 +88,23 @@
 | `/logs off` | 关闭过程通知，保留最终回复和失败原因 |
 
 同一话题一次处理一条消息；用 `/new` 开始空白上下文，`/chat 编号` 切回旧话题。
-技能、模板、预设的创建与管理参数见[使用手册](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/user-guide.md)。
+技能、模板、预设的创建与管理参数见[使用手册](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/user-guide.md)。
 
 ## 配置与数据
 
 - `allowedUsers`：私聊用户的 QQ openid 列表；`["*"]` 允许所有私聊用户。
 - `groupChat`：默认关闭；启用后，群内任何成员 @ 机器人均可调用，结果在群内可见。
 - `dataDir`：新安装默认 `<实例>/data/codex-image-local`，保存会话、任务和图片。
-- `webBridgePort`：默认 `5141`，须与扩展一致；自定义配置参见[安装说明](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/installation.md)。
+- `webBridgePort`：默认 `5141`，须与扩展一致；自定义配置参见[安装说明](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/installation.md)。
 
-普通消息默认最多 1500 字、2 张参考图，每图 10 MB。更多选项见[配置示例](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/koishi.example.yml)。
+普通消息默认最多 1500 字、2 张参考图，每图 10 MB。更多选项见[配置示例](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/koishi.example.yml)。
 消息按所选模式提交给 ChatGPT 或本机 LM Studio；数据保留在部署电脑的数据目录中。
 
 ## 更多文档
 
-- [安装、扩展配对与旧版迁移](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/installation.md)
-- [完整使用手册](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/user-guide.md)
-- [重启、诊断与故障排查](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/operations.md)
-- [架构与开发验证](https://github.com/Mlnikko/Koishi-GPT-Bridge/blob/v0.4.3/docs/architecture.md)
+- [安装、扩展配对与旧版迁移](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/installation.md)
+- [完整使用手册](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/user-guide.md)
+- [重启、诊断与故障排查](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/operations.md)
+- [架构与开发验证](https://app.unpkg.com/koishi-plugin-chatgpt-bridge@0.4.4/files/docs/architecture.md)
 
 MIT License
